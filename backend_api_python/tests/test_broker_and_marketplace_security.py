@@ -126,8 +126,8 @@ def test_ibkr_factory_policy_blocks_before_client_creation(monkeypatch):
 
 def test_ibkr_connect_route_returns_forbidden_before_client_creation(app, monkeypatch):
     monkeypatch.setenv("ALLOW_LOCAL_DESKTOP_BROKERS", "false")
-    client_class = Mock()
-    monkeypatch.setattr(ibkr_route, "IBKRClient", client_class)
+    session_factory = Mock()
+    monkeypatch.setattr(ibkr_route, "get_or_create_session", session_factory)
     view = ibkr_route.connect
     while hasattr(view, "__wrapped__"):
         view = view.__wrapped__
@@ -142,4 +142,67 @@ def test_ibkr_connect_route_returns_forbidden_before_client_creation(app, monkey
 
     assert status == 403
     assert response.get_json()["success"] is False
-    client_class.assert_not_called()
+    session_factory.assert_not_called()
+
+
+def test_implicit_reconnect_never_enables_trading(app, monkeypatch):
+    """Without an explicit connect, an on-demand session must stay read-only."""
+    monkeypatch.setenv("ALLOW_LOCAL_DESKTOP_BROKERS", "true")
+    monkeypatch.setattr(ibkr_route, "_owner_connect_configs", {})
+    monkeypatch.setattr(ibkr_route._sessions, "get", lambda: None)
+    captured = {}
+
+    def fake_get_or_create_session(config, *, owner_id):
+        captured["config"] = config
+        captured["owner_id"] = owner_id
+        return object()
+
+    monkeypatch.setattr(ibkr_route, "get_or_create_session", fake_get_or_create_session)
+
+    from flask import g
+
+    with app.test_request_context("/api/ibkr/account"):
+        g.user_id = 42
+        ibkr_route._require_connected_client()
+
+    assert captured["config"].readonly is True
+    assert captured["owner_id"] == 42
+
+
+def test_implicit_reconnect_reuses_the_explicit_config(app, monkeypatch):
+    """A user who connected writable keeps that mode on reconnect."""
+    monkeypatch.setenv("ALLOW_LOCAL_DESKTOP_BROKERS", "true")
+    monkeypatch.setattr(ibkr_route._sessions, "get", lambda: None)
+    from app.services.ibkr_trading.client import IBKRConfig
+
+    remembered = IBKRConfig(host="gateway.test", port=4002, client_id=1, readonly=False)
+    monkeypatch.setattr(ibkr_route, "_owner_connect_configs", {7: remembered})
+    captured = {}
+
+    def fake_get_or_create_session(config, *, owner_id):
+        captured["config"] = config
+        return object()
+
+    monkeypatch.setattr(ibkr_route, "get_or_create_session", fake_get_or_create_session)
+
+    from flask import g
+
+    with app.test_request_context("/api/ibkr/account"):
+        g.user_id = 7
+        ibkr_route._require_connected_client()
+
+    assert captured["config"] is remembered
+
+
+def test_ibkr_status_and_disconnect_enforce_the_desktop_policy(app, monkeypatch):
+    """Every IBKR endpoint refuses cloud deployments, not just /connect."""
+    monkeypatch.setenv("ALLOW_LOCAL_DESKTOP_BROKERS", "false")
+    for view in (ibkr_route.get_status, ibkr_route.disconnect):
+        inner = view
+        while hasattr(inner, "__wrapped__"):
+            inner = inner.__wrapped__
+        with app.test_request_context("/api/ibkr/endpoint", method="POST"):
+            result = inner()
+        response, status = result if isinstance(result, tuple) else (result, result.status_code)
+        assert status == 403
+        assert response.get_json()["success"] is False

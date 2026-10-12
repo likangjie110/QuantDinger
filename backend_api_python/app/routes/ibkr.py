@@ -8,7 +8,9 @@ Multi-tenancy: connections are isolated per authenticated user via
 through someone else's IBKR/TWS account.
 """
 
-from flask import jsonify, request
+import os
+
+from flask import jsonify, request, g
 from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app.utils.auth import login_required
 
@@ -18,7 +20,9 @@ from app.utils.local_brokers import (
     desktop_broker_cloud_reject_message,
     local_desktop_brokers_allowed,
 )
-from app.services.ibkr_trading import IBKRClient, IBKRConfig
+from app.services.ibkr_trading.account import flatten_account_summary
+from app.services.ibkr_trading.config import build_ibkr_config
+from app.services.ibkr_trading.session import get_or_create_session
 
 logger = get_logger(__name__)
 
@@ -26,6 +30,11 @@ ibkr_blp = Blueprint('ibkr', __name__)
 
 # Per-user client cache keyed by (user_id, 'ibkr')
 _sessions = BrokerSessionRegistry('ibkr')
+
+# The config each user explicitly connected with, so an implicit reconnect reuses
+# the same session identity — and never silently upgrades a read-only session into
+# one that can place orders.
+_owner_connect_configs: dict = {}
 
 
 def _placeholder_status():
@@ -39,15 +48,51 @@ def _placeholder_status():
     }
 
 
+def _connect_error_message(config) -> str:
+    """Explain a failed connect, including the containerised-loopback trap."""
+    target = f"{config.host}:{config.port}"
+    if config.host in ("127.0.0.1", "localhost", "::1") and os.path.exists("/.dockerenv"):
+        return (
+            f"Cannot reach TWS/Gateway at {target}. The backend runs in a container, "
+            "where 127.0.0.1 is the container itself. Use the host address "
+            "(host.docker.internal on Docker Desktop) and save it on the IBKR credential."
+        )
+    return (
+        f"Cannot reach TWS/Gateway at {target}. Check that it is running and that "
+        "its API port accepts connections from this host."
+    )
+
+
 def _require_connected_client():
+    """Return a live session, reconnecting from stored credentials if needed.
+
+    The session lives in process memory, so a request served by a different
+    worker than the one that handled ``POST /connect`` would otherwise report
+    "Not connected". Reconnecting on demand keeps every endpoint usable
+    regardless of which worker picks it up.
+    """
     if not local_desktop_brokers_allowed():
         return None, (
             jsonify({"success": False, "error": desktop_broker_cloud_reject_message()}),
             403,
         )
     client = _sessions.get()
-    if client is None or not client.connected:
+    if client is not None and client.connected:
+        return client, None
+
+    try:
+        config = _owner_connect_configs.get(int(g.user_id))
+        if config is None:
+            # Nothing was explicitly connected in this process: reconnect for data
+            # only. Read-only keeps an implicit reconnect from enabling trading.
+            config = build_ibkr_config({}, user_id=g.user_id)
+            config.readonly = True
+        client = get_or_create_session(config, owner_id=g.user_id)
+    except Exception as exc:
+        logger.info(f"IBKR auto-connect failed: {exc}")
         return None, (jsonify({"success": False, "error": "Not connected to IBKR"}), 400)
+
+    _sessions.set(client)
     return client, None
 
 
@@ -57,6 +102,11 @@ def _require_connected_client():
 @login_required
 def get_status():
     """Get IBKR connection status."""
+    if not local_desktop_brokers_allowed():
+        return jsonify({
+            "success": False,
+            "error": desktop_broker_cloud_reject_message(),
+        }), 403
     try:
         client = _sessions.get()
         if client is None:
@@ -94,30 +144,24 @@ def connect():
             }), 403
 
         data = request.get_json() or {}
+        config = build_ibkr_config(data, user_id=g.user_id)
 
-        config = IBKRConfig(
-            host=data.get('host', '127.0.0.1'),
-            port=int(data.get('port', 7497)),
-            client_id=int(data.get('clientId', 1)),
-            account=data.get('account', ''),
-            readonly=data.get('readonly', False),
-        )
-
-        client = IBKRClient(config)
-        success = client.connect()
-
-        if success:
-            _sessions.set(client)
-            return jsonify({
-                "success": True,
-                "message": "Connected successfully",
-                "data": client.get_connection_status()
-            })
-        else:
+        try:
+            client = get_or_create_session(config, owner_id=g.user_id)
+        except ConnectionError as exc:
+            logger.warning(f"IBKR connect rejected: {exc}")
             return jsonify({
                 "success": False,
-                "error": "Connection failed. Please check if TWS/Gateway is running."
+                "error": _connect_error_message(config),
             }), 400
+
+        _sessions.set(client)
+        _owner_connect_configs[int(g.user_id)] = config
+        return jsonify({
+            "success": True,
+            "message": "Connected successfully",
+            "data": client.get_connection_status()
+        })
 
     except ImportError:
         return jsonify({
@@ -136,6 +180,11 @@ def connect():
 @login_required
 def disconnect():
     """Disconnect from IBKR."""
+    if not local_desktop_brokers_allowed():
+        return jsonify({
+            "success": False,
+            "error": desktop_broker_cloud_reject_message(),
+        }), 403
     try:
         _sessions.disconnect_current()
         return jsonify({
@@ -161,10 +210,17 @@ def get_account():
         if err is not None:
             return err
 
-        return jsonify({
-            "success": True,
-            "data": client.get_account_summary()
-        })
+        data = client.get_account_summary()
+        if not isinstance(data, dict) or not data.get("success"):
+            error = (data or {}).get("error") if isinstance(data, dict) else ""
+            return jsonify({
+                "success": False,
+                "error": error or "Failed to read the IBKR account summary",
+            }), 400
+
+        # The UI reads flat numeric fields; ``summary`` stays for agent/MCP callers.
+        data.update(flatten_account_summary(data.get("summary")))
+        return jsonify({"success": True, "data": data})
     except Exception as e:
         logger.error(f"Get account info failed: {e}")
         return jsonify({
