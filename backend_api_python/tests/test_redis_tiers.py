@@ -16,6 +16,9 @@ def test_cache_and_job_redis_use_separate_endpoints(monkeypatch):
     monkeypatch.delenv("REDIS_URL", raising=False)
     monkeypatch.delenv("CELERY_BROKER_URL", raising=False)
     monkeypatch.delenv("CELERY_RESULT_BACKEND", raising=False)
+    monkeypatch.delenv("REDIS_PORT", raising=False)
+    monkeypatch.delenv("REDIS_DB", raising=False)
+    monkeypatch.delenv("CELERY_REDIS_PORT", raising=False)
 
     assert cache_redis_url() == "redis://:cache%20password@cache:6379/0"
     assert celery_broker_url() == "redis://:jobs%2Fpassword@jobs:6379/2"
