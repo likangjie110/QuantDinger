@@ -102,6 +102,11 @@ def _require_connected_client():
 @login_required
 def get_status():
     """Get IBKR connection status."""
+    if not local_desktop_brokers_allowed():
+        return jsonify({
+            "success": False,
+            "error": desktop_broker_cloud_reject_message(),
+        }), 403
     try:
         client = _sessions.get()
         if client is None:
@@ -175,6 +180,11 @@ def connect():
 @login_required
 def disconnect():
     """Disconnect from IBKR."""
+    if not local_desktop_brokers_allowed():
+        return jsonify({
+            "success": False,
+            "error": desktop_broker_cloud_reject_message(),
+        }), 403
     try:
         _sessions.disconnect_current()
         return jsonify({

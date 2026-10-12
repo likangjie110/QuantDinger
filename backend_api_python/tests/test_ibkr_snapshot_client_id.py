@@ -65,3 +65,23 @@ def test_snapshot_falls_back_when_the_setting_is_not_a_number(monkeypatch):
     snap._fetch_ibkr_snapshot({"ibkr_client_id": 7}, [])
 
     assert captured["config"]["ibkr_client_id"] == 9
+
+
+def test_ibkr_orders_use_amount_like_every_other_venue(monkeypatch):
+    captured = {}
+
+    class _ClientWithOrder(_FakeClient):
+        def get_open_orders(self):
+            return [{"symbol": "AAPL", "action": "BUY", "quantity": 3,
+                     "orderId": 11, "status": "Submitted", "price": 1.5}]
+
+    def fake_create_client(config, market_type=None):
+        captured["config"] = config
+        return _ClientWithOrder()
+
+    monkeypatch.setattr(snap, "create_client", fake_create_client)
+
+    _, orders = snap._fetch_ibkr_snapshot({"ibkr_host": "h", "ibkr_port": 4002}, [])
+
+    assert orders and orders[0]["amount"] == 3.0
+    assert "size" not in orders[0]

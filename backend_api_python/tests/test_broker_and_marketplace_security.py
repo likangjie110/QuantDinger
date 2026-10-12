@@ -192,3 +192,17 @@ def test_implicit_reconnect_reuses_the_explicit_config(app, monkeypatch):
         ibkr_route._require_connected_client()
 
     assert captured["config"] is remembered
+
+
+def test_ibkr_status_and_disconnect_enforce_the_desktop_policy(app, monkeypatch):
+    """Every IBKR endpoint refuses cloud deployments, not just /connect."""
+    monkeypatch.setenv("ALLOW_LOCAL_DESKTOP_BROKERS", "false")
+    for view in (ibkr_route.get_status, ibkr_route.disconnect):
+        inner = view
+        while hasattr(inner, "__wrapped__"):
+            inner = inner.__wrapped__
+        with app.test_request_context("/api/ibkr/endpoint", method="POST"):
+            result = inner()
+        response, status = result if isinstance(result, tuple) else (result, result.status_code)
+        assert status == 403
+        assert response.get_json()["success"] is False

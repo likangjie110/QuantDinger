@@ -352,3 +352,39 @@ def test_one_owner_keeps_reusing_its_own_session(fake_ib):
     again = ibkr_session.get_or_create_session(_config(), owner_id=7)
 
     assert again is first
+
+
+def test_disconnect_is_idempotent_and_unregisters(fake_ib):
+    session = ibkr_session.get_or_create_session(_config(), owner_id=1)
+
+    session.disconnect()
+    session.disconnect()  # must not raise on a shut-down executor
+
+    assert ibkr_session.find_session(_config(), owner_id=1) is None
+
+
+def test_a_raising_connect_leaves_no_registry_entry(fake_ib, monkeypatch):
+    def boom(self):
+        raise RuntimeError("handshake exploded")
+
+    monkeypatch.setattr(_FakeIBKRClient, "connect", boom)
+
+    with pytest.raises(RuntimeError):
+        ibkr_session.get_or_create_session(_config(), owner_id=1)
+
+    # find_session() filters on connected, so it would hide a lingering entry;
+    # assert on the registry itself: a half-open session leaks its thread and loop.
+    assert ibkr_session.find_session(_config(), owner_id=1) is None
+    assert ibkr_session._registry == {}
+
+
+def test_a_timed_out_call_marks_the_session_unhealthy(fake_ib, monkeypatch):
+    """A wedged call must not keep reporting connected, or nobody reconnects."""
+    session = ibkr_session.get_or_create_session(_config(), owner_id=1)
+    assert session.connected is True
+    monkeypatch.setattr(ibkr_session, "_CALL_TIMEOUT_SEC", 0.05)
+
+    with pytest.raises(TimeoutError):
+        session._submit(lambda: threading.Event().wait(0.4))
+
+    assert session.connected is False

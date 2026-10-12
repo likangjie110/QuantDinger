@@ -659,7 +659,7 @@ class IBKRClient:
                     "ib_symbol": contract.symbol,
                     # Futures share a symbol across expiries; localSymbol (MGCV6)
                     # is what identifies the contract actually held.
-                    "localSymbol": contract.localSymbol or "",
+                    "localSymbol": getattr(contract, "localSymbol", "") or "",
                     "lastTradeDate": contract.lastTradeDateOrContractMonth or "",
                     "secType": contract.secType,
                     "exchange": exchange,
@@ -708,7 +708,7 @@ class IBKRClient:
                     "orderId": order.orderId,
                     "permId": getattr(order, "permId", 0),
                     "symbol": contract.symbol,
-                    "localSymbol": contract.localSymbol or "",
+                    "localSymbol": getattr(contract, "localSymbol", "") or "",
                     "action": order.action,
                     "quantity": float(order.totalQuantity),
                     "orderType": order.orderType,

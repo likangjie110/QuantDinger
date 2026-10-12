@@ -734,6 +734,9 @@ def _fetch_ibkr_snapshot(
                     continue
                 positions_out.append({
                     # localSymbol distinguishes futures expiries (MGCV6 vs MGCZ6).
+                    # No mark_price: the client reads positions only, and pricing each
+                    # one would need a per-symbol reqMktData subscription this snapshot
+                    # must not assume. Consumers must read it as unknown, not as zero.
                     "symbol": str(
                         p.get("localSymbol") or p.get("symbol") or p.get("ib_symbol") or ""
                     ).strip(),
@@ -756,7 +759,7 @@ def _fetch_ibkr_snapshot(
                     "symbol": str(o.get("localSymbol") or o.get("symbol") or "").strip(),
                     "side": str(o.get("action") or "").strip().lower(),
                     "price": price_f,
-                    "size": float(o.get("quantity") or 0.0),
+                    "amount": float(o.get("quantity") or 0.0),
                     "status": str(o.get("status") or "").strip(),
                     "exchange_order_id": str(o.get("orderId") or "").strip(),
                 })

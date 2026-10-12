@@ -68,6 +68,9 @@ class IBKRSession:
     def __init__(self, config: IBKRConfig, *, owner_id: int = 0):
         self._config = config
         self._key = _session_key(config, owner_id)
+        self._closed = False
+        # Set when a call times out: the socket state is then unknown.
+        self._wedged = False
         self._client = IBKRClient(config)
         self._executor = ThreadPoolExecutor(
             max_workers=1,
@@ -81,15 +84,27 @@ class IBKRSession:
         return self._submit(self._client.connect)
 
     def disconnect(self) -> None:
+        """Tear the session down once; later calls are no-ops.
+
+        A shut-down executor, or a client that raises while disconnecting, must not
+        leave the session registered, so cleanup happens either way.
+        """
+        if self._closed:
+            return
+        self._closed = True
         try:
             self._submit(self._client.disconnect)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("IBKR session disconnect raised: %s", exc)
         finally:
             self._executor.shutdown(wait=False)
             _forget(self._key, self)
 
     @property
     def connected(self) -> bool:
-        return self._client.connected
+        # A timed-out call leaves the socket in an unknown state: report the session
+        # as dead so the next caller replaces it instead of reusing a wedged one.
+        return self._client.connected and not self._wedged
 
     # -- proxy -----------------------------------------------------------
 
@@ -110,7 +125,11 @@ class IBKRSession:
         return _marshalled
 
     def _submit(self, fn: Callable[[], Any]) -> Any:
-        return self._executor.submit(fn).result(timeout=_CALL_TIMEOUT_SEC)
+        try:
+            return self._executor.submit(fn).result(timeout=_CALL_TIMEOUT_SEC)
+        except TimeoutError:
+            self._wedged = True
+            raise
 
 
 def _install_event_loop() -> None:
@@ -152,8 +171,13 @@ def get_or_create_session(config: IBKRConfig, *, owner_id: int) -> IBKRSession:
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("Stale IBKR session disconnect raised: %s", exc)
 
-    if not session.connect():
-        _forget(key, session)
+    try:
+        connected = session.connect()
+    except Exception:
+        # A half-open session must not stay registered, or the next caller reuses it.
+        session.disconnect()
+        raise
+    if not connected:
         session.disconnect()
         raise ConnectionError(
             "Failed to connect to IBKR TWS/Gateway at "
