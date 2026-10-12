@@ -28,6 +28,8 @@ QuantDinger 可通过 Interactive Brokers TWS 或 IB Gateway 执行美股交易�
 
 Docker Desktop 中连接宿主机 TWS/Gateway 时，Host 通常使用 `host.docker.internal`。不要把 Socket API 直接暴露到公网。
 
+在容器内，请求里的回环地址（`127.0.0.1`、`localhost`、`::1`）会被当作前端占位值，改用凭据里保存的 Host——容器内的回环地址到不了宿主机上的 TWS/Gateway。若后端直接跑在宿主机上（非 Docker），显式填写的回环地址会被原样采用，同机部署的终端仍然可选。
+
 ## 交易流程与标的
 
 美股标的使用普通代码，例如 `AAPL`、`TSLA`、`MSFT`。当前信号流为：

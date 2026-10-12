@@ -12,6 +12,8 @@ host, so a single click on "Connect" works from a Docker deployment.
 
 from __future__ import annotations
 
+import os
+
 from typing import Any, Dict, Optional
 
 from app.services.ibkr_trading.client import IBKRConfig
@@ -19,6 +21,19 @@ from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _running_in_container() -> bool:
+    """Whether a loopback address can reach a terminal running on this host.
+
+    Inside a container 127.0.0.1 is the container itself and can never reach a
+    TWS/Gateway on the host (the same condition ``_connect_error_message`` reports);
+    anywhere else it is a real address the user may deliberately choose.
+    """
+    return os.path.exists("/.dockerenv")
+
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7497
@@ -85,9 +100,10 @@ def build_ibkr_config(request_data: Dict[str, Any], *, user_id: int) -> IBKRConf
     client_id = _int_or_none(data.get("clientId"))
     account = _text_or_none(data.get("account"))
 
-    # A localhost host is treated as "unset": it is the UI placeholder and is
-    # unreachable from inside a container.
-    if host in ("127.0.0.1", "localhost", "::1"):
+    # A loopback host is treated as "unset" only inside a container, where it is the
+    # UI placeholder and provably unreachable. On a host install an explicit loopback
+    # address is honoured, so a terminal on the same machine stays selectable.
+    if host in _LOOPBACK_HOSTS and _running_in_container():
         host = None
 
     # ``ibkr_client_id`` on the credential belongs to the strategy/order session

@@ -133,9 +133,25 @@ def saved_credential(monkeypatch):
     )
 
 
-def test_ui_placeholder_host_falls_back_to_the_saved_host(saved_credential):
-    """127.0.0.1 is the UI default and is unreachable from inside a container."""
+def test_ui_placeholder_host_falls_back_to_the_saved_host(saved_credential, monkeypatch):
+    """Inside a container 127.0.0.1 is the UI default and cannot reach the host."""
+    monkeypatch.setattr(ibkr_config, "_running_in_container", lambda: True)
     resolved = build_ibkr_config({"host": "127.0.0.1", "port": 4002, "clientId": 1}, user_id=1)
+
+    assert resolved.host == "host.docker.internal"
+
+
+def test_loopback_host_is_honoured_on_a_host_install(saved_credential, monkeypatch):
+    """Outside a container 127.0.0.1 is a real address, not a placeholder."""
+    monkeypatch.setattr(ibkr_config, "_running_in_container", lambda: False)
+    resolved = build_ibkr_config({"host": "127.0.0.1", "port": 4002, "clientId": 1}, user_id=1)
+
+    assert resolved.host == "127.0.0.1"
+
+
+def test_saved_host_is_still_used_when_the_request_omits_one(saved_credential, monkeypatch):
+    monkeypatch.setattr(ibkr_config, "_running_in_container", lambda: False)
+    resolved = build_ibkr_config({"port": 4002, "clientId": 1}, user_id=1)
 
     assert resolved.host == "host.docker.internal"
     assert resolved.account == "DU1234567"

@@ -156,6 +156,12 @@ When running QuantDinger in Docker, TWS/IB Gateway must be accessible from the c
 2. Use `host.docker.internal` as the host address (Docker Desktop)
 3. Or configure host network mode
 
+Inside a container a loopback host (`127.0.0.1`, `localhost`, `::1`) sent in a request is
+treated as the UI placeholder and the host saved on the credential is used instead: from
+inside the container that address can never reach a terminal on the host. When the backend
+runs directly on the host (not in Docker), an explicit loopback host is honoured as-is, so a
+terminal on the same machine remains selectable.
+
 ## Security Recommendations
 
 - Only enable "Allow connections from localhost only" in TWS/Gateway
