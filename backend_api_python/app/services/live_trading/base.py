@@ -115,6 +115,16 @@ def _get_proxies() -> Optional[Dict[str, str]]:
     return _proxies_value
 
 
+def cancel_all_algo_orders_enabled() -> bool:
+    """Whether this process may cancel *all* algo orders on an OKX instrument/account.
+
+    Off by default. Those sweeps cannot tell this system's protective orders from a
+    user's manually placed TP/SL, so enabling them can silently remove live
+    protection; the scoped cancel that unblocks error 59669 does not need this.
+    """
+    return str(os.environ.get("OKX_CANCEL_ALL_ALGO_ORDERS", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class LiveOrderResult:
     exchange_id: str
