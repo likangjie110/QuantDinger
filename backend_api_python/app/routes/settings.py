@@ -2451,13 +2451,12 @@ def test_connection():
         service = data.get('service')
         
         if service == 'openrouter':
-            from app.services.llm import LLMService
+            from app.services.llm import LLMProvider, LLMService
             llm = LLMService()
-            result = llm.test_connection()
-            if result:
-                return jsonify({'code': 1, 'msg': 'OpenRouter connection successful'})
-            else:
-                return jsonify({'code': 0, 'msg': 'OpenRouter connection failed'})
+            # Probe OpenRouter explicitly: LLMService() would otherwise resolve the
+            # configured/auto-detected provider and report its result under this button.
+            ok, detail = llm.test_connection(LLMProvider.OPENROUTER)
+            return jsonify({'code': 1 if ok else 0, 'msg': detail})
         
         elif service == 'finnhub':
             import requests
