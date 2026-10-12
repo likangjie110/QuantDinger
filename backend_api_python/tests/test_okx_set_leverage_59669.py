@@ -36,7 +36,8 @@ def test_okx_set_leverage_skips_when_leverage_info_already_at_target():
     assert client.set_leverage(inst_id="BTC-USDT-SWAP", lever=1, mgn_mode="cross", pos_side="net") is True
 
 
-def test_okx_set_leverage_59669_accepts_existing_leverage():
+def test_okx_set_leverage_59669_accepts_existing_leverage(monkeypatch):
+    monkeypatch.setattr("app.services.live_trading.okx.time.sleep", lambda *_a, **_k: None)
     calls = {"set": 0}
 
     def fake_read_configured_leverage(**_kwargs):

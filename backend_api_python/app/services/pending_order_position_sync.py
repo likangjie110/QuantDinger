@@ -164,9 +164,9 @@ def _purge_flat_strategy_positions_from_exchange(
     just-executed open/add fill.
     """
     try:
-        enabled = str(os.getenv("POSITION_SYNC_PURGE_FLAT_LEDGER", "true")).strip().lower()
+        enabled = str(os.getenv("POSITION_SYNC_PURGE_FLAT_LEDGER", "false")).strip().lower()
     except Exception:
-        enabled = "true"
+        enabled = "false"
     if enabled in {"0", "false", "no", "off"}:
         return 0
 
@@ -200,10 +200,27 @@ def _purge_flat_strategy_positions_from_exchange(
                 grace_sec,
             )
             continue
+        from app.services.live_trading.external_flat_close import (
+            reconcile_external_flat_closes,
+            trade_side_net_qty,
+        )
+
+        if trade_side_net_qty(sid, symbol, side) <= eps:
+            # An earlier tick already recorded this close but did not drop the leg (for
+            # example the delete raised). Re-reconciling would write a second close for the
+            # same size and double-count the PnL, so only the stale leg is removed here.
+            logger.warning(
+                "[PositionSync] Strategy %s dropping already-reconciled leg %s %s.",
+                sid,
+                symbol,
+                side,
+            )
+            _delete_position(sid, symbol, side)
+            deleted += 1
+            continue
+
         trade_id = 0
         try:
-            from app.services.live_trading.external_flat_close import reconcile_external_flat_closes
-
             trade_id = reconcile_external_flat_closes(
                 strategy_id=sid,
                 symbol=symbol,
@@ -307,10 +324,12 @@ def _activate_position_sync_fd_backoff(reason: str) -> None:
 class PendingOrderPositionSyncMixin:
     def _sync_positions_best_effort(self, target_strategy_id: Optional[int] = None) -> None:
         """
-        Refresh the account-level exchange mirror without changing strategy ledgers.
+        Refresh the account-level exchange mirror, and drop L3 strategy legs that a fresh
+        exchange snapshot confirms are flat - after recording the matching close trade.
 
         L1 account positions come from exchange snapshots. L3 strategy positions are
-        produced only by strategy-owned fills, including fill-ledger strategies.
+        produced only by strategy-owned fills, including fill-ledger strategies; a leg is
+        only dropped when its close can be attributed to this strategy.
         """
         if _is_position_sync_fd_backoff_active():
             logger.debug("[PositionSync] skipped: file-descriptor backoff active")
