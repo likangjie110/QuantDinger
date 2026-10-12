@@ -11,6 +11,7 @@ from app._version import APP_VERSION
 from app.markets.registry import market_options
 from app.utils.logger import get_logger
 from app.utils.config_loader import clear_config_cache
+from app.utils.redaction import redact_secrets
 from app.utils.auth import login_required, admin_required
 from app.services.settings.branding import build_brand_config
 from app.services.settings.env_file import read_env_file, write_env_file
@@ -2475,8 +2476,10 @@ def test_connection():
         return jsonify({'code': 0, 'msg': 'Unknown service'})
     
     except Exception as e:
-        logger.error(f"Connection test failed: {e}")
-        return jsonify({'code': 0, 'msg': f'Test failed: {str(e)}'})
+        # The Finnhub probe carries its key as a query parameter and requests embeds the
+        # URL in exception text, so scrub before logging and returning it.
+        logger.error(f"Connection test failed: {redact_secrets(e)}")
+        return jsonify({'code': 0, 'msg': f'Test failed: {redact_secrets(e)}'})
 
 # openapi-compat: legacy import name
 settings_bp = settings_blp

@@ -13,6 +13,7 @@ from enum import Enum
 from app.utils.logger import get_logger
 from app.config import APIKeys
 from app.utils.config_loader import load_addon_config
+from app.utils.redaction import redact_secrets
 
 logger = get_logger(__name__)
 
@@ -151,6 +152,20 @@ PROVIDER_CONFIGS = {
         "fallback_model": "gpt-4o-mini",
     },
 }
+
+
+def _scrubbed_request_error(exc: "requests.exceptions.RequestException") -> "requests.exceptions.RequestException":
+    """Rebuild a requests exception with its message scrubbed.
+
+    Re-raising the original would hand a key-bearing URL back to the caller
+    (routes echo ``str(e)`` to clients), so the same type is reconstructed with
+    the scrubbed text while keeping ``response``/``request`` attached.
+    """
+    return type(exc)(
+        redact_secrets(str(exc)),
+        response=getattr(exc, "response", None),
+        request=getattr(exc, "request", None),
+    )
 
 
 class LLMService:
@@ -357,7 +372,7 @@ class LLMService:
                     "for direct LLM access, or set it to a reachable proxy and keep "
                     "LLM_USE_SYSTEM_PROXY disabled unless you really want system proxy env vars."
                 )
-            raise requests.exceptions.ConnectionError(f"{msg}{hint}") from exc
+            raise requests.exceptions.ConnectionError(f"{redact_secrets(msg)}{hint}") from exc
 
         if stream:
             response._quantdinger_llm_session = session
@@ -438,7 +453,7 @@ class LLMService:
                     error_msg += ". 可能原因：模型不可用或账户隐私/数据策略限制。请检查 https://openrouter.ai/settings/privacy"
 
             raise LLMAPIError(
-                error_msg,
+                redact_secrets(error_msg),
                 status_code=response.status_code,
                 request_id=request_id,
                 generation_id=generation_id,
@@ -610,7 +625,10 @@ class LLMService:
     def _call_google_gemini(self, messages: list, model: str, temperature: float,
                            api_key: str, base_url: str, timeout: int) -> str:
         """Call Google Gemini API."""
-        url = f"{base_url}/models/{model}:generateContent?key={api_key}"
+        # The key travels in a header instead of the query string: requests embeds the
+        # URL in exception messages, which are logged and surfaced to clients. A custom
+        # GOOGLE_BASE_URL proxy must accept the x-goog-api-key header.
+        url = f"{base_url}/models/{model}:generateContent"
         
         # Convert OpenAI message format to Gemini format
         contents = []
@@ -656,7 +674,10 @@ class LLMService:
         if system_instruction:
             data["systemInstruction"] = {"parts": [{"text": system_instruction}]}
         
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": str(api_key or "").strip(),
+        }
         
         response = self._llm_post(url, headers=headers, json_payload=data, timeout=timeout)
         response.raise_for_status()
@@ -770,7 +791,7 @@ class LLMService:
             if error_type.endswith("error") and error_type not in RETRYABLE_LLM_ERROR_TYPES:
                 error_type = ""
             raise LLMAPIError(
-                f"LiteLLM API error ({model}): {e}",
+                f"LiteLLM API error ({model}): {redact_secrets(e)}",
                 status_code=status_code,
                 request_id=str(getattr(e, "request_id", "") or ""),
                 error_type=error_type,
@@ -1288,7 +1309,7 @@ class LLMService:
                 status_code = e.response.status_code if e.response else None
                 last_status_code = status_code
                 
-                logger.error(f"{p.value} API HTTP error ({current_model}): {status_code} - {error_detail}")
+                logger.error(f"{p.value} API HTTP error ({current_model}): {status_code} - {redact_secrets(error_detail)}")
                 last_error = str(e)
                 
                 # 403/402 errors usually mean API key issue - try alternative provider
@@ -1307,16 +1328,16 @@ class LLMService:
                     continue
                 
                 if not use_fallback or current_model == models_to_try[-1]:
-                    raise
+                    raise _scrubbed_request_error(e) from e
                     
             except requests.exceptions.RequestException as e:
-                logger.error(f"{p.value} API request error ({current_model}): {str(e)}")
+                logger.error(f"{p.value} API request error ({current_model}): {redact_secrets(e)}")
                 last_error = str(e)
                 if not use_fallback or current_model == models_to_try[-1]:
-                    raise
+                    raise _scrubbed_request_error(e) from e
                     
             except ValueError as e:
-                logger.warning(f"Model {current_model} returned invalid data: {str(e)}")
+                logger.warning(f"Model {current_model} returned invalid data: {redact_secrets(e)}")
                 last_error = str(e)
                 if current_model == models_to_try[-1]:
                     raise
@@ -1326,8 +1347,8 @@ class LLMService:
             error_msg += f"\nStatus {last_status_code} usually means: API key invalid/expired, insufficient balance, or no access to model."
             error_msg += f"\nPlease check your {p.value} API key configuration and account balance."
         
-        logger.error(error_msg)
-        raise Exception(error_msg)
+        logger.error(redact_secrets(error_msg))
+        raise Exception(redact_secrets(error_msg))
 
     def stream_llm_api(self, messages: list, model: str = None, temperature: float = 0.7):
         """Stream LLM response deltas for providers with OpenAI-compatible streaming."""
@@ -1390,7 +1411,7 @@ class LLMService:
                     try_alternative_providers=False  # Prevent infinite recursion
                 )
             except Exception as e:
-                logger.warning(f"Alternative provider {alt_provider.value} also failed: {str(e)}")
+                logger.warning(f"Alternative provider {alt_provider.value} also failed: {redact_secrets(e)}")
                 continue
         
         raise Exception(f"All LLM providers failed. Please check your API key configurations.")
@@ -1440,8 +1461,8 @@ class LLMService:
             default_structure['report'] = f"Failed to parse analysis result JSON. Raw output (partial): {response_text[:500] if response_text else 'N/A'}"
             return default_structure
         except Exception as e:
-            logger.error(f"LLM call failed: {str(e)}")
-            default_structure['report'] = f"Analysis failed: {str(e)}"
+            logger.error(f"LLM call failed: {redact_secrets(e)}")
+            default_structure['report'] = f"Analysis failed: {redact_secrets(e)}"
             return default_structure
 
     @classmethod
