@@ -35,6 +35,7 @@ from app.services.factor_mining.engine import (
     split_periods,
 )
 from app.services.factor_mining.gates import GateThresholds
+from app.services.factor_mining.templates import expand_candidates
 
 
 class _FakeProvider:
@@ -54,6 +55,14 @@ class _FakeProvider:
 
 
 def _frames_and_members(periods=200):
+    """One frame per symbol plus the members a real ``resolve_candidates`` would return.
+
+    ``key`` is the handle ``_membership_panel`` matches on. ``membership_periods`` is the
+    point-in-time part: ``USStock:F`` only joins the universe from May, so a search that
+    really applies the membership panel sees a five-symbol cross-section before that and a
+    six-symbol one after. Without periods every member is active on every date and the
+    universe filter is never exercised.
+    """
     index = pd.date_range("2024-01-01", periods=periods, freq="B")
     frames, members = {}, []
     for offset, symbol in enumerate(["A", "B", "C", "D", "E", "F"]):
@@ -64,11 +73,12 @@ def _frames_and_members(periods=200):
             {"open": close, "high": [value * 1.001 for value in close],
              "low": [value * 0.999 for value in close], "close": close,
              "volume": [1000.0 + day * (offset + 1) for day in range(periods)]}, index=index)
-        # ``key`` is the handle the real ``resolve_candidates`` always injects and the one
-        # ``_membership_panel`` matches on. Without it the panel reads every symbol as
-        # inactive, the cross-section is empty, and the point-in-time universe never runs.
-        members.append({"key": key, "market": "USStock", "symbol": symbol,
-                        "effectiveFrom": None})
+        member = {"key": key, "market": "USStock", "symbol": symbol, "effectiveFrom": None}
+        if symbol == "F":
+            member["membership_periods"] = [
+                {"valid_from": datetime(2024, 5, 1), "valid_to": None},
+            ]
+        members.append(member)
     return frames, members
 
 
@@ -264,18 +274,30 @@ def test_trials_repeat_the_costs_the_run_passed_in():
         assert item["metrics"]["executionAssumptions"]["slippage"] == 0.002
 
 
-def test_run_is_reproducible_with_same_seed():
+def test_run_is_reproducible_trial_sequence_including_order():
+    """Two independent expansions produce the same trial sequence, position by position.
+
+    Comparing fingerprints as sets, or sorted, cannot see an ordering difference -- which is
+    the half of determinism that matters, because the trial ledger's order is the expansion
+    order the budget truncated. The final assertion fails if the sequence is ever a constant.
+    """
     first, _ = _search(seed=11)
     second, _ = _search(seed=11)
-    assert [item["fingerprint"] for item in first["trials"]] == [item["fingerprint"] for item in second["trials"]]
+    first_trials = [(item["fingerprint"], item["stage"], item["verdict"], item["reason"])
+                    for item in first["trials"]]
+    second_trials = [(item["fingerprint"], item["stage"], item["verdict"], item["reason"])
+                     for item in second["trials"]]
+    assert first_trials == second_trials
+    assert len(set(first_trials)) > 1, "a single repeated trial would satisfy any equality"
 
 
-def test_run_is_reproducible_on_the_candidate_sequence_too():
+def test_run_is_reproducible_candidate_sequence_including_order():
     first, _ = _search(seed=11, thresholds=_NO_DEDUPLICATION)
     second, _ = _search(seed=11, thresholds=_NO_DEDUPLICATION)
-    assert first["candidates"] and second["candidates"]
-    assert [item["fingerprint"] for item in first["candidates"]] == \
-           [item["fingerprint"] for item in second["candidates"]]
+    first_candidates = [item["fingerprint"] for item in first["candidates"]]
+    second_candidates = [item["fingerprint"] for item in second["candidates"]]
+    assert first_candidates == second_candidates
+    assert len(set(first_candidates)) > 1
 
 
 def test_trials_carry_the_ladder_verdict_shape():
@@ -322,12 +344,75 @@ def test_fold_signs_are_the_four_equal_folds_of_the_series():
     assert _fold_ic_signs(series) == [1.0, -1.0, 1.0, 1.0]
 
 
-def test_fold_signs_of_an_absent_series_are_empty():
-    assert _fold_ic_signs(None) == []
-    assert _fold_ic_signs([]) == []
+def test_fold_signs_of_an_absent_series_raise_rather_than_skip_the_check():
+    """An unreadable IC series must not leave L3 quietly missing its fold-consistency check."""
+    with pytest.raises(ValueError, match="factorMining.missingIcSeries"):
+        _fold_ic_signs(None)
+    with pytest.raises(ValueError, match="factorMining.missingIcSeries"):
+        _fold_ic_signs([])
 
 
-def test_redundancy_gate_rejects_a_builtin_duplicate(monkeypatch):
+_MOMENTUM_5 = {"op": "ts_pct_change", "args": ["close"], "params": {"n": 5}}
+_NEGATED_MOMENTUM_5 = {"op": "neg", "args": [dict(_MOMENTUM_5)], "params": {}}
+
+
+def _candidate(expression):
+    from app.services.factor_mining.dsl import normalize_expression
+    from app.services.factor_mining.templates import CandidateSeed
+
+    return CandidateSeed(expression=expression,
+                         fingerprint=normalize_expression(expression).fingerprint,
+                         template_id="handmade", origin="template", params={"N": 1})
+
+
+def _redundancy_views(monkeypatch, expressions):
+    """The L4 mapping the loop derives for each expression, read off the recorded trials."""
+    result, _ = _run_with_seeds(monkeypatch, [_candidate(item) for item in expressions],
+                                thresholds=_NO_DEDUPLICATION)
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    return [engine._correlations(item["metrics"]) for item in result["trials"]]
+
+
+def test_the_redundancy_gate_measures_the_candidate_not_a_builtin(monkeypatch):
+    """Two candidates with opposite signals must get two opposite L4 mappings.
+
+    The fixture's prices are geometric curves, so every expression ranks the symbols the same
+    way and a candidate can only differ from another by sign -- which is exactly the difference
+    asserted here. When ``_factor_correlation`` regenerates the selected factor instead of
+    using the injected panel, both candidates come back with the built-in ``momentum_20``'s
+    correlations and this equality holds for any pair, which is what makes the gate decorative.
+    """
+    momentum, negated = _redundancy_views(monkeypatch, [_MOMENTUM_5, _NEGATED_MOMENTUM_5])
+    assert momentum and negated, "a gate with no measurement at all proves nothing"
+    assert momentum != negated
+    assert momentum["reversal_5"] == pytest.approx(-1.0, abs=1e-9)
+    assert negated["reversal_5"] == pytest.approx(1.0, abs=1e-9)
+
+
+def test_redundancy_gate_rejects_the_candidate_that_duplicates_a_builtin(monkeypatch):
+    """Of two candidates, only the built-in's duplicate is rejected -- and for that reason.
+
+    ``ts_pct_change(close, 5)`` is the exact reverse of the ``reversal_5`` built-in, so their
+    cross-sectional ranks agree at a correlation of 1.0 and the de-duplication gate must fire.
+    Its negation correlates at the same magnitude but the opposite sign, and the gate compares
+    magnitude, so it passes. Two candidates, two different verdicts, both from the same gate:
+    that is only possible if the gate is looking at each candidate's own values.
+    """
+    result, _ = _run_with_seeds(monkeypatch, [_candidate(_MOMENTUM_5), _candidate(_NEGATED_MOMENTUM_5)],
+                                thresholds=GateThresholds(
+                                    min_ic_observations=5, min_abs_rank_ic=0.0, min_icir=0.0,
+                                    min_fold_consistency=0.0, max_turnover=1.0, min_coverage=0.0,
+                                    max_builtin_correlation=1.1))
+    assert [item["verdict"] for item in result["trials"]] == ["pass", "pass"]
+
+    rejected, _ = _run_with_seeds(monkeypatch, [_candidate(_MOMENTUM_5)],
+                                  thresholds=GateThresholds(
+                                      min_ic_observations=5, min_abs_rank_ic=0.0, min_icir=0.0,
+                                      min_fold_consistency=0.0, max_turnover=1.0, min_coverage=0.0,
+                                      max_builtin_correlation=0.85))
+    assert rejected["trials"][0]["stage"] == "L4"
+    assert rejected["trials"][0]["reason"] == "factorMining.reject.duplicateBuiltin"
+
     """L4 is reached and handed real correlations, and rejects a duplicate as one.
 
     The fixture's candidates track the ``reversal_5`` built-in at a correlation of 1.0, so a
@@ -365,6 +450,49 @@ def test_members_without_a_key_are_reported_as_no_membership():
     assert _resolved_members([{"market": "USStock", "symbol": "A", "effectiveFrom": None}]) == ()
     keyed = [{"key": "USStock:A", "market": "USStock", "symbol": "A"}]
     assert _resolved_members(keyed) == keyed
+
+
+def test_the_search_does_not_write_into_the_shared_candidate_expansion():
+    """The expanded seeds are shared, so the loop must not touch their expression or params.
+
+    A template's base expression is the same object as its two smoothing variants' inner
+    argument, and ``params`` feeds the fingerprint -- writing a field into either would
+    silently rewrite siblings that share the object, and the run would keep going with a
+    different candidate set than the one it recorded. Comparing against a freshly expanded
+    copy catches both an added key and a changed value.
+    """
+    fresh = {seed.fingerprint: seed for seed in expand_candidates(
+        template_ids=None, budget=12, seed=3)}
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
+    assert result["candidates"]
+    for item in result["candidates"]:
+        expected = fresh[item["fingerprint"]]
+        assert item["expression"] == expected.expression
+        assert item["expression"].keys() == expected.expression.keys()
+        assert repr(item["expression"]) == repr(expected.expression)
+
+
+def test_the_point_in_time_universe_is_applied_per_date(monkeypatch):
+    """A member that joins the universe mid-window never appears in an earlier cross-section.
+
+    ``USStock:F`` carries a ``membership_periods`` starting in May. The research engine records
+    the symbols it grouped on every date, so the test reads that ledger directly: F is held
+    after it joins, and absent before -- which is what says the point-in-time universe is
+    actually being evaluated rather than waved through.
+    """
+    frames, members = _fixture()
+    monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: _seeds(1))
+    result, _ = _run(frames, members, thresholds=_NO_DEDUPLICATION)
+    groups = result["candidates"][0]["metrics"]["groupObservations"]
+    assert groups, "no cross-section was grouped"
+    joined = datetime(2024, 5, 1)
+    before = [item for item in groups if datetime.fromisoformat(item["time"]) < joined]
+    after = [item for item in groups if datetime.fromisoformat(item["time"]) >= joined]
+    assert before and after, "the window must span both sides of F's membership start"
+    assert not any("USStock:F" in item["members"] for item in before)
+    assert any("USStock:F" in item["members"] for item in after)
+    assert all(item["crossSectionSize"] == 5 for item in before)
+    assert any(item["crossSectionSize"] == 6 for item in after)
 
 
 def test_keyless_members_leave_the_search_running_rather_than_blanking_it(monkeypatch):

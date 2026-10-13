@@ -488,15 +488,21 @@ def _metrics_payload(result: Mapping[str, Any], config: MiningConfig) -> dict[st
 def _fold_ic_signs(ic_series: Any) -> list[float]:
     """Signs of the four equal folds of the IC series: L3's fold-consistency input.
 
-    The gate reads an absent series as "not evaluated" and skips the check, so leaving it
-    unwritten would silently drop the one stability check that can catch a factor whose edge
-    comes from a single stretch of the window. An IC series with fewer observations than folds
-    is split into that many folds rather than padded, so no fold is ever empty. A fold whose
-    mean reads exactly zero contributes a neutral sign rather than a vote.
+    An absent series is an error rather than an empty result. The gate reads a series shorter
+    than two entries as "not evaluated" and skips the fold check, so returning empty here would
+    turn "the research engine handed back no IC series" into a silently weaker gate -- the
+    candidate would be screened on everything except fold consistency and nobody would see it.
+    Raising keeps the candidate-level guard's verdict (``factorMining.reject.invalid``) honest.
+
+    An IC series with fewer observations than folds is split into that many folds rather than
+    padded, so no fold is ever empty. A fold whose mean reads exactly zero contributes a
+    neutral sign rather than a vote.
     """
-    values = [float(item["value"]) for item in ic_series or () if "value" in item]
+    if ic_series is None:
+        raise ValueError("factorMining.missingIcSeries")
+    values = [float(item["value"]) for item in ic_series if "value" in item]
     if not values:
-        return []
+        raise ValueError("factorMining.missingIcSeries")
     size = math.ceil(len(values) / min(4, len(values)))
     signs: list[float] = []
     for start in range(0, len(values), size):

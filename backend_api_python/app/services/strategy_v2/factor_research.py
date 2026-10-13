@@ -51,7 +51,11 @@ class FactorResearchEngine:
         there. Every other branch is unchanged."""
         requested_groups = max(2, min(10, int(groups or 5)))
         holding_period = max(1, int(holding_period or 5))
-        factor_name = str(factor_id or "momentum_20").strip().lower()
+        # A caller that injects its own panel studies that panel, not a built-in -- and must not
+        # borrow a built-in's name, or the correlation study would de-duplicate the candidate
+        # away against the built-in it is named after and compare one factor fewer.
+        default_name = "expression" if factor_panel is not None else "momentum_20"
+        factor_name = str(factor_id or default_name).strip().lower()
         start = self._timestamp(start_date)
         end = self._timestamp(end_date)
         prepared = self._prepare_frames(frames, end)
@@ -265,6 +269,7 @@ class FactorResearchEngine:
                 membership,
                 research_dates,
                 factor_name,
+                selected_panel=factor_panel,
             ),
             "stability": {
                 "firstHalfIc": float(first_half.mean()) if not first_half.empty else 0.0,
@@ -448,11 +453,22 @@ class FactorResearchEngine:
         membership: pd.DataFrame,
         research_dates: Sequence[pd.Timestamp],
         selected_factor: str,
+        selected_panel: pd.DataFrame | None = None,
     ) -> dict[str, Any]:
+        """Correlate the studied factor against the built-in pool, one cross-section at a time.
+
+        ``selected_panel`` is the studied factor's own values, for a caller whose factor is not
+        a built-in: without it the selected name is looked up as a built-in like any other, and
+        a caller that injected its own panel would silently get the built-in's correlations --
+        a matrix that is identical for every candidate, which de-duplicates nothing.
+        """
         names = list(dict.fromkeys((selected_factor, *self._CORRELATION_FACTORS)))
         panels: dict[str, pd.DataFrame] = {}
         for name in names:
-            panel = self._factor_panel(frames, name, close)
+            if selected_panel is not None and name == selected_factor:
+                panel = selected_panel
+            else:
+                panel = self._factor_panel(frames, name, close)
             visible = panel.reindex(index=research_dates)
             if int(visible.notna().sum().sum()) >= 3:
                 panels[name] = panel
