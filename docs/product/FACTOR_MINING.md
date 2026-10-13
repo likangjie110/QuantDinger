@@ -212,9 +212,7 @@ denominator used at L5.
 **A ledger row keeps only what the gates read.** The trial's `metrics` carries `coverage`,
 `rankIc`, `icir`, `foldIcSigns`, `averageTurnover`, `stability`, the `executionAssumptions` block,
 and `icObservations` -- the **length** of the IC series, under its own key, because L2 asks how many
-observations there were and never what they were. Everything else (the IC series itself, the group
-and long/short curves, the per-date cross-sections, the correlation matrix) stays on the
-**candidate**, whose detail view serves it. The ledger has one row per evaluation, so an untrimmed
+observations there were and never what they were. The rest (the IC series itself, the group and long/short curves, the per-date cross-sections, the correlation matrix) is kept on the **candidate** only for a candidate that reached the ledger's pass side -- survivors, and the ones the frozen review then judged; a candidate rejected at L1--L4 never gets a candidate row, so its ledger row is all that remains of it. The ledger has one row per evaluation, so an untrimmed
 row is what makes a run's record grow with the budget: at 200 symbols one is 0.78 MB, and a budget
 of 400 would persist roughly a third of a gigabyte per run -- three times over, since the record is
 written to `qd_factor_trials`, `qd_factor_mining_runs.result_json`, and `qd_agent_jobs.result`.

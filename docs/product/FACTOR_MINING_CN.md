@@ -145,7 +145,7 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 **全部试验（含失败）留痕。** 每个被评估的候选都往 `qd_factor_trials` 写一行，通过和淘汰一视同仁。这份台账的条数就是 L5 里 DSR 的分母。
 
-**台账行只保留门槛会读的字段。** 试验的 `metrics` 里只有 `coverage`、`rankIc`、`icir`、`foldIcSigns`、`averageTurnover`、`stability`、`executionAssumptions`，以及 `icObservations`——IC 序列的**长度**，单独一个键，因为 L2 只问观测数有多少，从不问观测值是什么。其余内容（IC 序列本身、分组与多空曲线、逐日截面、相关度矩阵）只留在**候选**上，由候选详情接口提供。台账是一次评估一行，所以不裁剪的就是让运行记录随预算膨胀的那一项：200 标的时单行 0.78 MB，`budget=400` 的一次运行要落大约三分之一 GB——而且是三份，因为同一份记录同时写进 `qd_factor_trials`、`qd_factor_mining_runs.result_json` 与 `qd_agent_jobs.result`。
+**台账行只保留门槛会读的字段。** 试验的 `metrics` 里只有 `coverage`、`rankIc`、`icir`、`foldIcSigns`、`averageTurnover`、`stability`、`executionAssumptions`，以及 `icObservations`——IC 序列的**长度**，单独一个键，因为 L2 只问观测数有多少，从不问观测值是什么。其余内容（IC 序列本身、分组与多空曲线、逐日截面、相关度矩阵）只对走到台账通过侧的候选留在**候选**行上——幸存者，以及此后被冻结段复核过的那些；在 L1–L4 就被淘汰的候选从没有候选行，对它而言那条台账行就是仅存的记录。台账是一次评估一行，所以不裁剪的就是让运行记录随预算膨胀的那一项：200 标的时单行 0.78 MB，`budget=400` 的一次运行要落大约三分之一 GB——而且是三份，因为同一份记录同时写进 `qd_factor_trials`、`qd_factor_mining_runs.result_json` 与 `qd_agent_jobs.result`。
 
 **数据指纹。** `summary.snapshotId` 是对面板内容算出的真实指纹：按标的排序，逐个把该标的的规范 OHLCV 字节混入 `sha256`（标的代码也参与哈希）。它是**数据指纹，不是可重放副本**——v1 只存指纹，不存行情快照。
 
