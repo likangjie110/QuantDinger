@@ -515,7 +515,7 @@ def test_a_run_made_under_a_patched_expansion_is_never_memoized(monkeypatch):
     to store a run it cannot attribute to the real expansion.
 
     This patches by hand rather than through ``_patched_expansion``: that helper's ``finally``
-    empties the memo, which would hide the very write being asserted here.
+    drops every entry its block added, which would hide the very write being asserted here.
     """
     monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: _seeds(1))
     patched, _ = _search(thresholds=_NO_DEDUPLICATION)
