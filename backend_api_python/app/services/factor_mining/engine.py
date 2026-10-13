@@ -7,12 +7,13 @@ never grows a second data layer with its own time semantics. Second the split: t
 range is cut into a search window and a frozen tail, and the tail is never fetched here; the
 out-of-sample review asks for it separately, once.
 
-Two decisions are invisible in the signatures. The fetch covers the DSL's maximum lookback of
-history *before* the search window, because the panel is evaluated over the fetched window and
-only then cut to the search window -- a shorter warmup would judge long-window candidates on a
-partly NaN factor and fail them on coverage, so the gate would compare window length instead
-of signal quality. And the field panels are pinned to one shared index and column order with a
-missing field kept as a NaN column, which is what the evaluator assumes when it aligns a
+Two decisions are invisible in the signatures. The fetch carries enough history *before* the
+search window for the candidates this run will actually evaluate -- the same template
+selection, budget and seed the search loop expands -- because the panel is evaluated over the
+fetched window and only then cut to the search window; budgeting the DSL's ceiling instead
+would cost several times the provider history and, where a policy caps it, silently shorten the
+window the run can search. And the field panels are pinned to one shared index and column order
+with a missing field kept as a NaN column, which is what the evaluator assumes when it aligns a
 candidate to ``fields["close"]``.
 
 The provider falls back to the real services so the search and freeze stages can construct it
