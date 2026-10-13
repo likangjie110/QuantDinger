@@ -24,7 +24,9 @@ review's own statuses, into the result ``finish_run`` persists.
 
 The runner is a bound method (``runner=self._run_mining_job``) rather than a module-level
 function, so the collaborators this layer injects -- repository, engine factory, backtest service
--- are the same ones the job actually runs with.
+-- are the same ones the job actually runs with. ``run_mining_job`` is the module-level shell the
+durable (Celery) path imports; it resolves the process singleton and calls that same bound method,
+so both dispatch paths execute one implementation.
 """
 
 from __future__ import annotations
@@ -258,6 +260,30 @@ class FactorMiningService:
             default_commission=DEFAULT_COMMISSION,
             default_slippage=DEFAULT_SLIPPAGE,
         )
+
+
+_service: FactorMiningService | None = None
+
+
+def get_factor_mining_service() -> FactorMiningService:
+    """The process-wide service, shared by the HTTP routes and the durable job runner."""
+    global _service
+    if _service is None:
+        _service = FactorMiningService()
+    return _service
+
+
+def run_mining_job(
+    payload: Mapping[str, Any],
+    on_progress: Callable | None = None,
+) -> dict[str, Any]:
+    """Run one persisted job from its request payload.
+
+    The entry point the Celery worker imports. It is deliberately a shell: the orchestration stays
+    on the service, so both dispatch paths -- the in-process pool's bound method and this one --
+    run the same implementation with the same collaborators.
+    """
+    return get_factor_mining_service()._run_mining_job(payload, on_progress)
 
 
 def _public_job(row: Mapping[str, Any] | None) -> dict[str, Any] | None:

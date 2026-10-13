@@ -15,6 +15,7 @@ import pytest
 from app.services.factor_mining import service as mining_service
 from app.services.factor_mining.engine import MiningDataProvider
 from app.services.factor_mining.service import FactorMiningService
+from app.tasks import agent_jobs as celery_agent_jobs
 
 
 USER_ID = 4
@@ -409,3 +410,39 @@ def test_runner_refuses_a_missing_source_before_opening_a_run(monkeypatch):
         service._run_mining_job({"__userId": USER_ID, **_payload()}, _PROGRESS)
 
     assert repository.trace == []
+
+
+# ─────────────────────────────── celery dispatch ───────────────────────────────
+
+def test_celery_dispatches_factor_mining_to_the_service_runner(monkeypatch):
+    """An unregistered kind degrades to the in-process pool, where a restart loses the job."""
+    assert celery_agent_jobs.supports_kind("factor_mining") is True
+
+    captured = {}
+
+    def runner(payload, on_progress):
+        captured.update(payload=payload, on_progress=on_progress)
+        return {"summary": {"frozen": 1}}
+
+    monkeypatch.setattr(mining_service, "run_mining_job", runner)
+    progress = lambda event: event
+
+    result = celery_agent_jobs._execute("factor_mining", {"__userId": 17, "sourceId": 9}, progress)
+
+    assert result == {"summary": {"frozen": 1}}
+    assert captured == {"payload": {"__userId": 17, "sourceId": 9}, "on_progress": progress}
+
+
+def test_run_mining_job_shell_delegates_to_the_process_singleton(monkeypatch):
+    """The durable entry point is a shell: the orchestration stays on the injected service."""
+    captured = {}
+
+    class _Service:
+        def _run_mining_job(self, payload, on_progress):
+            captured.update(payload=payload, on_progress=on_progress)
+            return {"ok": True}
+
+    monkeypatch.setattr(mining_service, "get_factor_mining_service", lambda: _Service())
+
+    assert mining_service.run_mining_job({"__userId": 17}, None) == {"ok": True}
+    assert captured == {"payload": {"__userId": 17}, "on_progress": None}
