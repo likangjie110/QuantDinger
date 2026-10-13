@@ -53,11 +53,16 @@ def _query_int(name: str) -> int | None:
         raise ValueError("factorMining.invalidQuery") from exc
 
 
-def _public_job(job: dict | None) -> dict | None:
-    """A job receipt as the API spells it: the service's own payload, timestamps in ISO-8601."""
-    if not job:
-        return job
-    return {key: _iso(value) for key, value in job.items()}
+def _iso_timestamps(payload: dict | None) -> dict | None:
+    """A stored row as the API spells it: every top-level ``datetime`` becomes ISO-8601.
+
+    Shape-neutral on purpose: the job columns and the candidate columns are both naive UTC, so
+    a receipt, a listed job, and a library row all have to leave through here -- one column
+    rendered as RFC-822 next to another rendered as ISO-8601 is the same API speaking twice.
+    """
+    if not payload:
+        return payload
+    return {key: _iso(value) for key, value in payload.items()}
 
 
 def _iso(value):
@@ -101,7 +106,7 @@ def run_factor_mining():
     """Queue one mining run. 202: the receipt is the job, not its result."""
     try:
         data = get_factor_mining_service().submit(user_id=int(g.user_id), payload=_run_payload())
-        return jsonify({"code": 1, "msg": "common.success", "data": _public_job(data)}), 202
+        return jsonify({"code": 1, "msg": "common.success", "data": _iso_timestamps(data)}), 202
     except ValueError as exc:
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
     except Exception:
@@ -117,7 +122,7 @@ def list_factor_mining_jobs():
         limit = max(1, min(_query_int("limit") or 20, 50))
         items = get_factor_mining_service().list_jobs(user_id=int(g.user_id), limit=limit)
         return jsonify({"code": 1, "msg": "common.success", "data": {
-            "items": [_public_job(item) for item in items],
+            "items": [_iso_timestamps(item) for item in items],
         }})
     except ValueError as exc:
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
@@ -130,7 +135,7 @@ def get_factor_mining_job(job_id: str):
     job = get_factor_mining_service().get_job(job_id, user_id=int(g.user_id))
     if not job:
         return jsonify({"code": 0, "msg": "factorMining.jobNotFound", "data": None}), 404
-    return jsonify({"code": 1, "msg": "common.success", "data": _public_job(job)})
+    return jsonify({"code": 1, "msg": "common.success", "data": _iso_timestamps(job)})
 
 
 @factor_mining_blp.route("/jobs/<job_id>/cancel", methods=["POST"])
@@ -140,7 +145,7 @@ def cancel_factor_mining_job(job_id: str):
     job = get_factor_mining_service().cancel_job(job_id, user_id=int(g.user_id))
     if not job:
         return jsonify({"code": 0, "msg": "factorMining.jobNotFound", "data": None}), 404
-    return jsonify({"code": 1, "msg": "common.success", "data": _public_job(job)})
+    return jsonify({"code": 1, "msg": "common.success", "data": _iso_timestamps(job)})
 
 
 @factor_mining_blp.route("/candidates", methods=["GET"])
@@ -156,14 +161,16 @@ def list_factor_mining_candidates():
             limit=max(1, min(_query_int("limit") or 50, 200)),
             offset=max(0, _query_int("offset") or 0),
         )
-        return jsonify({"code": 1, "msg": "common.success", "data": {"items": items}})
+        return jsonify({"code": 1, "msg": "common.success", "data": {
+            "items": [_iso_timestamps(item) for item in items],
+        }})
     except ValueError as exc:
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
 
 
 @factor_mining_blp.route("/candidates/<candidate_id>", methods=["GET"])
 @login_required
-def get_candidate(candidate_id: int):
+def get_candidate(candidate_id: str):
     """One candidate with the metrics and out-of-sample block a list row leaves behind."""
     try:
         identifier = int(candidate_id)
@@ -173,4 +180,4 @@ def get_candidate(candidate_id: int):
     candidate = get_factor_mining_service().get_candidate(identifier, user_id=int(g.user_id))
     if not candidate:
         return jsonify({"code": 0, "msg": "factorMining.candidateNotFound", "data": None}), 404
-    return jsonify({"code": 1, "msg": "common.success", "data": candidate})
+    return jsonify({"code": 1, "msg": "common.success", "data": _iso_timestamps(candidate)})

@@ -6,6 +6,7 @@ rejection or a missing row turns into, and that a stored timestamp leaves as ISO
 than the RFC-822 ``jsonify`` renders for a native ``datetime``.
 """
 
+import dataclasses
 import inspect
 from datetime import datetime, timezone
 
@@ -13,6 +14,7 @@ import pytest
 from flask import Flask, g
 
 from app.routes import factor_mining as mining_routes
+from app.services.factor_mining.engine import MiningConfig
 
 
 USER_ID = 23
@@ -81,6 +83,12 @@ def _invoke(app, view, *args, path="/", **request_kwargs):
         return inspect.unwrap(view)(*args)
 
 
+def _camel(name: str) -> str:
+    """``template_ids`` -> ``templateIds``: the mapping the run payload's keys are spelled with."""
+    head, *rest = name.split("_")
+    return head + "".join(part.title() for part in rest)
+
+
 def _receipt(**overrides):
     base = {
         "jobId": "job-9",
@@ -94,6 +102,17 @@ def _receipt(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def _candidate(**overrides):
+    """A library row as ``FactorMiningRepository._hydrate_candidate`` hands it over."""
+    row = {
+        "id": 5, "userId": USER_ID, "runId": 7, "expressionHash": "a" * 64, "origin": "template",
+        "templateId": "momentum", "market": "USStock", "timeframe": "1D", "status": "frozen",
+        "reason": "", "createdAt": None, "updatedAt": None, "expression": {"op": "close"},
+    }
+    row.update(overrides)
+    return row
 
 
 def test_run_returns_202_with_job_receipt(app, service):
@@ -143,6 +162,12 @@ def test_run_drops_request_keys_a_run_config_never_reads(app, service):
     assert stub.calls["submit"]["payload"] == {
         "sourceId": 1, "budget": 20, "thresholds": {"min_icir": 0.4},
     }
+
+
+def test_run_field_whitelist_matches_the_config_it_feeds():
+    """The whitelist is a hand-copied key set, so a field added to ``MiningConfig`` and forgotten
+    here would drop the caller's value silently: the job would search the default instead."""
+    assert {_camel(field.name) for field in dataclasses.fields(MiningConfig)} == mining_routes._RUN_FIELDS
 
 
 def test_estimate_prices_the_search_and_drops_unknown_keys(app, service):
@@ -203,7 +228,7 @@ def test_cancel_returns_the_receipt_and_404s_for_an_unknown_job(app, service):
 
 
 def test_candidate_list_forwards_the_library_filters(app, service):
-    stub = service(list_candidates=[{"candidateId": 5}])
+    stub = service(list_candidates=[_candidate()])
     response = _invoke(
         app, mining_routes.list_factor_mining_candidates,
         path="/api/factor-mining/candidates?runId=7&status=frozen&market=USStock&limit=10&offset=20",
@@ -212,7 +237,24 @@ def test_candidate_list_forwards_the_library_filters(app, service):
         "user_id": USER_ID, "run_id": 7, "status": "frozen",
         "market": "USStock", "limit": 10, "offset": 20,
     }
-    assert response.get_json()["data"]["items"] == [{"candidateId": 5}]
+    assert response.get_json()["data"]["items"] == [_candidate()]
+
+
+def test_candidate_timestamps_leave_as_iso8601(app, service):
+    """The library columns are naive UTC like the job columns, so both exits normalize."""
+    service(
+        list_candidates=[_candidate(createdAt=datetime(2026, 10, 13, 18, 0))],
+        get_candidate=_candidate(
+            createdAt=datetime(2026, 10, 13, 18, 0),
+            updatedAt=datetime(2026, 10, 13, 19, 30, tzinfo=timezone.utc),
+        ),
+    )
+    listed = _invoke(app, mining_routes.list_factor_mining_candidates).get_json()["data"]["items"]
+    detail = _invoke(app, mining_routes.get_candidate, "5").get_json()["data"]
+    assert listed[0]["createdAt"] == "2026-10-13T18:00:00+00:00"
+    assert listed[0]["updatedAt"] is None
+    assert detail["createdAt"] == "2026-10-13T18:00:00+00:00"
+    assert detail["updatedAt"] == "2026-10-13T19:30:00+00:00"
 
 
 def test_candidate_list_rejects_an_unreadable_filter(app, service):
@@ -235,7 +277,7 @@ def test_candidate_detail_returns_404_for_unknown_id(app, service):
 
 
 def test_candidate_detail_returns_the_candidate_with_its_metrics(app, service):
-    service(get_candidate={"candidateId": 9, "status": "frozen", "metrics": {"rankIc": 0.03}})
+    service(get_candidate=_candidate(status="frozen", metrics={"rankIc": 0.03}))
     response = _invoke(app, mining_routes.get_candidate, "9")
     assert response.status_code == 200
     assert response.get_json()["data"]["metrics"] == {"rankIc": 0.03}
