@@ -203,10 +203,19 @@ def test_persist_run_serializes_config_datetimes_as_iso8601(monkeypatch):
     assert {"apiVersion": 1} in stored
 
 
-def test_count_trials_reports_the_runs_ledger(monkeypatch):
-    _record(monkeypatch, row={"total": 250})
+def test_count_trials_counts_only_within_the_callers_own_run(monkeypatch):
+    """The scope is in the statement: the count joins the run and filters on its owner.
 
-    assert FactorMiningRepository().count_trials(9) == 250
+    Offline evidence only -- that the statement carries the user scope. Whether another user's
+    ``run_id`` really counts 0 is a database question, and belongs to the integration script.
+    """
+    cursor = _record(monkeypatch, row={"total": 250})
+
+    assert FactorMiningRepository().count_trials(9, user_id=4) == 250
+
+    sql, params = cursor.statements[0]
+    assert params == (9, 4)
+    assert "run.user_id = ?" in sql
 
 
 def test_list_candidates_scopes_to_the_user_and_the_requested_filters(monkeypatch):

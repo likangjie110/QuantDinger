@@ -253,18 +253,24 @@ class FactorMiningRepository:
             cur.close()
         return len(rows)
 
-    def count_trials(self, run_id: int) -> int:
+    def count_trials(self, run_id: int, *, user_id: int) -> int:
         """The run's whole ledger: the denominator the out-of-sample review is priced by.
 
-        Scoped by ``run_id`` rather than by user because it answers the orchestration layer's own
-        question about a run it just wrote. A user-facing count comes from ``get_run``, which is
-        user-scoped and carries the same total as ``trialsCount``.
+        Counted only within the caller's own run. The scope comes through the run rather than
+        through the trial rows' own ``user_id``: a trial belongs to whoever owns the run that wrote
+        it, so joining the owner is what makes a cross-tenant count impossible instead of merely
+        unused.
         """
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                "SELECT COUNT(*) AS total FROM qd_factor_trials WHERE run_id = ?",
-                (int(run_id),),
+                """
+                SELECT COUNT(*) AS total
+                FROM qd_factor_trials AS trial
+                JOIN qd_factor_mining_runs AS run ON run.id = trial.run_id
+                WHERE trial.run_id = ? AND run.user_id = ?
+                """,
+                (int(run_id), int(user_id)),
             )
             row = cur.fetchone() or {}
             cur.close()
