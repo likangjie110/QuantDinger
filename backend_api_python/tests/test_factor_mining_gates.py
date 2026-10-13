@@ -99,7 +99,7 @@ def test_screen_metrics_reads_missing_metrics_as_unmet():
         "factorMining.reject.insufficientObservations")
 
 
-def test_gates_neutralize_nan_and_keep_infinities():
+def test_gates_fail_closed_on_unmeasurable_and_infinite_metrics():
     # NaN compares False against every bar, so left alone it would walk a poisoned candidate
     # through the whole ladder. An infinity is a real reading, and it fails the gate it faces.
     assert screen_metrics(_metrics(coverage=float("nan")), GateThresholds()).reason == (
@@ -108,9 +108,11 @@ def test_gates_neutralize_nan_and_keep_infinities():
     assert screen_stability(_metrics(icir=float("nan")), GateThresholds()).reason == "factorMining.reject.weakIcir"
     assert screen_stability(_metrics(averageTurnover=float("inf")), GateThresholds()).reason == (
         "factorMining.reject.highTurnover")
-    # A NaN turnover is no evidence either, and no evidence passes a friction gate -- the same
-    # direction an absent turnover takes.
-    assert screen_stability(_metrics(averageTurnover=float("nan")), GateThresholds()).passed is True
+    # An unmeasurable turnover is not a low one -- L3 and L4 fail closed together. An absent
+    # turnover still reads as no excess, which is the preserved "missing reads as 0.0" policy.
+    assert screen_stability(_metrics(averageTurnover=float("nan")), GateThresholds()).reason == (
+        "factorMining.reject.highTurnover")
+    assert screen_stability(_metrics(averageTurnover=None), GateThresholds()).passed is True
 
 
 def test_screen_stability_thresholds_are_inclusive():
