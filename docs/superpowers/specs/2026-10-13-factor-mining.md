@@ -167,7 +167,7 @@ backend_api_python/migrations/20261013_factor_mining.sql
 | L1 | DSL 合规、字段可用、深度/节点/回看合规、可求值 | — | `factorMining.reject.invalid` |
 | L2 | 覆盖率、观测数、信号强度、非常量 | `coverage >= 0.60`；IC 观测数 `>= 30`；`abs(rankIC) >= 0.02` | `.lowCoverage` / `.insufficientObservations` / `.weakIc` |
 | L3 | ICIR、滚动折一致性、前后半一致、换手 | `ICIR >= 0.30`；折 IC 同号率 `>= 0.60`；前半/后半 IC 同号；平均换手 `<= 0.70` | `.weakIcir` / `.unstableFolds` / `.unstableHalves` / `.highTurnover` |
-| L4 | 与内置 61 因子相关性去重 | 与任一内置因子 `abs(corr) >= 0.85` → 淘汰 | `.duplicateBuiltin` |
+| L4 | 与内置 61 因子相关性去重 | 与任一内置因子 `abs(corr) >= 0.85` → 淘汰；NaN/缺失条目视为「无重复证据」而忽略；**过滤后无任何有限值 → 淘汰** | `.duplicateBuiltin` / `.unverifiableRedundancy` |
 | L5 | 冻结段样本外 + 选择偏差校正 | OOS `abs(rankIC) >= 0.01` 且与 IS 同号；`deflated_sharpe(observed_sharpe, trials=该 run 全部 trial 数).probability >= 0.95` | `.weakOutOfSample` / `.selectionBias` |
 
 门槛全部来自 run 配置，可覆盖但覆盖后在 run 记录留痕。L4 的候选间数值去重与因子池增量评估属 v2。
