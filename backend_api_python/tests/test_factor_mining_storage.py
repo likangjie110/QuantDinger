@@ -12,15 +12,20 @@ import json
 from contextlib import contextmanager
 from datetime import datetime
 
+import pytest
+
 from app.services.factor_mining import storage
 from app.services.factor_mining.storage import FactorMiningRepository
 
+# What the ownership precheck's ``SELECT 1`` returns when the run belongs to the caller.
+_OWNED_RUN = {"?column?": 1}
+
 
 class _RecordingCursor:
-    def __init__(self, row=None):
+    def __init__(self, rows=()):
         self.statements = []
         self.lastrowid = 9  # what PostgresCursor exposes after an INSERT .. RETURNING id
-        self.row = row
+        self.rows = list(rows)
 
     def execute(self, sql, params=None):
         self.statements.append((sql, params))
@@ -29,7 +34,7 @@ class _RecordingCursor:
         self.statements.append((sql, [tuple(row) for row in params_list]))
 
     def fetchone(self):
-        return self.row
+        return self.rows.pop(0) if self.rows else None
 
     def fetchall(self):
         return []
@@ -50,9 +55,14 @@ class _RecordingConnection:
         self.commits += 1
 
 
-def _record(monkeypatch, *, row=None) -> _RecordingCursor:
-    """Point the repository at a recording connection and return its cursor."""
-    cursor = _RecordingCursor(row=row)
+def _record(monkeypatch, *, rows=()) -> _RecordingCursor:
+    """Point the repository at a recording connection and return its cursor.
+
+    ``rows`` is what each ``fetchone`` returns in turn, so a test that writes passes one
+    ``_OWNED_RUN`` per write (the ownership check the repository runs first) and a test that must
+    find nothing passes ``[None]``.
+    """
+    cursor = _RecordingCursor(rows=rows)
     connection = _RecordingConnection(cursor)
 
     @contextmanager
@@ -127,9 +137,9 @@ def test_hydrate_run_keeps_an_unreadable_result_out_of_the_summary():
     assert summary["errorMessage"] == "boom"
 
 
-def test_save_trials_writes_rejected_trials_and_returns_the_row_count(monkeypatch):
+def test_save_trials_counts_failures(monkeypatch):
     """The ledger's count is the deflated-Sharpe denominator, so nothing may be filtered out."""
-    cursor = _record(monkeypatch)
+    cursor = _record(monkeypatch, rows=[_OWNED_RUN])
     trials = [
         {"fingerprint": "a" * 64, "stage": "L2", "verdict": "reject",
          "reason": "factorMining.reject.weakIc", "metrics": {"rankIc": 0.001}},
@@ -141,12 +151,42 @@ def test_save_trials_writes_rejected_trials_and_returns_the_row_count(monkeypatc
 
     written = FactorMiningRepository().save_trials(9, user_id=4, trials=trials)
 
-    sql, rows = cursor.statements[0]
+    sql, rows = cursor.statements[-1]
     assert written == 3
     assert len(rows) == len(trials)
     assert sql.count("?") == len(rows[0])  # every placeholder is bound
     assert any("factorMining.reject.weakIc" in row for row in rows)
     assert any("factorMining.reject.invalid" in row for row in rows)
+
+
+def test_save_trials_takes_the_owner_from_the_run_not_the_caller(monkeypatch):
+    """A trial's ``user_id`` comes from the run it belongs to, inside the insert itself."""
+    cursor = _record(monkeypatch, rows=[_OWNED_RUN])
+
+    FactorMiningRepository().save_trials(
+        9, user_id=4,
+        trials=[{"fingerprint": "a" * 64, "stage": "L1", "verdict": "reject",
+                 "reason": "factorMining.reject.invalid", "metrics": {}}],
+    )
+
+    check, insert = cursor.statements
+    sql, rows = insert
+    assert "SELECT ?, run.user_id, ?, ?, ?, ?, ?" in sql
+    assert "WHERE run.id = ? AND run.user_id = ?" in sql
+    assert rows[0][-2:] == (9, 4)
+    assert "user_id" in check[0]  # the check that ran first was the ownership one
+
+
+def test_save_trials_refuses_a_run_that_is_not_the_callers(monkeypatch):
+    """A foreign run raises before anything is written -- never a silent zero-row ledger."""
+    cursor = _record(monkeypatch, rows=[None])
+    trials = [{"fingerprint": "a" * 64, "stage": "L2", "verdict": "reject",
+               "reason": "factorMining.reject.weakIc", "metrics": {}}]
+
+    with pytest.raises(storage.FactorMiningWriteError, match="factorMining.runNotFound"):
+        FactorMiningRepository().save_trials(9, user_id=4, trials=trials)
+
+    assert len(cursor.statements) == 1  # the ownership check, and no INSERT after it
 
 
 def test_save_trials_and_upsert_candidates_skip_the_database_when_nothing_was_evaluated(monkeypatch):
@@ -161,7 +201,7 @@ def test_save_trials_and_upsert_candidates_skip_the_database_when_nothing_was_ev
 
 
 def test_upsert_candidates_converges_on_the_expression_hash(monkeypatch):
-    cursor = _record(monkeypatch)
+    cursor = _record(monkeypatch, rows=[_OWNED_RUN, _OWNED_RUN])  # one ownership check per call
     survivor = {"expression": {"op": "ts_pct_change", "args": ["close"], "params": {"n": 20}},
                 "fingerprint": "a" * 64, "origin": "template", "template_id": "momentum",
                 "status": "search", "reason": "", "metrics": {"rankIc": 0.05}, "outOfSample": {}}
@@ -174,11 +214,80 @@ def test_upsert_candidates_converges_on_the_expression_hash(monkeypatch):
                                           "outOfSample": {"rankIc": 0.03}}],
     ) == 1
 
-    sql, rows = cursor.statements[0]
+    sql, rows = cursor.statements[1]
     assert "ON CONFLICT (user_id, expression_hash) DO UPDATE" in sql
     assert sql.count("?") == len(rows[0])  # every placeholder is bound
     assert len(rows) == 1
-    assert "frozen" in cursor.statements[1][1][0]
+    assert "frozen" in cursor.statements[3][1][0]
+    # The convergence is the whole SET list, not just the pointer: a conflict has to update the
+    # verdict, its reason, and both metric payloads, or the survivor keeps its search-stage state.
+    update = sql.split("DO UPDATE", 1)[1]
+    for column in ("run_id", "status", "reject_reason", "metrics_json", "out_of_sample_json"):
+        assert f"{column} = EXCLUDED.{column}" in update
+
+
+def test_upsert_candidates_refuses_a_run_that_is_not_the_callers(monkeypatch):
+    """A foreign run raises instead of returning a count for rows that were never written."""
+    cursor = _record(monkeypatch, rows=[None])
+    survivor = {"expression": {"op": "close"}, "fingerprint": "a" * 64, "origin": "template",
+                "template_id": "momentum", "status": "search", "reason": "", "metrics": {},
+                "outOfSample": {}}
+
+    with pytest.raises(storage.FactorMiningWriteError, match="factorMining.runNotFound"):
+        FactorMiningRepository().upsert_candidates(user_id=4, run_id=9, candidates=[survivor])
+
+    assert len(cursor.statements) == 1  # the ownership check, and no INSERT after it
+
+
+def test_upsert_candidates_rejects_a_batch_without_fingerprints(monkeypatch):
+    """An empty hash would fold every such candidate into the unique key's single row."""
+    def _forbidden():
+        raise AssertionError("an unidentifiable batch must not open a connection")
+
+    monkeypatch.setattr(storage, "get_db_connection", _forbidden)
+    candidate = {"expression": {"op": "close"}, "fingerprint": "", "origin": "template",
+                 "template_id": "momentum", "status": "search", "reason": "", "metrics": {},
+                 "outOfSample": {}}
+
+    with pytest.raises(storage.FactorMiningWriteError, match="factorMining.fingerprintInvalid"):
+        FactorMiningRepository().upsert_candidates(user_id=4, run_id=9, candidates=[candidate])
+
+
+def test_finish_run_lifts_the_summary_counts_and_scopes_the_update(monkeypatch):
+    cursor = _record(monkeypatch)
+
+    FactorMiningRepository().finish_run(
+        9, user_id=4, status="success",
+        result={"summary": {"trials": 250, "candidates": 12, "frozen": 3}},
+    )
+
+    sql, params = cursor.statements[0]
+    assert params[3:6] == (250, 12, 3)  # trials / candidates / frozen, read as totals
+    assert params[-2:] == (9, 4)
+    assert "WHERE id = ? AND user_id = ?" in sql
+
+
+def test_finish_run_backfills_the_snapshot_only_when_the_result_carries_one(monkeypatch):
+    """``COALESCE(NULLIF(?, ''), snapshot_id)`` is what keeps a late empty result from erasing it.
+
+    The statement is the only offline evidence there is: ``persist_run`` stores the fingerprint
+    before the search and this call may arrive without one, so the empty case must bind ``''``
+    (which ``NULLIF`` turns into "keep what is stored") and the populated case must bind the
+    fingerprint through.
+    """
+    cursor = _record(monkeypatch)
+    repository = FactorMiningRepository()
+
+    repository.finish_run(9, user_id=4, status="success", result={"summary": {"trials": 1}})
+    repository.finish_run(9, user_id=4, status="success",
+                          result={"summary": {"trials": 1, "snapshotId": "e" * 64}})
+
+    empty_sql, empty_params = cursor.statements[0]
+    filled_sql, filled_params = cursor.statements[1]
+    assert "snapshot_id = COALESCE(NULLIF(?, ''), snapshot_id)" in empty_sql
+    assert empty_params[6] == ""
+    assert filled_params[6] == "e" * 64
+    assert empty_sql == filled_sql
 
 
 def test_persist_run_serializes_config_datetimes_as_iso8601(monkeypatch):
@@ -209,13 +318,25 @@ def test_count_trials_counts_only_within_the_callers_own_run(monkeypatch):
     Offline evidence only -- that the statement carries the user scope. Whether another user's
     ``run_id`` really counts 0 is a database question, and belongs to the integration script.
     """
-    cursor = _record(monkeypatch, row={"total": 250})
+    cursor = _record(monkeypatch, rows=[{"total": 250}])
 
     assert FactorMiningRepository().count_trials(9, user_id=4) == 250
 
     sql, params = cursor.statements[0]
     assert params == (9, 4)
     assert "run.user_id = ?" in sql
+
+
+def test_list_runs_scopes_to_the_user_and_skips_the_result_payload(monkeypatch):
+    cursor = _record(monkeypatch)
+
+    rows = FactorMiningRepository().list_runs(user_id=4, limit=5)
+
+    sql, params = cursor.statements[0]
+    assert rows == []
+    assert params == (4, 5)
+    assert "user_id = ?" in sql
+    assert "result_json" not in sql  # the heavy payload belongs to the detail read only
 
 
 def test_list_candidates_scopes_to_the_user_and_the_requested_filters(monkeypatch):

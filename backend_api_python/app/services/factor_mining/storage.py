@@ -14,6 +14,11 @@ under snake_case keys, while ``split`` is already ISO-8601 strings -- and both s
 contracts this layer will not rewrite. Instead one serializer makes any payload JSON-safe and
 renders datetimes as ISO-8601, so every timestamp a stored run holds reads the same way.
 
+Writes are scoped like reads, and audibly. A run that is not the caller's is refused with a closed
+key rather than written as zero rows: a caller that believes it stored 250 trials while the ledger
+got none would understate the deflated-Sharpe denominator silently, which is the one error this
+layer exists to make impossible.
+
 No clock, network, or panel access: every method takes and returns plain mappings, and the
 ``_hydrate*`` helpers are static so the row shapes are testable without a database.
 """
@@ -26,6 +31,23 @@ from datetime import date, datetime
 from typing import Any
 
 from app.utils.db import get_db_connection
+
+
+RUN_NOT_FOUND = "factorMining.runNotFound"
+FINGERPRINT_INVALID = "factorMining.fingerprintInvalid"
+
+# ``normalize_expression`` always yields a sha256 hex digest; anything else would join the
+# ``UNIQUE (user_id, expression_hash)`` rows of unrelated expressions into one.
+_FINGERPRINT_LENGTH = 64
+
+
+class FactorMiningWriteError(ValueError):
+    """A write this repository refuses: the run is not the caller's, or a row has no identity.
+
+    Subclasses ``ValueError`` because that is how this feature reports every closed i18n key, and
+    because the HTTP layer already turns ``ValueError`` into ``code: 0`` carrying the key instead
+    of a 500. The key is the message, exactly as elsewhere in ``factor_mining``.
+    """
 
 
 _RUN_COLUMNS = """
@@ -75,6 +97,20 @@ _CANDIDATE_KEYS = {
 
 
 class FactorMiningRepository:
+    def _assert_run_owner(self, cur: Any, run_id: int, user_id: int) -> None:
+        """Refuse a write aimed at a run that is missing or belongs to someone else.
+
+        Checked before the write rather than inferred from it. An ``INSERT ... SELECT`` scoped by
+        ownership would store nothing for a foreign run and still hand back a row count, and the
+        caller records that count as the trial ledger's size.
+        """
+        cur.execute(
+            "SELECT 1 FROM qd_factor_mining_runs WHERE id = ? AND user_id = ?",
+            (int(run_id), int(user_id)),
+        )
+        if cur.fetchone() is None:
+            raise FactorMiningWriteError(RUN_NOT_FOUND)
+
     def persist_run(
         self,
         *,
@@ -120,6 +156,7 @@ class FactorMiningRepository:
         self,
         run_id: int,
         *,
+        user_id: int,
         status: str,
         result: Mapping[str, Any],
         error_message: str = "",
@@ -130,7 +167,8 @@ class FactorMiningRepository:
         ``frozen`` stays 0 for anything but the orchestration layer's final write: only the review
         knows how many survivors held up out of sample. The panel fingerprint is backfilled here
         because ``persist_run`` precedes the search; an empty one in the result leaves whatever the
-        insert stored.
+        insert stored. The update is scoped to the caller's own run and simply matches nothing
+        otherwise -- there is no payload a caller could lose by failing to close a foreign run.
         """
         summary = result.get("summary") if isinstance(result, Mapping) else None
         summary = summary if isinstance(summary, Mapping) else {}
@@ -142,13 +180,13 @@ class FactorMiningRepository:
                 SET status = ?, error_message = ?, result_json = ?,
                     trials_count = ?, candidates_count = ?, frozen_count = ?,
                     snapshot_id = COALESCE(NULLIF(?, ''), snapshot_id)
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
                 (
                     str(status or ""), str(error_message or ""), _dump(dict(result)),
                     _count(summary.get("trials")), _count(summary.get("candidates")),
                     _count(summary.get("frozen")), str(summary.get("snapshotId") or ""),
-                    int(run_id),
+                    int(run_id), int(user_id),
                 ),
             )
             db.commit()
@@ -167,13 +205,17 @@ class FactorMiningRepository:
         survivor, and the frozen review's deflated-Sharpe benchmark is priced by the whole count.
         The return value is the length of this call's batch, which is the caller's ``trials_count``
         -- read from the batch rather than from the driver, whose batch execution reports only its
-        last page.
+        last page, and honest because a foreign or missing run raises instead of storing nothing.
+
+        The row's ``user_id`` is read from the owning run inside the statement, so a trial's owner
+        is the run it belongs to rather than whatever the caller passed in.
         """
         rows = [
             (
-                int(run_id), int(user_id), str(trial.get("fingerprint") or ""),
+                int(run_id), str(trial.get("fingerprint") or ""),
                 str(trial.get("stage") or ""), str(trial.get("verdict") or ""),
                 str(trial.get("reason") or ""), _dump(trial.get("metrics") or {}),
+                int(run_id), int(user_id),
             )
             for trial in trials
         ]
@@ -181,16 +223,21 @@ class FactorMiningRepository:
             return 0
         with get_db_connection() as db:
             cur = db.cursor()
-            cur.executemany(
-                """
-                INSERT INTO qd_factor_trials
-                (run_id, user_id, expression_hash, stage, verdict, reject_reason, metrics_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
-            db.commit()
-            cur.close()
+            try:
+                self._assert_run_owner(cur, run_id, user_id)
+                cur.executemany(
+                    """
+                    INSERT INTO qd_factor_trials
+                    (run_id, user_id, expression_hash, stage, verdict, reject_reason, metrics_json)
+                    SELECT ?, run.user_id, ?, ?, ?, ?, ?
+                    FROM qd_factor_mining_runs AS run
+                    WHERE run.id = ? AND run.user_id = ?
+                    """,
+                    rows,
+                )
+                db.commit()
+            finally:
+                cur.close()
         return len(rows)
 
     def upsert_candidates(
@@ -209,8 +256,14 @@ class FactorMiningRepository:
         frozen review writes their final status and out-of-sample metrics on top.
 
         The market and timeframe are read from the owning run inside the statement, because a
-        candidate record carries neither: it is the run that knows which market was searched.
+        candidate record carries neither: it is the run that knows which market was searched. A
+        foreign or missing run raises rather than returning a row count for rows that were never
+        written, and a candidate with no fingerprint raises rather than being stored under ``''``
+        -- the unique key would fold every such candidate into one row and lose the rest.
         """
+        for index, candidate in enumerate(candidates):
+            if len(str(candidate.get("fingerprint") or "")) != _FINGERPRINT_LENGTH:
+                raise FactorMiningWriteError(f"{FINGERPRINT_INVALID}:{index}")
         rows = [
             (
                 int(user_id), int(run_id), _dump(candidate.get("expression") or {}),
@@ -225,32 +278,38 @@ class FactorMiningRepository:
             return 0
         with get_db_connection() as db:
             cur = db.cursor()
-            cur.executemany(
-                """
-                INSERT INTO qd_factor_candidates
-                (user_id, run_id, expression_json, expression_hash, origin, template_id,
-                 market, timeframe, status, reject_reason, metrics_json, out_of_sample_json,
-                 created_at, updated_at)
-                SELECT ?, ?, ?, ?, ?, ?, run.market, run.timeframe, ?, ?, ?, ?, NOW(), NOW()
-                FROM qd_factor_mining_runs AS run
-                WHERE run.id = ?
-                ON CONFLICT (user_id, expression_hash) DO UPDATE
-                SET run_id = EXCLUDED.run_id,
-                    expression_json = EXCLUDED.expression_json,
-                    origin = EXCLUDED.origin,
-                    template_id = EXCLUDED.template_id,
-                    market = EXCLUDED.market,
-                    timeframe = EXCLUDED.timeframe,
-                    status = EXCLUDED.status,
-                    reject_reason = EXCLUDED.reject_reason,
-                    metrics_json = EXCLUDED.metrics_json,
-                    out_of_sample_json = EXCLUDED.out_of_sample_json,
-                    updated_at = NOW()
-                """,
-                rows,
-            )
-            db.commit()
-            cur.close()
+            try:
+                self._assert_run_owner(cur, run_id, user_id)
+                # A duplicate fingerprint inside one batch is the caller's to prevent: the search
+                # dedupes before truncating (templates.py:242-245), and Postgres refuses a batch
+                # that reaches the same conflict target twice ("cannot affect row a second time").
+                cur.executemany(
+                    """
+                    INSERT INTO qd_factor_candidates
+                    (user_id, run_id, expression_json, expression_hash, origin, template_id,
+                     market, timeframe, status, reject_reason, metrics_json, out_of_sample_json,
+                     created_at, updated_at)
+                    SELECT ?, ?, ?, ?, ?, ?, run.market, run.timeframe, ?, ?, ?, ?, NOW(), NOW()
+                    FROM qd_factor_mining_runs AS run
+                    WHERE run.id = ?
+                    ON CONFLICT (user_id, expression_hash) DO UPDATE
+                    SET run_id = EXCLUDED.run_id,
+                        expression_json = EXCLUDED.expression_json,
+                        origin = EXCLUDED.origin,
+                        template_id = EXCLUDED.template_id,
+                        market = EXCLUDED.market,
+                        timeframe = EXCLUDED.timeframe,
+                        status = EXCLUDED.status,
+                        reject_reason = EXCLUDED.reject_reason,
+                        metrics_json = EXCLUDED.metrics_json,
+                        out_of_sample_json = EXCLUDED.out_of_sample_json,
+                        updated_at = NOW()
+                    """,
+                    rows,
+                )
+                db.commit()
+            finally:
+                cur.close()
         return len(rows)
 
     def count_trials(self, run_id: int, *, user_id: int) -> int:
