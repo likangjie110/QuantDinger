@@ -33,9 +33,9 @@ import pandas as pd
 from app.data_sources.asia_stock_kline import normalize_chart_timeframe
 from app.services.backtest_execution import parse_rate
 from app.services.backtest_limits import backtest_warmup_calendar_days
-from app.services.factor_mining.dsl import MAX_LOOKBACK, PRICE_VOLUME_FIELDS
+from app.services.factor_mining.dsl import MAX_LOOKBACK, PRICE_VOLUME_FIELDS, normalize_expression
 from app.services.factor_mining.gates import GateThresholds
-from app.services.factor_mining.templates import DEFAULT_BUDGET, MAX_BUDGET
+from app.services.factor_mining.templates import DEFAULT_BUDGET, MAX_BUDGET, expand_candidates
 from app.services.strategy_v2.contract import StrategyV2ContractError, compile_strategy_v2
 from app.services.strategy_v2.models import StrategyManifest
 from app.services.strategy_v2.service import StrategyV2BacktestService, _enforce_backtest_range
@@ -43,6 +43,8 @@ from app.services.strategy_v2.snapshot import canonical_frame_bytes
 
 
 MINIMUM_SYMBOLS = 3
+MINIMUM_WARMUP_BARS = 40
+WARMUP_MARGIN_BARS = 5
 DEFAULT_FREEZE_RATIO = 0.3
 DEFAULT_SEED = 42
 
@@ -178,7 +180,8 @@ class MiningDataProvider:
         )
         if len(candidates) < MINIMUM_SYMBOLS:
             raise ValueError("factorMining.universeTooSmall")
-        fetch_start = _warmup_start(config.timeframe, split.search_start)
+        warmup_bars = _warmup_bars(config)
+        fetch_start = _warmup_start(config.timeframe, split.search_start, warmup_bars)
         # The same range check the factor-research entry runs before fetching, against the
         # window this call actually loads: the freeze tail is task 8's separate request.
         _enforce_backtest_range(
@@ -186,7 +189,7 @@ class MiningDataProvider:
             timeframe=config.timeframe,
             start_date=split.search_start,
             end_date=split.search_end,
-            warmup_bars=MAX_LOOKBACK,
+            warmup_bars=warmup_bars,
             fetch_start=fetch_start,
         )
         frames, skipped = self._backtest_service.fetch_frames(
@@ -254,14 +257,37 @@ def _portfolio_manifest(code: str) -> StrategyManifest:
     return manifest
 
 
-def _warmup_start(frequency: str, search_start: datetime) -> datetime:
-    """First fetched bar: the DSL's maximum lookback of history before the search window.
+def _warmup_bars(config: MiningConfig) -> int:
+    """Bars of history the panel must carry before the search window.
+
+    The number follows the candidates this run will actually evaluate -- the same template
+    selection, budget and seed the search loop expands -- rather than the DSL's ceiling. The
+    longest template path is 145 bars, and budgeting the ceiling's 504 would spend 3.5x the
+    provider history for it: on a 1095-day daily policy that is the difference between a
+    four-month and a one-year search window. The margin covers the bar-to-calendar conversion,
+    which can undershoot on intraday timeframes, and per-symbol gaps inside the warmup. The
+    floor and ceiling stay as guards for degenerate runs and for templates that grow.
+    """
+    candidates = expand_candidates(
+        template_ids=config.template_ids or None,
+        budget=config.budget,
+        seed=config.seed,
+    )
+    longest = max(
+        (normalize_expression(candidate.expression).lookback for candidate in candidates),
+        default=MAX_LOOKBACK,
+    )
+    return max(MINIMUM_WARMUP_BARS, min(MAX_LOOKBACK, longest + WARMUP_MARGIN_BARS))
+
+
+def _warmup_start(frequency: str, search_start: datetime, warmup_bars: int) -> datetime:
+    """First fetched bar: ``warmup_bars`` of history before the search window.
 
     The conversion to calendar days is the shared backtest one, which pads daily bars for
-    weekends and holidays. On intraday timeframes it can fall short of ``MAX_LOOKBACK`` bars;
-    the missing bars are then a small share of a window that holds far more of them.
+    weekends and holidays. On intraday timeframes it can fall short of ``warmup_bars``; the
+    missing bars are then a small share of a window that holds far more of them.
     """
-    return search_start - timedelta(days=backtest_warmup_calendar_days(frequency, MAX_LOOKBACK))
+    return search_start - timedelta(days=backtest_warmup_calendar_days(frequency, warmup_bars))
 
 
 def _field_panels(frames: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:

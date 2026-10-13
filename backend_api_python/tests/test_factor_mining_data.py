@@ -11,8 +11,14 @@ import re
 import pandas as pd
 import pytest
 
-from app.services.backtest_limits import BacktestRangeLimitError
-from app.services.factor_mining.engine import MiningConfig, MiningDataProvider, split_periods
+from app.services.backtest_limits import BacktestRangeLimitError, backtest_warmup_calendar_days
+from app.services.factor_mining.dsl import MAX_LOOKBACK
+from app.services.factor_mining.engine import (
+    MiningConfig,
+    MiningDataProvider,
+    _warmup_bars,
+    split_periods,
+)
 from app.services.factor_mining.templates import MAX_BUDGET
 
 
@@ -50,6 +56,14 @@ class _FakeBacktestService:
             {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000.0}, index=index)
             for item in candidates}
         return frames, []
+
+
+class _AShareService(_FakeBacktestService):
+    """Chinese A-share members: their daily data carries a tighter provider policy than US."""
+
+    def resolve_candidates(self, *, user_id, manifest, start_date, end_date):
+        return ([{"market": "AStock", "symbol": symbol, "effectiveFrom": None}
+                 for symbol in ("600000.SH", "600519.SH", "000001.SZ")], None)
 
 
 def _config(**overrides):
@@ -158,15 +172,42 @@ def test_prepare_panel_rejects_a_usable_universe_smaller_than_three():
 
 
 def test_prepare_panel_rejects_a_window_beyond_the_market_data_policy():
-    class _AShareService(_FakeBacktestService):
-        def resolve_candidates(self, *, user_id, manifest, start_date, end_date):
-            return ([{"market": "AStock", "symbol": symbol, "effectiveFrom": None}
-                     for symbol in ("600000.SH", "600519.SH", "000001.SZ")], None)
-
+    # Non-US daily data is capped at 1095 days. Four years leave a ~3.1-year search window after
+    # the 30% freeze, and even the candidate-derived 284-day warmup pushes the fetch to 1305
+    # days -- over the cap, so the run is rejected before any bar is requested.
     service = _AShareService()
     with pytest.raises(BacktestRangeLimitError):
-        _provider(service).prepare(user_id=1, code=_SOURCE, config=_config())
+        _provider(service).prepare(
+            user_id=1, code=_SOURCE,
+            config=_config(start_date=datetime(2021, 1, 1), end_date=datetime(2024, 12, 31)))
     assert service.fetch_calls == []
+
+
+def test_warmup_follows_the_candidates_this_run_will_evaluate():
+    short = _config(template_ids=("reversal",))
+    # reversal's longest path is 20 bars plus a 5-bar smoothing variant, so the floor binds
+    assert _warmup_bars(short) == 40
+    assert backtest_warmup_calendar_days("1d", _warmup_bars(short)) == 76
+    # every template: 145 bars longest plus the 5-bar margin, against the 504 the ceiling cost
+    assert _warmup_bars(_config()) == 150
+    assert backtest_warmup_calendar_days("1d", _warmup_bars(_config())) == 284
+    assert backtest_warmup_calendar_days("1d", MAX_LOOKBACK) == 953
+
+
+def test_short_window_candidates_reopen_a_non_us_daily_window():
+    # The same 2024 range needed a 1227-day fetch under the fixed 504-bar warmup and was
+    # rejected by the 1095-day CNStock daily policy; it now fetches what it needs.
+    service = _AShareService()
+    short = _config(template_ids=("reversal",))
+    panel = _provider(service).prepare(user_id=1, code=_SOURCE, config=short)
+    assert panel.frequency == "1d"
+    _, fetch_start, _ = service.fetch_calls[0]
+    assert (split_periods(short).search_start - fetch_start).days == 76
+
+    # A full year is inside the cap for the whole template library too.
+    every_template = _AShareService()
+    _provider(every_template).prepare(user_id=1, code=_SOURCE, config=_config())
+    assert every_template.fetch_calls
 
 
 def test_prepare_panel_looks_back_warmup_bars_but_stops_at_the_search_end():
