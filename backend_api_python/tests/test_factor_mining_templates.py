@@ -59,6 +59,21 @@ def test_smoothing_adds_three_variants_per_grid_point():
     assert len(smoothed) == 3 * len(plain)
 
 
+def test_liquidity_splits_into_change_and_level_templates():
+    change = TEMPLATES["liquidity"]
+    level = TEMPLATES["liquidity_level"]
+    assert change.parameter_grid == {"N": (5, 10, 20), "M": (20, 60)}
+    assert level.parameter_grid == {"N": (5, 10, 20)}
+    assert level.hypothesis_i18n_key == "factorMining.template.liquidity_level"
+    assert change.build({"N": 5, "M": 20}) == {"op": "safe_div", "args": [
+        {"op": "ts_mean", "args": ["volume"], "params": {"n": 5}},
+        {"op": "ts_mean", "args": ["volume"], "params": {"n": 20}},
+    ], "params": {}}
+    assert level.build({"N": 5}) == {"op": "cs_rank", "args": [
+        {"op": "ts_mean", "args": ["volume"], "params": {"n": 5}},
+    ], "params": {}}
+
+
 def test_conditional_filter_keeps_a_panel_truth_branch_and_constant_fallback():
     node = TEMPLATES["conditional_filter"].build({"N": 20, "M": 5})
     condition, truth_branch, fallback = node["args"]

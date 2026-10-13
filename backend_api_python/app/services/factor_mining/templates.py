@@ -62,11 +62,16 @@ def _low_volatility(params: Mapping[str, int]) -> dict:
 
 
 def _liquidity(params: Mapping[str, int]) -> dict:
-    """Volume level (cross-sectional rank) or volume change (short mean over long mean)."""
-    recent = _windowed("ts_mean", params["N"], "volume")
-    if params["level"]:
-        return {"op": "cs_rank", "args": [recent], "params": {}}
-    return {"op": "safe_div", "args": [recent, _windowed("ts_mean", params["M"], "volume")], "params": {}}
+    """Volume change: recent average volume against a longer baseline."""
+    return {"op": "safe_div", "args": [
+        _windowed("ts_mean", params["N"], "volume"),
+        _windowed("ts_mean", params["M"], "volume"),
+    ], "params": {}}
+
+
+def _liquidity_level(params: Mapping[str, int]) -> dict:
+    """Volume level: recent average volume, ranked across symbols."""
+    return {"op": "cs_rank", "args": [_windowed("ts_mean", params["N"], "volume")], "params": {}}
 
 
 def _volume_price_confirm(params: Mapping[str, int]) -> dict:
@@ -126,11 +131,15 @@ TEMPLATES: dict[str, FactorTemplate] = {
         template_id="liquidity",
         hypothesis_i18n_key="factorMining.template.liquidity",
         category="volume",
-        # One grid cannot carry two skeletons through a single ``build``, so ``level``
-        # selects the hypothesis half: 1 = volume level, 0 = volume change. ``M`` is inert
-        # for level rows; dedup collapses the duplicates it makes.
-        parameter_grid={"N": (5, 10, 20), "M": (20, 60), "level": (0, 1)},
+        parameter_grid={"N": (5, 10, 20), "M": (20, 60)},
         build=_liquidity,
+    ),
+    "liquidity_level": FactorTemplate(
+        template_id="liquidity_level",
+        hypothesis_i18n_key="factorMining.template.liquidity_level",
+        category="volume",
+        parameter_grid={"N": (5, 10, 20)},
+        build=_liquidity_level,
     ),
     "volume_price_confirm": FactorTemplate(
         template_id="volume_price_confirm",
@@ -183,11 +192,11 @@ def _smoothed(node: dict, window: int) -> dict:
 def _truncate(seeds: list[CandidateSeed], budget: int, seed: int) -> list[CandidateSeed]:
     """Reservoir-truncate to ``budget`` rows, mirroring ``ParameterSampler.grid``.
 
-    That sampler cannot be called here: it samples a ``SearchParameter`` space, whereas
-    truncation runs on an already deduped candidate list, and importing it would pull pandas
-    and psycopg2 into this pure module. Its reservoir loop is copied line for line -- keep
-    the first ``budget`` rows, let each later row replace a random slot, then restore row
-    order.
+    The duplication is deliberate. That sampler cannot be reused here: it samples a
+    ``SearchParameter`` space, not a deduped candidate list, and importing it executes
+    ``strategy_evolution/__init__.py``, which pulls pandas and psycopg2 into this pure
+    computation layer. Its reservoir loop is copied line for line -- keep the first
+    ``budget`` rows, let each later row replace a random slot, then restore row order.
     """
     if len(seeds) <= budget:
         return seeds
