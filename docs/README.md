@@ -117,6 +117,7 @@ ownership or shared state.
 - [Chart indicator development](trading/INDICATOR_DEV_GUIDE.md)
 - [Interactive Brokers](trading/IBKR_TRADING_GUIDE_EN.md)
 - [Live-trading safety](trading/LIVE_TRADING_SAFETY.md)
+- [Testnet validation runbook for the merged fixes (Chinese)](trading/TESTNET_VALIDATION_RUNBOOK_CN.md)
 - [Public universes and point-in-time fundamentals (Chinese)](trading/PUBLIC_UNIVERSE_AND_FUNDAMENTALS_CN.md)
 - [Fundamental-data preparation operations (Chinese)](strategies/FUNDAMENTAL_DATA_PREPARATION_CN.md)
 - Runnable examples in [`examples/`](examples/)
