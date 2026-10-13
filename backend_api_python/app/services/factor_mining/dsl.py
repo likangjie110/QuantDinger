@@ -1,8 +1,10 @@
 """Canonical factor expression DSL: validation, normalization, and fingerprints.
 
 A candidate factor is a JSON expression tree: leaves are field names and internal
-nodes are ``{"op": ..., "args": [...], "params": {...}}``. This module is a pure
-function layer -- it never reads clocks, databases, or the network.
+nodes are ``{"op": ..., "args": [...], "params": {...}}``. Numbers never appear as
+bare leaves -- a literal enters an expression through the zero-arity ``const``
+operator. This module is a pure function layer -- it never reads clocks,
+databases, or the network.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from typing import Any
 DSL_VERSION = 1
 MAX_DEPTH = 6
 MAX_NODES = 24
-WINDOW_MIN = 2
+WINDOW_MIN = 1
 WINDOW_MAX = 252
 MAX_LOOKBACK = 504
 PRICE_VOLUME_FIELDS = ("open", "high", "low", "close", "volume")
@@ -37,6 +39,7 @@ OPERATOR_SPECS: dict[str, tuple[int, bool]] = {
     "ts_zscore": (1, True),
     "ts_pct_change": (1, True),
     "ts_corr": (2, True),
+    "const": (0, False),
     "cs_rank": (1, False),
     "cs_zscore": (1, False),
     "cs_demean": (1, False),
@@ -73,6 +76,31 @@ def _reject(reason: str) -> ExpressionError:
     return ExpressionError(f"factorMining.reject.invalid:{reason}")
 
 
+def _is_finite_number(value: Any) -> bool:
+    """Finite int/float. ``bool`` is excluded even though it subclasses ``int``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    # int is always finite; routing it through math.isfinite would overflow.
+    return not isinstance(value, float) or math.isfinite(value)
+
+
+def _canonical_node(current: Any) -> Any:
+    """Rebuild a validated node with stable spelling: sorted params, empty params dropped.
+
+    ``json.dumps`` renders numbers through ``repr``, which keeps float spelling stable.
+    """
+    if not isinstance(current, dict):
+        return current
+    normalized: dict[str, Any] = {
+        "op": current["op"],
+        "args": [_canonical_node(argument) for argument in current.get("args") or []],
+    }
+    params = current.get("params") or {}
+    if params:
+        normalized["params"] = {key: params[key] for key in sorted(params)}
+    return normalized
+
+
 @dataclass(frozen=True)
 class NormalizedExpression:
     node: dict
@@ -92,8 +120,10 @@ def normalize_expression(
 ) -> NormalizedExpression:
     """Validate ``node`` and report its canonical form, fingerprint, and budgets.
 
-    ``lookback`` is the largest window sum along any root-to-leaf path; ``depth``
-    counts the root as 1 and ``node_count`` counts every leaf and operator node.
+    ``canonical`` re-spells the tree with sorted keys and empty ``params`` dropped, so
+    spelling variants of one expression share a fingerprint. ``lookback`` is the largest
+    window sum along any root-to-leaf path; ``depth`` counts the root as 1 and
+    ``node_count`` counts every leaf and operator node.
     """
     fields: set[str] = set()
     windows: set[int] = set()
@@ -121,6 +151,8 @@ def normalize_expression(
             raise _reject("unknownOperator")
         arity, windowed = spec
         args = current.get("args")
+        if args is None:
+            args = []
         if not isinstance(args, (list, tuple)) or len(args) != arity:
             raise _reject("badArity")
         params = current.get("params")
@@ -138,19 +170,21 @@ def normalize_expression(
                 raise _reject("badWindow")
             windows.add(window)
             own += window
+        elif op == "const":
+            if not _is_finite_number(params.get("value")):
+                raise _reject("badNode")
         elif op == "clip":
-            for key in _CLIP_PARAMS:
-                bound = params.get(key)
-                if isinstance(bound, bool) or not isinstance(bound, (int, float)):
-                    raise _reject("badNode")
-                if not math.isfinite(bound):
-                    raise _reject("badNode")
+            if not all(_is_finite_number(params.get(key)) for key in _CLIP_PARAMS):
+                raise _reject("badNode")
         if own > MAX_LOOKBACK:
             raise _reject("lookbackExceeded")
+        if not args:
+            # Zero-arity operators (const) terminate the path at this node.
+            return own
         return max(walk(argument, depth + 1, own) for argument in args)
 
     lookback = walk(node, 1, 0)
-    canonical = json.dumps(node, sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(_canonical_node(node), sort_keys=True, separators=(",", ":"))
     fingerprint = hashlib.sha256(f"{canonical}:v{DSL_VERSION}".encode("utf-8")).hexdigest()
     return NormalizedExpression(
         node=node,
