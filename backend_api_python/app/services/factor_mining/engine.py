@@ -1,20 +1,33 @@
-"""Data preparation for factor mining: one point-in-time panel, one search/freeze split.
+"""The factor mining engine: one point-in-time panel prepared, then searched.
 
-This layer owns the two things the rest of the mining pipeline reads. First the panel: bars
-come through the Strategy V2 data path -- ``compile_strategy_v2`` for the manifest,
-``resolve_candidates`` for the as-of universe, ``fetch_frames`` for the bars -- so mining
-never grows a second data layer with its own time semantics. Second the split: the requested
-range is cut into a search window and a frozen tail, and the tail is never fetched here; the
-out-of-sample review asks for it separately, once.
+This layer owns what the rest of the mining pipeline reads. First the panel: bars come through
+the Strategy V2 data path -- ``compile_strategy_v2`` for the manifest, ``resolve_candidates``
+for the as-of universe, ``fetch_frames`` for the bars -- so mining never grows a second data
+layer with its own time semantics. Second the split: the requested range is cut into a search
+window and a frozen tail, and the tail is never fetched by the search; the out-of-sample review
+asks for it separately, once. Third the loop: every expanded candidate is scored through
+``FactorResearchEngine`` and walked down the graded gate ladder, and every one of them -- pass
+or reject -- leaves a trial behind.
 
-Two decisions are invisible in the signatures. The fetch carries enough history *before* the
+Decisions that are invisible in the signatures. The fetch carries enough history *before* the
 search window for the candidates this run will actually evaluate -- the same template
 selection, budget and seed the search loop expands -- because the panel is evaluated over the
 fetched window and only then cut to the search window; budgeting the DSL's ceiling instead
 would cost several times the provider history and, where a policy caps it, silently shorten the
-window the run can search. And the field panels are pinned to one shared index and column order
+window the run can search. The field panels are pinned to one shared index and column order
 with a missing field kept as a NaN column, which is what the evaluator assumes when it aligns a
 candidate to ``fields["close"]``.
+
+The search itself holds four things that are easy to lose. The panel carries warmup bars, so
+every evaluation re-cuts the frames to the search window; scoring the whole panel would fold
+the warmup into the in-sample metrics and, worse, leak into the frozen tail. A candidate is
+scored by the same engine that scores the built-in factors, which is why ``FactorResearchEngine
+.run`` grew a ``factor_panel`` parameter -- one evaluation path, not two. One candidate's
+failure is recorded, never raised: ``ExpressionError`` is not the only way an expression dies
+(a scalar ``const`` divides by zero, overflows ``float``, or reaches a panel operator that
+cannot take it), so the whole evaluation is guarded and the trial says which stage gave up.
+And the expanded seeds are read-only shared data -- the base expression of a template is the
+same object as its two smoothing variants' inner argument -- so nothing here writes into them.
 
 The provider falls back to the real services so the search and freeze stages can construct it
 without arguments; tests inject fakes. Nothing here opens a connection, reads a clock, or
@@ -24,8 +37,10 @@ mocks the network.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
-from dataclasses import dataclass
+import math
+import statistics
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -35,9 +50,17 @@ from app.data_sources.asia_stock_kline import normalize_chart_timeframe
 from app.services.backtest_execution import parse_rate
 from app.services.backtest_limits import backtest_warmup_calendar_days
 from app.services.factor_mining.dsl import MAX_LOOKBACK, PRICE_VOLUME_FIELDS, normalize_expression
-from app.services.factor_mining.gates import GateThresholds
+from app.services.factor_mining.evaluator import ExpressionEvaluator
+from app.services.factor_mining.gates import (
+    GateThresholds,
+    GateVerdict,
+    screen_metrics,
+    screen_redundancy,
+    screen_stability,
+)
 from app.services.factor_mining.templates import DEFAULT_BUDGET, MAX_BUDGET, expand_candidates
 from app.services.strategy_v2.contract import StrategyV2ContractError, compile_strategy_v2
+from app.services.strategy_v2.factor_research import FactorResearchEngine
 from app.services.strategy_v2.models import StrategyManifest
 from app.services.strategy_v2.service import StrategyV2BacktestService, _enforce_backtest_range
 from app.services.strategy_v2.snapshot import canonical_frame_bytes
@@ -48,6 +71,8 @@ MINIMUM_WARMUP_BARS = 40
 WARMUP_MARGIN_BARS = 5
 DEFAULT_FREEZE_RATIO = 0.3
 DEFAULT_SEED = 42
+PROGRESS_EVERY = 10
+INVALID_EXPRESSION_REASON = "factorMining.reject.invalid"
 
 
 @dataclass(frozen=True)
@@ -214,6 +239,270 @@ class MiningDataProvider:
             frequency=config.timeframe,
             warnings=sorted(_skipped_warning(item) for item in skipped),
         )
+
+
+class FactorMiningEngine:
+    """Expand the templates, score every candidate, keep the ledger.
+
+    Determinism is a contract, not a property: the same panel plus the same
+    ``(template_ids, budget, seed)`` produce the same trials and the same candidates in the
+    same order, because the template expansion is seeded, the gate ladder is pure, and nothing
+    here iterates a set.
+    """
+
+    def __init__(
+        self,
+        *,
+        data_provider: MiningDataProvider,
+        on_progress: Callable[[dict], None] | None = None,
+    ) -> None:
+        self._data_provider = data_provider
+        self._on_progress = on_progress
+
+    def run(self, *, user_id: int, code: str, config: MiningConfig) -> dict[str, Any]:
+        """Search ``code``'s universe over ``config`` and return the run record.
+
+        ``candidates`` are the survivors of the ladder, in expansion order; ``trials`` are every
+        candidate the run evaluated, rejected ones included, because that count is what the
+        deflated-Sharpe benchmark needs to price the search itself.
+        """
+        panel = self._data_provider.prepare(user_id=user_id, code=code, config=config)
+        split = split_periods(config)
+        # Candidates evaluate against the field panels the provider pinned to one shared index,
+        # which is what keeps a candidate's dates and symbols aligned with ``fields["close"]``.
+        # A provider that carries only frames is accepted by deriving them the same way.
+        evaluator = ExpressionEvaluator(panel.fields or _field_panels(panel.frames))
+        seeds = expand_candidates(
+            template_ids=config.template_ids or None,
+            budget=config.budget,
+            seed=config.seed,
+        )
+        members = _resolved_members(panel.members)
+        trials: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
+        for evaluated, seed in enumerate(seeds, start=1):
+            verdict, metrics = self._evaluate(
+                seed.expression, evaluator, config, split, panel, members,
+            )
+            trials.append({
+                "fingerprint": seed.fingerprint,
+                "stage": verdict.stage,
+                "verdict": "pass" if verdict.passed else "reject",
+                "reason": verdict.reason,
+                "metrics": metrics,
+            })
+            if verdict.passed:
+                candidates.append({
+                    "expression": seed.expression,
+                    "fingerprint": seed.fingerprint,
+                    "origin": seed.origin,
+                    "template_id": seed.template_id,
+                    "status": "search",
+                    "reason": "",
+                    "metrics": metrics,
+                    "outOfSample": {},
+                })
+            self._progress(evaluated, len(seeds))
+        return {
+            "config": asdict(config),
+            "split": self._split_payload(split),
+            "trials": trials,
+            "candidates": candidates,
+            "summary": self._summary(config, panel, trials, candidates),
+        }
+
+    def _evaluate(
+        self,
+        expression: Mapping[str, Any],
+        evaluator: ExpressionEvaluator,
+        config: MiningConfig,
+        split: PeriodSplit,
+        panel: PreparedPanel,
+        members: Sequence[Mapping[str, Any]],
+    ) -> tuple[GateVerdict, dict[str, Any]]:
+        """Score one candidate down the L1-L4 ladder: a verdict and the metrics behind it.
+
+        The whole body sits under one guard because ``ExpressionError`` is not the only way a
+        candidate dies. The DSL validates shape and ranges, not values: ``div`` of two scalar
+        ``const`` nodes raises ``ZeroDivisionError``, a ``const`` big enough to overflow
+        ``float()`` raises ``OverflowError``, and a scalar handed to any operator that expects a
+        panel raises a bare ``AttributeError``. A template-authored expression that does any of
+        those is an invalid candidate, and one invalid candidate must not end the run.
+
+        A rejected candidate still returns whatever metrics were readable, so the ledger keeps
+        the fold signs L3 reads alongside everything the other gates read.
+        """
+        try:
+            normalize_expression(expression)
+            candidate_panel = evaluator.evaluate(expression)
+            metrics = _metrics_payload(
+                self._research(config, split, panel, members, candidate_panel), config,
+            )
+        except Exception:
+            # v1 has no per-candidate error budget: an unreadable candidate is rejected, and
+            # the count of them is visible because each one still writes a trial.
+            return GateVerdict(passed=False, stage="L1", reason=INVALID_EXPRESSION_REASON), {}
+        for screen, payload in (
+            (screen_metrics, metrics),
+            (screen_stability, metrics),
+            (screen_redundancy, self._correlations(metrics)),
+        ):
+            verdict = screen(payload, config.thresholds)
+            if not verdict.passed:
+                return verdict, metrics
+        return GateVerdict(passed=True, stage="L4", reason=""), metrics
+
+    def _research(
+        self,
+        config: MiningConfig,
+        split: PeriodSplit,
+        panel: PreparedPanel,
+        members: Sequence[Mapping[str, Any]],
+        candidate_panel: pd.DataFrame,
+    ) -> dict[str, Any]:
+        """Score the candidate panel over the search window only.
+
+        ``panel.frames`` reach back before ``split.search_start`` by the warmup the candidates
+        need, and ``PreparedPanel`` carries no split of its own, so the window is passed on every
+        call. The research engine re-cuts the frames to it (``factor_research.py`` builds
+        ``research_index`` from ``start_date``/``end_date``); nothing here assumes the panel is
+        already the search segment, because the alternative is the warmup leaking into the
+        in-sample metrics and, on a mis-split panel, the frozen tail leaking into the search.
+        """
+        return FactorResearchEngine().run(
+            frames=panel.frames,
+            factor_panel=candidate_panel,
+            factor_id="",
+            start_date=split.search_start,
+            end_date=split.search_end,
+            groups=config.groups,
+            holding_period=config.holding_period,
+            commission=config.commission,
+            slippage=config.slippage,
+            neutralize_industry=config.neutralize_industry,
+            members=members,
+        )
+
+    def _correlations(self, metrics: Mapping[str, Any]) -> dict[str, float]:
+        """The candidate's measured correlation against each built-in factor that was scored.
+
+        Read out of the correlation study the research engine already ran, which puts the
+        selected factor first and every built-in that had enough overlapping observations after
+        it. A built-in the study could not measure is absent rather than zero: ``screen_
+        redundancy`` filters to finite values itself, and a zero this method invented would read
+        as a measurement that cleared a duplicate. An unreadable study yields an empty mapping,
+        which the gate rejects as unverifiable -- the gate owns that decision, not this method.
+        """
+        block = metrics.get("factorCorrelation") or {}
+        names = list(block.get("factors") or ())
+        matrix = list(block.get("matrix") or ())
+        if not names or not matrix:
+            return {}
+        return {
+            name: value
+            for name, value in zip(names[1:], matrix[0][1:])
+        }
+
+    def _progress(self, evaluated: int, total: int) -> None:
+        """Report every ``PROGRESS_EVERY``th candidate, so a long run is not a black box."""
+        if self._on_progress and evaluated % PROGRESS_EVERY == 0:
+            self._on_progress({"stage": "search", "evaluated": evaluated, "total": total})
+
+    @staticmethod
+    def _split_payload(split: PeriodSplit) -> dict[str, str]:
+        return {
+            "searchStart": split.search_start.isoformat(),
+            "searchEnd": split.search_end.isoformat(),
+            "freezeStart": split.freeze_start.isoformat(),
+            "freezeEnd": split.freeze_end.isoformat(),
+        }
+
+    @staticmethod
+    def _summary(
+        config: MiningConfig,
+        panel: PreparedPanel,
+        trials: Sequence[Mapping[str, Any]],
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Run totals plus the snapshot the search read and the costs it priced in.
+
+        The counts are what a frozen run is audited against, and the execution assumptions
+        repeat what was actually passed to the research engine rather than the engine's own
+        defaults, so a stored run explains its own numbers.
+        """
+        return {
+            "snapshotId": panel.snapshot_id,
+            "warnings": list(panel.warnings),
+            "trials": len(trials),
+            "candidates": len(candidates),
+            "frozen": 0,
+            "executionAssumptions": {
+                "commission": config.commission,
+                "slippage": config.slippage,
+                "groups": config.groups,
+                "holdingPeriod": config.holding_period,
+                "neutralizeIndustry": config.neutralize_industry,
+            },
+        }
+
+
+def _resolved_members(
+    members: Sequence[Mapping[str, Any]],
+) -> Sequence[Mapping[str, Any]]:
+    """The members the research engine can apply a point-in-time universe from.
+
+    ``_membership_panel`` matches members on ``member["key"]``, the ``"market:symbol"`` handle
+    ``StrategyV2BacktestService.resolve_candidates`` always injects. Members without one resolve
+    to no active symbol at all, which reads as an empty cross-section on every date and turns
+    every candidate into an inconclusive rejection, so they are dropped here instead. That
+    leaves the empty sequence, which the research engine documents as "no membership
+    restrictions" -- the honest reading of members that never carried a universe mapping.
+    """
+    if any(member.get("key") for member in members):
+        return members
+    return ()
+
+
+def _metrics_payload(result: Mapping[str, Any], config: MiningConfig) -> dict[str, Any]:
+    """The research engine's verdict on a candidate, as the gate ladder and the ledger read it.
+
+    Two additions, both required. ``foldIcSigns`` is L3's fold-consistency input and only the
+    search engine can write it: the research result has no folds, and the gate reads a missing
+    series as "not evaluated" and skips the check, so a run that forgot it would quietly lose
+    the one check that catches a factor whose edge lives in a single stretch of the window. The
+    execution assumptions are re-stamped with the costs this run actually passed in rather than
+    the research engine's defaults, so a stored trial explains its own numbers.
+    """
+    return {
+        **result,
+        "foldIcSigns": _fold_ic_signs(result.get("icSeries")),
+        "executionAssumptions": {
+            **result.get("executionAssumptions", {}),
+            "commission": config.commission,
+            "slippage": config.slippage,
+        },
+    }
+
+
+def _fold_ic_signs(ic_series: Any) -> list[float]:
+    """Signs of the four equal folds of the IC series: L3's fold-consistency input.
+
+    The gate reads an absent series as "not evaluated" and skips the check, so leaving it
+    unwritten would silently drop the one stability check that can catch a factor whose edge
+    comes from a single stretch of the window. An IC series with fewer observations than folds
+    is split into that many folds rather than padded, so no fold is ever empty. A fold whose
+    mean reads exactly zero contributes a neutral sign rather than a vote.
+    """
+    values = [float(item["value"]) for item in ic_series or () if "value" in item]
+    if not values:
+        return []
+    size = math.ceil(len(values) / min(4, len(values)))
+    signs: list[float] = []
+    for start in range(0, len(values), size):
+        mean = statistics.fmean(values[start:start + size])
+        signs.append(float((mean > 0) - (mean < 0)))
+    return signs
+
 
 
 def _payload_int(payload: Mapping[str, Any], key: str, default: int) -> int:

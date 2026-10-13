@@ -43,7 +43,12 @@ class FactorResearchEngine:
         neutralize_industry: bool = False,
         members: Sequence[Mapping[str, Any]] | None = None,
         annualization_periods: float = 252.0,
+        factor_panel: pd.DataFrame | None = None,
     ) -> dict[str, Any]:
+        """Run one factor's cross-sectional research. ``factor_panel`` overrides the built-in
+        factor named by ``factor_id``, which factor mining uses to score a DSL expression --
+        a candidate that is not one of the built-ins has no id, so ``factor_id`` may be empty
+        there. Every other branch is unchanged."""
         requested_groups = max(2, min(10, int(groups or 5)))
         holding_period = max(1, int(holding_period or 5))
         factor_name = str(factor_id or "momentum_20").strip().lower()
@@ -61,7 +66,7 @@ class FactorResearchEngine:
         if not research_dates:
             raise ValueError("strategyV2.factorResearchInsufficientObservations")
 
-        factor = self._factor_panel(prepared, factor_name, close)
+        factor = factor_panel if factor_panel is not None else self._factor_panel(prepared, factor_name, close)
         entry = open_price.shift(-1)
         exit_price = open_price.shift(-(holding_period + 1))
         forward_return = exit_price / entry - 1.0
