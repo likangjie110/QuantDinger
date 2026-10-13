@@ -8,13 +8,15 @@ thing a fake cannot prove -- that PostgreSQL accepts the statements -- belongs t
 integration check.
 """
 
-from datetime import datetime
+import copy
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from app.services.factor_mining import service as mining_service
-from app.services.factor_mining.engine import MiningDataProvider
+from app.services.factor_mining.engine import DEFAULT_SEED, MiningDataProvider
 from app.services.factor_mining.service import FactorMiningService
+from app.services.factor_mining.templates import DEFAULT_BUDGET, expand_candidates
 from app.tasks import agent_jobs as celery_agent_jobs
 
 
@@ -107,11 +109,12 @@ class _Repository:
 class _Engine:
     """A stand-in for ``FactorMiningEngine`` that records what the search and review were told."""
 
-    def __init__(self, trace, *, run_result=None, reviewed=(), error=None):
+    def __init__(self, trace, *, run_result=None, reviewed=(), error=None, review_error=None):
         self.trace = trace
         self.run_result = run_result
         self.reviewed = list(reviewed)
         self.error = error
+        self.review_error = review_error
         self.trials_counts = []
         self.survivors = None
 
@@ -125,6 +128,8 @@ class _Engine:
         self.trace.append("review_frozen")
         self.survivors = list(survivors)
         self.trials_counts.append(trials_count)
+        if self.review_error is not None:
+            raise self.review_error
         return self.reviewed
 
 
@@ -184,6 +189,25 @@ def test_submit_validates_before_it_opens_a_job(monkeypatch):
         FactorMiningService().submit(user_id=4, payload=_payload(market="NASDAQ"))
 
 
+def test_submit_strips_client_supplied_reserved_keys(monkeypatch):
+    """``__`` keys are the job store's own channel -- ``__billing`` is refunded from them."""
+    captured = {}
+
+    def _fake_submit_job(**kwargs):
+        captured.update(kwargs)
+        return {"job_id": "job-1", "status": "queued"}
+
+    monkeypatch.setattr(mining_service.agent_jobs, "submit_job", _fake_submit_job)
+    monkeypatch.setattr(mining_service.agent_jobs, "count_active_jobs", lambda **_: 0)
+
+    FactorMiningService().submit(
+        user_id=4,
+        payload=_payload(**{"__billing": {"credits": 999}, "__userId": 99}),
+    )
+
+    assert captured["request_payload"] == {**_payload(), "__userId": 4}
+
+
 def test_get_job_speaks_the_camel_case_envelope(monkeypatch):
     monkeypatch.setattr(mining_service.agent_jobs, "get_job",
                         lambda job_id, *, user_id: _job_row(job_id=job_id))
@@ -216,6 +240,39 @@ def test_list_jobs_asks_for_this_kind_and_maps_every_row(monkeypatch):
 
     assert asked == {"user_id": USER_ID, "kind": "factor_mining", "limit": 5}
     assert [job["jobId"] for job in jobs] == ["job-1", "job-2"]
+
+
+def _list_one_running_job(monkeypatch, started_at, failed):
+    monkeypatch.setattr(
+        mining_service.agent_jobs, "list_jobs",
+        lambda **_: [{"job_id": "job-1", "status": "running", "started_at": started_at}],
+    )
+    monkeypatch.setattr(mining_service.agent_jobs, "get_job",
+                        lambda job_id, *, user_id: _job_row(job_id=job_id, status="failed"))
+    monkeypatch.setattr(mining_service.agent_jobs, "_set_failure",
+                        lambda job_id, message: failed.append((job_id, message)))
+    return FactorMiningService().list_jobs(user_id=USER_ID)
+
+
+def test_list_jobs_retires_a_job_whose_worker_died(monkeypatch):
+    """An unswept ghost blocks every later submission: the concurrency gate counts active jobs."""
+    failed = []
+    stale = datetime.now(timezone.utc) - timedelta(seconds=10_000)
+
+    jobs = _list_one_running_job(monkeypatch, stale, failed)
+
+    assert failed == [("job-1", "factorMining.workerInterrupted")]
+    assert jobs[0]["status"] == "failed"
+
+
+def test_list_jobs_leaves_a_running_job_inside_its_time_limit_alone(monkeypatch):
+    """Inside the limit a job may simply be slow, and retiring it would free its slot to a second run."""
+    failed = []
+    fresh = datetime.now(timezone.utc) - timedelta(seconds=60)
+
+    _list_one_running_job(monkeypatch, fresh, failed)
+
+    assert failed == []
 
 
 def test_cancel_job_cancels_only_the_callers_own_job(monkeypatch):
@@ -299,7 +356,9 @@ def test_blank_integer_fields_read_as_absent(monkeypatch):
     estimate = FactorMiningService().estimate(
         _payload(budget="", seed="", groups="", holdingPeriod=""),
     )
-    assert estimate["candidateBudget"] >= 1
+    assert estimate["candidateBudget"] == len(
+        expand_candidates(template_ids=None, budget=DEFAULT_BUDGET, seed=DEFAULT_SEED)
+    )
     with pytest.raises(ValueError, match="factorMining.sourceRequired"):
         FactorMiningService().estimate(_payload(sourceId=""))
 
@@ -346,7 +405,9 @@ def test_runner_ledgers_every_trial_and_writes_the_frozen_count_back(monkeypatch
                 "outOfSample": {}}
     reviewed = [{**survivor, "status": "frozen", "reason": "", "outOfSample": {"rankIc": 0.4}}]
     repository = _Repository()
-    engine = _Engine(repository.trace, run_result=_run_result(trials, [survivor]), reviewed=reviewed)
+    run_result = _run_result(trials, [survivor])
+    engine_summary = copy.deepcopy(run_result["summary"])
+    engine = _Engine(repository.trace, run_result=run_result, reviewed=reviewed)
     build, built = _factory(repository.trace, engine)
     sources = _SourceService(_SOURCE)
     monkeypatch.setattr(mining_service, "get_script_source_service", lambda: sources)
@@ -376,10 +437,14 @@ def test_runner_ledgers_every_trial_and_writes_the_frozen_count_back(monkeypatch
     assert engine.trials_counts == [len(trials)]
     assert repository.finished[0]["status"] == "success"
     assert repository.finished[0]["error_message"] == ""
-    assert repository.finished[0]["result"]["summary"]["frozen"] == 1
     assert repository.finished[0]["result"]["candidates"] == reviewed
+    # The service writes the review back and nothing else: every other field the engine handed it
+    # is persisted unchanged, and only ``summary.frozen`` differs from the engine's placeholder.
+    persisted = repository.finished[0]["result"]
+    assert persisted["summary"] == {**engine_summary, "frozen": 1}
+    assert persisted["trials"] == trials
+    assert persisted["split"] == run_result["split"]
     assert result["summary"]["frozen"] == 1
-    assert result["summary"]["trials"] == 3
 
 
 def test_runner_closes_the_run_as_failed_then_reraises(monkeypatch):
@@ -410,6 +475,46 @@ def test_runner_refuses_a_missing_source_before_opening_a_run(monkeypatch):
         service._run_mining_job({"__userId": USER_ID, **_payload()}, _PROGRESS)
 
     assert repository.trace == []
+
+
+def test_runner_keeps_the_search_counts_when_the_review_fails(monkeypatch):
+    """A review that fails after the ledger was written must not persist zero counts against it."""
+    trials = [_trial("a", "reject"), _trial("b", "pass")]
+    survivor = {"expression": {"op": "close"}, "fingerprint": "b" * 64, "origin": "template",
+                "template_id": "momentum", "status": "search", "reason": "", "metrics": {},
+                "outOfSample": {}}
+    repository = _Repository()
+    engine = _Engine(repository.trace, run_result=_run_result(trials, [survivor]),
+                     review_error=ValueError("factorMining.noMarketData"))
+    build, _ = _factory(repository.trace, engine)
+    monkeypatch.setattr(mining_service, "get_script_source_service", lambda: _SourceService(_SOURCE))
+
+    service = FactorMiningService(engine_factory=build, repository=repository)
+    with pytest.raises(ValueError, match="factorMining.noMarketData"):
+        service._run_mining_job({"__userId": USER_ID, **_payload()}, _PROGRESS)
+
+    finished = repository.finished[0]
+    assert finished["status"] == "failed"
+    assert finished["error_message"] == "factorMining.noMarketData"
+    assert finished["result"]["summary"]["trials"] == len(trials)
+    assert finished["result"]["summary"]["snapshotId"] == "b" * 64
+
+
+def test_runner_marks_a_cancelled_run_as_cancelled(monkeypatch):
+    """``agent_jobs`` distinguishes a user's cancellation from a failure, and the run row must too."""
+    repository = _Repository()
+    engine = _Engine(repository.trace,
+                     error=mining_service.agent_jobs.JobCancelledError("JOB_CANCELLED"))
+    build, _ = _factory(repository.trace, engine)
+    monkeypatch.setattr(mining_service, "get_script_source_service", lambda: _SourceService(_SOURCE))
+
+    service = FactorMiningService(engine_factory=build, repository=repository)
+    with pytest.raises(mining_service.agent_jobs.JobCancelledError):
+        service._run_mining_job({"__userId": USER_ID, **_payload()}, _PROGRESS)
+
+    assert repository.trace == ["persist_run", "engine_factory", "engine.run", "finish_run"]
+    assert repository.finished[0]["status"] == "cancelled"
+    assert repository.finished[0]["error_message"] == ""
 
 
 # ─────────────────────────────── celery dispatch ───────────────────────────────

@@ -32,8 +32,10 @@ so both dispatch paths execute one implementation.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Any
 
 from app.markets.registry import list_market_keys
@@ -103,8 +105,17 @@ class FactorMiningService:
         }
 
     def submit(self, *, user_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:
-        """Queue one mining run and return its job receipt."""
-        request_payload = dict(payload or {})
+        """Queue one mining run and return its job receipt.
+
+        The ``__`` prefix is the job store's own channel -- ``__billing`` is refunded from the
+        stored request, ``__userId`` scopes the run -- so a client-supplied one is dropped here,
+        where the untrusted mapping enters, rather than in ``submit_job``, which cannot tell a
+        client's key from the ``__userId`` this method is about to inject. Order matters: strip
+        first, then inject.
+        """
+        request_payload = {
+            key: value for key, value in (payload or {}).items() if not str(key).startswith("__")
+        }
         self._config(request_payload)
         if agent_jobs.count_active_jobs(user_id=int(user_id)):
             raise ValueError("factorMining.concurrentLimit")
@@ -126,10 +137,16 @@ class FactorMiningService:
         """The caller's mining jobs, newest first, in the same envelope as :meth:`get_job`.
 
         Each job is re-read for its progress and result: a poller lists jobs to find the one that
-        finished, and the summary query carries neither.
+        finished, and the summary query carries neither. Listing is also where a job orphaned by a
+        dead worker is retired -- an unswept ghost is not cosmetic, because the concurrency gate
+        counts active jobs, so it would otherwise block every later submission by that tenant.
         """
         items = []
         for summary in agent_jobs.list_jobs(user_id=int(user_id), kind=JOB_KIND, limit=limit):
+            if _is_stale_running_job(summary):
+                agent_jobs._set_failure(
+                    str(summary.get("job_id") or ""), "factorMining.workerInterrupted",
+                )
             row = agent_jobs.get_job(str(summary.get("job_id") or ""), user_id=int(user_id))
             if row:
                 items.append(_public_job(row))
@@ -197,13 +214,17 @@ class FactorMiningService:
             snapshot_id="",
             manifest=compile_strategy_v2(code).manifest.metadata(),
         )
+        result: dict[str, Any] = {}
         try:
             engine = self._engine_factory(
                 data_provider=MiningDataProvider(backtest_service=self._backtest_service),
                 on_progress=on_progress,
             )
-            result = engine.run(user_id=user_id, code=code, config=config)
-            self._repository.save_trials(run_id, user_id=user_id, trials=result["trials"])
+            search = engine.run(user_id=user_id, code=code, config=config)
+            self._repository.save_trials(run_id, user_id=user_id, trials=search["trials"])
+            # The counts may only be persisted once the ledger holds them: a run row closed before
+            # its trials were written would claim evaluations the ledger never received.
+            result = search
             self._repository.upsert_candidates(
                 user_id=user_id, run_id=run_id, candidates=result["candidates"],
             )
@@ -222,9 +243,19 @@ class FactorMiningService:
                 1 for candidate in reviewed if candidate.get("status") == "frozen"
             )
             self._repository.finish_run(run_id, user_id=user_id, status="success", result=result)
-        except Exception as exc:
+        except agent_jobs.JobCancelledError:
+            # The job store already says cancelled, and the run row has to agree: a library view
+            # that reads "failed" cannot tell the user's own cancellation from an engine failure.
             self._repository.finish_run(
-                run_id, user_id=user_id, status="failed", result={}, error_message=str(exc),
+                run_id, user_id=user_id, status="cancelled", result=result,
+            )
+            raise
+        except Exception as exc:
+            # ``result`` carries whatever the search already produced. A review that fails after
+            # the ledger was written must not persist zero counts and an empty fingerprint against
+            # a run whose trials are on disk.
+            self._repository.finish_run(
+                run_id, user_id=user_id, status="failed", result=result, error_message=str(exc),
             )
             raise
         return result
@@ -284,6 +315,22 @@ def run_mining_job(
     run the same implementation with the same collaborators.
     """
     return get_factor_mining_service()._run_mining_job(payload, on_progress)
+
+
+def _is_stale_running_job(row: Mapping[str, Any]) -> bool:
+    """A job still marked ``running`` long past the worker's own time limit: its process is gone.
+
+    The threshold is the one the strategy-evolution list applies -- the worker's limit plus a
+    grace window -- because a job inside its limit may simply be slow, and retiring a live job
+    would both mislabel it and hand its concurrency slot to a second run.
+    """
+    if row.get("status") != "running" or not row.get("started_at"):
+        return False
+    started_at = row["started_at"]
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    limit_seconds = max(120, int(os.getenv("CELERY_TASK_TIME_LIMIT", "3600"))) + 300
+    return (datetime.now(timezone.utc) - started_at).total_seconds() > limit_seconds
 
 
 def _public_job(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
