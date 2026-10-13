@@ -130,8 +130,16 @@ def _fixture(name="plain"):
 
 
 def _search(**overrides):
-    """``_run`` over the plain fixture, memoized on the config overrides."""
+    """``_run`` over the plain fixture, memoized on the config overrides.
+
+    A run is memoized only while the real template expansion is in place. A test that patches
+    ``expand_candidates`` and calls this would otherwise store its result under the key the
+    template search owns, and every later test asking for that key -- in a subset run, where
+    nothing repopulated it first -- would read that run instead of a template search.
+    """
     key = tuple(sorted((name, repr(value)) for name, value in overrides.items()))
+    if engine_module.expand_candidates is not expand_candidates:
+        return _run(*_fixture(), **overrides)
     if key not in _SEARCH_CACHE:
         _SEARCH_CACHE[key] = _run(*_fixture(), **overrides)
     return _SEARCH_CACHE[key]
@@ -475,6 +483,24 @@ def test_the_correlation_study_reads_the_injected_panel_not_a_lookalike():
                if datetime.fromisoformat(item["time"]) < cutoff]
     assert blanked, "the blanked half must have scored something before it was blanked"
     assert whole_observed - partial_observed == len(blanked)
+
+
+def test_a_run_made_under_a_patched_expansion_is_never_memoized(monkeypatch):
+    """A patched expansion's run must not answer the template search's memoized key.
+
+    Writing it there leaves the wrong run behind for every later test that asks for the same
+    key -- which only shows up in a subset run, where no earlier test repopulated the entry
+    first. That is the shape of the false red this suite already had once, so the memo refuses
+    to store a run it cannot attribute to the real expansion.
+    """
+    monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: _seeds(1))
+    patched, _ = _search(thresholds=_NO_DEDUPLICATION)
+    assert len(patched["trials"]) == 1, "the patch must be in effect for this test to mean anything"
+
+    monkeypatch.undo()
+    unpatched, _ = _search(thresholds=_NO_DEDUPLICATION)
+    assert unpatched is not patched
+    assert len(unpatched["trials"]) == 12, "the template search's own run was overwritten"
 
 
 def test_members_without_a_key_are_reported_as_no_membership():
