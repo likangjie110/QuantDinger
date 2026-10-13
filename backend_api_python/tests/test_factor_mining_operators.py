@@ -70,12 +70,21 @@ def test_every_windowed_operator_is_prefix_invariant(name):
     """Rewriting the newest bar must not move any earlier output."""
     assert _WINDOWED_OPERATORS, "windowed operators must exist for this boundary test to mean anything"
     base = _panel([[1.0, 2.0], [2.0, 3.0], [3.0, 5.0], [4.0, 8.0]])
+    # The second operand has to differ from the first. ``ts_corr`` of a panel with itself is 1.0
+    # on every bar it can measure, and a constant series is invariant under any implementation.
+    other = _panel([[5.0, 1.0], [1.0, 4.0], [3.0, 2.0], [2.0, 6.0]])
     mutated = base.copy()
     mutated.iloc[-1] = [100.0, 200.0]
     arity = OPERATOR_SPECS[name][0]
-    before = apply_operator(name, [base] * arity, {"n": 2}).iloc[:-1]
-    after = apply_operator(name, [mutated] * arity, {"n": 2}).iloc[:-1]
+    args = [base, other][:arity]
+    mutated_args = [mutated, other][:arity]
+    before = apply_operator(name, args, {"n": 2}).iloc[:-1]
+    after = apply_operator(name, mutated_args, {"n": 2}).iloc[:-1]
     pd.testing.assert_frame_equal(before, after, obj=name)
+    if name == "ts_corr":
+        measured = apply_operator(name, args, {"n": 2}).iloc[2:]
+        assert not np.allclose(measured.to_numpy(), 1.0), \
+            "the two operands correlate at 1 on every bar, so the comparison above proves nothing"
 
 
 def test_windowed_operators_follow_the_spec_semantics():

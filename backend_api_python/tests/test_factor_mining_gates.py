@@ -55,18 +55,6 @@ def test_screen_redundancy_rejects_builtin_duplicate():
     assert verdict.reason == "factorMining.reject.duplicateBuiltin"
 
 
-def test_screen_out_of_sample_uses_total_trial_count():
-    curve = [{"time": "2025-01-01", "gross": 1.0, "net": 1.0}, {"time": "2025-01-02", "gross": 1.1, "net": 1.09}]
-    returns = net_return_series(curve)
-    assert returns == pytest.approx([0.09])
-    verdict = screen_out_of_sample(is_metrics=_metrics(rankIc=0.05),
-                                   oos_metrics=_metrics(rankIc=0.04),
-                                   returns=[0.01, -0.002, 0.004, 0.006], trials=250,
-                                   thresholds=GateThresholds())
-    assert verdict.stage == "L5"
-    assert verdict.reason in {"", "factorMining.reject.selectionBias"}
-
-
 def test_screen_out_of_sample_rejects_sign_flip():
     verdict = screen_out_of_sample(is_metrics=_metrics(rankIc=0.05), oos_metrics=_metrics(rankIc=-0.04),
                                    returns=[0.01, -0.002, 0.004, 0.006], trials=10, thresholds=GateThresholds())
@@ -235,6 +223,8 @@ def test_screen_out_of_sample_needs_an_in_sample_direction_to_confirm():
 
 
 def test_net_return_series_skips_undefined_steps():
+    # The steps it does take are plain point-to-point returns.
+    assert net_return_series([{"net": 1.0}, {"net": 1.09}]) == pytest.approx([0.09])
     assert net_return_series([]) == []
     assert net_return_series([{"time": "2025-01-01", "net": 1.0}]) == []
     assert net_return_series([{"time": "2025-01-01", "net": 0.0}, {"time": "2025-01-02", "net": 1.0}]) == []
@@ -248,6 +238,42 @@ def test_gate_thresholds_from_payload_overrides_only_supplied_keys():
         GateThresholds(min_coverage=0.8, min_ic_observations=12))
     # A null or unrecognised key keeps its default instead of raising on a partial payload.
     assert GateThresholds.from_payload({"min_coverage": None, "minRankIc": 0.5}) == defaults
+    # A value spelled in the field's own type, in either numeric spelling, is accepted as given.
+    assert GateThresholds.from_payload({"min_ic_observations": 30.0, "min_icir": "0.4"}) == (
+        GateThresholds(min_ic_observations=30, min_icir=0.4))
+
+
+@pytest.mark.parametrize("payload", [[1], "min_coverage", 5], ids=["list", "string", "number"])
+def test_gate_thresholds_refuse_a_payload_that_is_not_a_mapping(payload):
+    """``payload.get`` on a list is an ``AttributeError``: a 500 with no key for the caller."""
+    with pytest.raises(ValueError, match="factorMining.thresholdsInvalid"):
+        GateThresholds.from_payload(payload)
+
+
+@pytest.mark.parametrize("payload", [
+    {"min_ic_observations": 0.5},       # int(0.5) is 0: the observation floor switches itself off
+    {"min_ic_observations": True},      # int(True) is 1: the same floor, near enough
+    {"min_coverage": True},             # float(True) is 1.0: perfect coverage demanded
+    {"min_coverage": float("nan")},     # every comparison against NaN is False, so the bar passes
+    {"min_coverage": float("inf")},
+    {"min_icir": "strong"},
+], ids=["fractional-count", "bool-count", "bool-rate", "nan", "inf", "unreadable"])
+def test_gate_thresholds_refuse_values_that_would_be_a_different_bar(payload):
+    """A coercion that silently changes the value is a bar the run never asked for."""
+    with pytest.raises(ValueError, match="factorMining.thresholdsInvalid"):
+        GateThresholds.from_payload(payload)
+
+
+def test_screen_metrics_reads_the_observation_count_a_trimmed_trial_keeps():
+    """A ledger row keeps the length of its IC series, not the series, and L2 still counts it."""
+    assert screen_metrics(
+        {"coverage": 0.9, "rankIc": 0.05, "icObservations": 30}, GateThresholds()).passed is True
+    assert screen_metrics(
+        {"coverage": 0.9, "rankIc": 0.05, "icObservations": 29}, GateThresholds()).reason == (
+        "factorMining.reject.insufficientObservations")
+    # A row with neither spelling has no observations to count, which is not a pass.
+    assert screen_metrics({"coverage": 0.9, "rankIc": 0.05}, GateThresholds()).reason == (
+        "factorMining.reject.insufficientObservations")
 
 
 def test_gate_verdicts_and_thresholds_are_frozen():

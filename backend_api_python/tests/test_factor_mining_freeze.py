@@ -35,6 +35,7 @@ from app.services.factor_mining.engine import (
 )
 from app.services.factor_mining.gates import GateThresholds, GateVerdict, net_return_series
 from app.services.factor_mining.templates import expand_candidates
+from app.utils import agent_jobs
 from tests.test_factor_mining_data import (
     _FakeBacktestService,
     _SOURCE,
@@ -165,8 +166,10 @@ def test_freeze_review_freezes_a_survivor_whose_edge_holds_out_of_sample():
     # Both windows agree on the sign, which is the first half of L5 -- asserted here as the
     # mechanism behind the frozen status rather than left to the gate's own suite.
     assert out_of_sample["rankIc"] * survivor["metrics"]["rankIc"] > 0
-    # And it is the frozen window that was scored, not the whole fetched panel.
-    assert len(out_of_sample["icSeries"]) < len(survivor["metrics"]["icSeries"])
+    # And it is the frozen window that was scored, not the whole fetched panel. The survivor's
+    # metrics come out of the trial ledger, which keeps its IC observation count rather than the
+    # series -- the length is what L2 reads, and the series is what makes a ledger row large.
+    assert len(out_of_sample["icSeries"]) < survivor["metrics"]["icObservations"]
     # The review answers with a new record instead of editing the run's ledger entry.
     assert survivor["status"] == "search"
     assert survivor["outOfSample"] == {}
@@ -212,6 +215,66 @@ def test_freeze_review_reads_nothing_when_there_are_no_survivors():
 
     assert reviewed == []
     assert provider.calls == []
+
+
+def test_freeze_review_reports_progress_and_stops_on_a_cancellation():
+    """The review has to report, because that callback is where ``agent_jobs`` checks for cancel.
+
+    A review that never reported would ignore a cancellation issued while it ran: the job row
+    would say ``cancelled`` while the run kept writing candidates and closed itself as a success,
+    so the two records would state opposite things about one event. One report per survivor, and
+    before the survivor is scored -- the point of the check is not to spend the work.
+    """
+    panel = _oscillating_fixture()
+    survivors = _survivors(count=3, panel=panel)
+    seen: list[dict] = []
+    reviewed = FactorMiningEngine(data_provider=_FakeProvider(*panel), on_progress=seen.append
+                                  ).review_frozen(
+        user_id=1, code=_CODE, config=_config(), survivors=survivors, trials_count=12)
+
+    assert [event["stage"] for event in seen] == ["review"] * 3
+    assert [(event["evaluated"], event["total"]) for event in seen] == [(1, 3), (2, 3), (3, 3)]
+    assert len(reviewed) == 3
+
+    reported: list[int] = []
+
+    def _cancel(event):
+        reported.append(event["evaluated"])
+        raise agent_jobs.JobCancelledError("JOB_CANCELLED")
+
+    with pytest.raises(agent_jobs.JobCancelledError):
+        FactorMiningEngine(data_provider=_FakeProvider(*panel), on_progress=_cancel).review_frozen(
+            user_id=1, code=_CODE, config=_config(), survivors=survivors, trials_count=12)
+    assert reported == [1], "the review scored a survivor after the cancellation was raised"
+
+
+def test_freeze_review_prices_the_costs_the_run_passed_in():
+    """Commission and slippage have to reach the frozen measurement, not just its label.
+
+    ``_research_window`` forwards them to the research engine, which charges them against each
+    rebalance. The label on the metrics block is written from the config either way, so comparing
+    the two net curves is what distinguishes a cost that was charged from one that was merely
+    declared -- and a turnover of zero would make the comparison hold for free.
+    """
+    panel = _oscillating_fixture()
+    survivor = _survivors(panel=panel)[0]
+    assert survivor["metrics"]["averageTurnover"] > 0, \
+        "a candidate that never traded would show no cost difference at all"
+
+    def review(**costs):
+        return FactorMiningEngine(data_provider=_FakeProvider(*panel)).review_frozen(
+            user_id=1, code=_CODE, config=_config(**costs),
+            survivors=[survivor], trials_count=12)[0]["outOfSample"]
+
+    free = review(commission=0.0, slippage=0.0)
+    charged = review(commission=0.05, slippage=0.05)
+
+    assert free["executionAssumptions"]["commission"] == 0.0
+    assert charged["executionAssumptions"]["commission"] == 0.05
+    free_nav = [point["net"] for point in free["longShortCurve"]]
+    charged_nav = [point["net"] for point in charged["longShortCurve"]]
+    assert free_nav != charged_nav, "the costs never reached the frozen measurement"
+    assert charged_nav[-1] < free_nav[-1], "a cost that was charged lowers a net long/short curve"
 
 
 def test_freeze_review_prices_the_haircut_with_the_runs_whole_trial_count(monkeypatch):

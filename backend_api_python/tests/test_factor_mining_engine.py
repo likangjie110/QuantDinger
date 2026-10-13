@@ -202,6 +202,30 @@ def test_search_records_one_trial_per_evaluated_candidate():
     assert all(item["stage"] in {"L1", "L2", "L3", "L4", "L5"} for item in result["trials"])
 
 
+def test_a_ledger_row_keeps_only_the_metrics_a_gate_reads():
+    """The trial ledger is a run's size bound: one row per evaluation, so no row carries a curve.
+
+    ``icSeries`` is kept as its length under ``icObservations`` -- L2 counts the observations and
+    never reads their values, while the series itself is what makes one row 0.36 MB at 40 symbols.
+    The candidate keeps the whole measurement, and that is where the detail view reads it.
+    """
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
+    assert result["trials"] and result["candidates"]
+    heaviest = {"icSeries", "groupCurves", "longShortCurve", "groupObservations",
+                "factorCorrelation"}
+    for item in result["trials"]:
+        assert not (set(item["metrics"]) & heaviest), "a ledger row dragged a curve along"
+    for item in result["candidates"]:
+        assert heaviest <= set(item["metrics"]), "the candidate lost the measurement"
+    # The count a ledger row keeps is the length of the series the candidate holds.
+    series_length = {item["fingerprint"]: len(item["metrics"]["icSeries"])
+                     for item in result["candidates"]}
+    assert series_length, "no candidate to compare against"
+    for item in result["trials"]:
+        if item["fingerprint"] in series_length:
+            assert item["metrics"]["icObservations"] == series_length[item["fingerprint"]]
+
+
 def test_the_pipeline_runs_past_the_observation_gate_on_real_correlations():
     """L3 is reached, and L4 rejects the fixture's candidates as duplicates, not as unverifiable.
 
@@ -309,6 +333,24 @@ def test_trials_repeat_the_costs_the_run_passed_in():
         assert item["metrics"]["executionAssumptions"]["slippage"] == 0.002
 
 
+def test_trials_declare_the_measurement_they_are_reading():
+    """The engine's own execution assumptions have to survive into the ledger row.
+
+    They are spread under this run's costs rather than replaced by them, and they are the only
+    place a stored trial says what its numbers mean -- which point-in-time price the signal is
+    read from, which bar the trade is entered on, and which bar it exits on. A payload that
+    carried the costs alone would still pass every other assertion in this suite.
+    """
+    result, _ = _search()
+    assert result["trials"]
+    assumptions = result["trials"][0]["metrics"]["executionAssumptions"]
+    assert assumptions["signal"] == "close_point_in_time"
+    assert assumptions["entry"] == "next_bar_open"
+    assert assumptions["exit"] == "open_after_5_bars"
+    assert assumptions["commission"] == 0.0005
+    assert assumptions["slippage"] == 0.0005
+
+
 def test_run_is_reproducible_trial_sequence_including_order():
     """Two independent expansions produce the same trial sequence, position by position.
 
@@ -408,11 +450,32 @@ def _candidate(expression):
 
 
 def _redundancy_views(monkeypatch, expressions):
-    """The L4 mapping the loop derives for each expression, read off the recorded trials."""
+    """The L4 mapping the loop derives for each expression, read off the surviving candidates.
+
+    Not the trials: a ledger row keeps only the metrics its gates read, and the correlation study
+    is not one of them -- the candidate is where the whole measurement lives.
+    """
     result, _ = _run_with_seeds(monkeypatch, [_candidate(item) for item in expressions],
                                 thresholds=_NO_DEDUPLICATION)
     engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
-    return [engine._correlations(item["metrics"]) for item in result["trials"]]
+    return [engine._correlations(item["metrics"]) for item in result["candidates"]]
+
+
+def test_the_redundancy_mapping_refuses_a_study_that_is_not_this_candidates():
+    """The first study row must be the candidate's own, or nothing is mapped at all.
+
+    ``factor_research`` only lists a factor it could compare over enough overlapping
+    observations, so the candidate's own row can be missing while built-ins remain. Reading the
+    matrix by position would then hand L4 a built-in's correlations -- a candidate measured
+    against a pool one factor short, with nothing to say so. An empty mapping is the honest
+    answer: ``screen_redundancy`` rejects it as unverifiable.
+    """
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    shifted = {"factors": ["momentum_20", "reversal_5"], "matrix": [[1.0, 0.2], [0.2, 1.0]]}
+    assert engine._correlations({"factorCorrelation": shifted}) == {}
+
+    own = {"factors": ["expression", "reversal_5"], "matrix": [[1.0, 0.2], [0.2, 1.0]]}
+    assert engine._correlations({"factorCorrelation": own}) == {"reversal_5": 0.2}
 
 
 def test_the_redundancy_gate_measures_the_candidate_not_a_builtin(monkeypatch):
@@ -693,12 +756,46 @@ def test_run_reports_the_config_split_and_summary():
     result, _ = _search()
     assert result["config"]["market"] == "USStock"
     assert result["config"]["budget"] == 12
-    assert datetime.fromisoformat(result["split"]["searchStart"]) == datetime(2024, 1, 1)
-    assert datetime.fromisoformat(result["split"]["searchStart"]) < \
-           datetime.fromisoformat(result["split"]["searchEnd"])
-    assert datetime.fromisoformat(result["split"]["freezeStart"]) > \
-           datetime.fromisoformat(result["split"]["searchEnd"])
-    assert datetime.fromisoformat(result["split"]["freezeEnd"]) == datetime(2024, 10, 31)
+    # The split's exact edges: the frozen tail starts the day after the last search session, so
+    # an off-by-one in either direction would move a bar from one window into the other.
+    assert result["split"] == {
+        "searchStart": "2024-01-01T00:00:00",
+        "searchEnd": "2024-07-31T00:00:00",
+        "freezeStart": "2024-08-01T00:00:00",
+        "freezeEnd": "2024-10-31T00:00:00",
+    }
+    # The config's dates leave in that same spelling. ``asdict`` keeps native datetimes, and the
+    # durable job store renders those with ``str()`` -- "2024-01-01 00:00:00", which a browser's
+    # ``new Date()`` reads as Invalid Date -- beside an ISO ``split`` in the same response.
+    assert result["config"]["start_date"] == "2024-01-01T00:00:00"
+    assert result["config"]["end_date"] == "2024-10-31T00:00:00"
     assert result["summary"]["snapshotId"] == "b" * 64
     assert result["summary"]["trials"] == len(result["trials"])
     assert result["summary"]["candidates"] == len(result["candidates"])
+
+
+def test_the_research_engine_is_told_the_runs_own_frequency(monkeypatch):
+    """ICIR is annualized from the run's timeframe and markets, not from the engine's default.
+
+    ICIR = ``ic_mean / ic_std * sqrt(annualization / holding_period)``, so a weekly run left on
+    the engine's 252-bar default would report an ICIR about 2.2x its own and clear ``min_icir``
+    on a number measured in another unit. The crypto case is what says the markets travel with
+    it: a daily US-equity run's 252 is indistinguishable from the default.
+    """
+    calls: list[dict] = []
+
+    class _Recording(FactorResearchEngine):
+        def run(self, **kwargs):
+            calls.append(kwargs)
+            return super().run(**kwargs)
+
+    monkeypatch.setattr(engine_module, "FactorResearchEngine", _Recording)
+
+    _run(*_fixture(), timeframe="1w")
+    assert calls, "no evaluation reached the research engine"
+    assert {call["annualization_periods"] for call in calls} == {52.0}
+
+    crypto = [{**member, "market": "Crypto"} for member in _fixture()[1]]
+    calls.clear()
+    _run(_fixture()[0], crypto)
+    assert {call["annualization_periods"] for call in calls} == {365.25}

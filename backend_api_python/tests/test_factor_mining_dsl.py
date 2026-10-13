@@ -2,7 +2,12 @@
 
 import pytest
 
-from app.services.factor_mining.dsl import ExpressionError, normalize_expression
+from app.services.factor_mining.dsl import (
+    MAX_LOOKBACK,
+    MAX_NODES,
+    ExpressionError,
+    normalize_expression,
+)
 
 
 def test_normalize_produces_stable_fingerprint_regardless_of_key_order():
@@ -65,6 +70,36 @@ def test_normalize_rejects_lookback_over_budget():
         "params": {"n": 252}}
     with pytest.raises(ExpressionError, match="lookbackExceeded"):
         normalize_expression(node)
+
+
+def _tree(nodes: int):
+    """A tree of exactly ``nodes`` nodes. The unary tail makes every count reachable."""
+    if nodes == 1:
+        return "close"
+    if nodes % 2 == 0:
+        return {"op": "neg", "args": [_tree(nodes - 1)], "params": {}}
+    half = (nodes - 1) // 2
+    return {"op": "add", "args": [_tree(half), _tree(half)], "params": {}}
+
+
+def test_a_lookback_of_exactly_the_budget_is_accepted():
+    """The ceiling is a maximum, not an exclusive bound: 504 of window sums still validates."""
+    assert MAX_LOOKBACK == 504
+    node = {"op": "ts_mean", "args": [
+        {"op": "ts_mean", "args": ["close"], "params": {"n": 252}}], "params": {"n": 252}}
+    result = normalize_expression(node)
+    assert result.lookback == MAX_LOOKBACK
+    assert result.windows == (252,)
+
+
+def test_a_node_count_of_exactly_the_budget_is_accepted():
+    """Likewise the node budget: 24 nodes validate, and the 25th is what ``tooManyNodes`` is for."""
+    assert MAX_NODES == 24
+    accepted = normalize_expression(_tree(MAX_NODES))
+    assert accepted.node_count == MAX_NODES
+    assert accepted.depth <= 6, "the accepted side must not be rejected for its depth instead"
+    with pytest.raises(ExpressionError, match="tooManyNodes"):
+        normalize_expression(_tree(MAX_NODES + 1))
 
 
 def test_window_one_is_accepted_for_single_bar_return():

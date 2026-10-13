@@ -114,12 +114,17 @@ class FactorMiningService:
         where the untrusted mapping enters, rather than in ``submit_job``, which cannot tell a
         client's key from the ``__userId`` this method is about to inject. Order matters: strip
         first, then inject.
+
+        The concurrency gate counts this feature's own jobs. Counting every kind would let a
+        running backtest answer ``factorMining.concurrentLimit`` -- a key that says the caller
+        already has a mining job -- and would let an unswept ghost from another feature block
+        mining forever, because this feature's sweep only retires its own kind.
         """
         request_payload = {
             key: value for key, value in (payload or {}).items() if not str(key).startswith("__")
         }
         self._config(request_payload)
-        if agent_jobs.count_active_jobs(user_id=int(user_id)):
+        if agent_jobs.count_active_jobs(user_id=int(user_id), kind=JOB_KIND):
             raise ValueError("factorMining.concurrentLimit")
         receipt = agent_jobs.submit_job(
             user_id=int(user_id),
@@ -142,6 +147,8 @@ class FactorMiningService:
         finished, and the summary query carries neither. Listing is also where a job orphaned by a
         dead worker is retired -- an unswept ghost is not cosmetic, because the concurrency gate
         counts active jobs, so it would otherwise block every later submission by that tenant.
+        The result is left out of the listed row (``hasResult`` says whether there is one): it is
+        the whole run record, and twenty of them is more than a listing can carry.
         """
         items = []
         for summary in agent_jobs.list_jobs(user_id=int(user_id), kind=JOB_KIND, limit=limit):
@@ -151,7 +158,7 @@ class FactorMiningService:
                 )
             row = agent_jobs.get_job(str(summary.get("job_id") or ""), user_id=int(user_id))
             if row:
-                items.append(_public_job(row))
+                items.append(_public_job(row, include_result=False))
         return items
 
     def cancel_job(self, job_id: str, *, user_id: int) -> dict[str, Any] | None:
@@ -335,15 +342,26 @@ def _is_stale_running_job(row: Mapping[str, Any]) -> bool:
     return (datetime.now(timezone.utc) - started_at).total_seconds() > limit_seconds
 
 
-def _public_job(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
-    """The job as the API spells it. Both a stored row and the submit receipt land here."""
+def _public_job(
+    row: Mapping[str, Any] | None, *, include_result: bool = True,
+) -> dict[str, Any] | None:
+    """The job as the API spells it. Both a stored row and the submit receipt land here.
+
+    ``include_result=False`` is the list view's shape. A finished run's result holds every
+    surviving candidate's full metrics and every trial's ledger row, so a page of twenty would
+    hand a poller more JSON than it can use -- it lists jobs to find the one that finished, and
+    the summary query carries neither. ``hasResult`` says whether there is one to fetch from
+    ``GET /jobs/<id>``.
+    """
     if not row:
         return None
+    result = _json(row.get("result"))
     return {
         "jobId": row.get("job_id"),
         "status": row.get("status"),
         "progress": _json(row.get("progress")) or {},
-        "result": _json(row.get("result")),
+        "result": result if include_result else None,
+        "hasResult": bool(result),
         "error": row.get("error"),
         "createdAt": row.get("created_at"),
         "startedAt": row.get("started_at"),

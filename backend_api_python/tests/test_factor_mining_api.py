@@ -181,6 +181,17 @@ def test_estimate_prices_the_search_and_drops_unknown_keys(app, service):
     assert stub.calls["estimate"] == {"payload": {"sourceId": 1}}
 
 
+def test_estimate_returns_500_envelope_when_the_service_raises_unexpectedly(app, service):
+    """``/run`` has a closed key for an unexpected failure; ``/estimate`` answers the same way."""
+    service(estimate=RuntimeError("connection reset"))
+    response, status = _invoke(
+        app, mining_routes.estimate_factor_mining,
+        path="/api/factor-mining/estimate", json={"sourceId": 1},
+    )
+    assert status == 500
+    assert response.get_json() == {"code": 0, "msg": "factorMining.estimateFailed", "data": None}
+
+
 def test_job_list_clamps_the_page_size(app, service):
     stub = service(list_jobs=[_receipt(jobId="job-1"), _receipt(jobId="job-2")])
     response = _invoke(

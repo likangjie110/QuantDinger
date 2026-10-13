@@ -46,15 +46,50 @@ class GateThresholds:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any] | None) -> "GateThresholds":
-        """Overlay a run payload on the defaults; null and unrecognised keys keep the default."""
+        """Overlay a run payload on the defaults; null and unrecognised keys keep the default.
+
+        A payload that is not a mapping is refused by key rather than read: ``.get`` on a list
+        raises ``AttributeError``, which the route layer would answer with a 500 and no key at
+        all. A value that cannot be read as its own field's type is refused for the same reason
+        a budget above the cap is -- the alternative is a bar the caller never asked for.
+        """
+        if payload is None:
+            return cls()
+        if not isinstance(payload, Mapping):
+            raise ValueError("factorMining.thresholdsInvalid")
         if not payload:
             return cls()
         defaults = {field.name: field.default for field in fields(cls)}
         return cls(**{
-            name: type(default)(payload[name])
+            name: _threshold_value(payload[name], default)
             for name, default in defaults.items()
             if payload.get(name) is not None
         })
+
+
+def _threshold_value(value: Any, default: Any) -> Any:
+    """One threshold override, read as its field's own type or refused by key.
+
+    ``type(default)(value)`` is a silent rewrite, not a coercion: ``int(0.5)`` is 0, so a
+    fractional ``min_ic_observations`` would switch L2's observation floor off entirely, and
+    ``float(True)`` is 1.0, so a boolean ``min_coverage`` would demand perfect coverage. Both
+    are rejected instead. An integral float is accepted (``30.0`` is an observation count), and
+    a non-finite one is not: every comparison against NaN or infinity is False, which passes the
+    minimum it was meant to enforce.
+    """
+    if isinstance(value, bool):
+        raise ValueError("factorMining.thresholdsInvalid")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("factorMining.thresholdsInvalid") from exc
+    if not math.isfinite(number):
+        raise ValueError("factorMining.thresholdsInvalid")
+    if isinstance(default, int):
+        if number != int(number):
+            raise ValueError("factorMining.thresholdsInvalid")
+        return int(number)
+    return number
 
 
 @dataclass(frozen=True)
@@ -109,11 +144,24 @@ def _failed(stage: str, reason: str) -> GateVerdict:
     return GateVerdict(passed=False, stage=stage, reason=reason)
 
 
+def _ic_observations(metrics: Mapping[str, Any]) -> int:
+    """How many IC observations L2 counts: the series' length, or a ledger row's own count.
+
+    A candidate's metrics carry the whole series; a stored trial keeps its length under
+    ``icObservations`` (``engine._trial_metrics``). Both reach this gate as an in-sample metrics
+    mapping, and a truncated series would move the count this minimum is compared against.
+    """
+    series = metrics.get("icSeries")
+    if series is None:
+        return int(_number(metrics.get("icObservations")))
+    return len(series or ())
+
+
 def screen_metrics(metrics: Mapping[str, Any], thresholds: GateThresholds) -> GateVerdict:
     """L2: coverage, IC observation count, then signal strength -- first failure wins."""
     if _number(metrics.get("coverage")) < thresholds.min_coverage:
         return _failed("L2", "factorMining.reject.lowCoverage")
-    if len(metrics.get("icSeries") or ()) < thresholds.min_ic_observations:
+    if _ic_observations(metrics) < thresholds.min_ic_observations:
         return _failed("L2", "factorMining.reject.insufficientObservations")
     if abs(_number(metrics.get("rankIc"))) < thresholds.min_abs_rank_ic:
         return _failed("L2", "factorMining.reject.weakIc")

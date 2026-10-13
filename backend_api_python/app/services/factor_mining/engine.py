@@ -7,7 +7,9 @@ layer with its own time semantics. Second the split: the requested range is cut 
 window and a frozen tail, and the tail is never fetched by the search; the out-of-sample review
 asks for it separately, once. Third the loop: every expanded candidate is scored through
 ``FactorResearchEngine`` and walked down the graded gate ladder, and every one of them -- pass
-or reject -- leaves a trial behind. Fourth the review: the frozen tail is fetched once, scored
+or reject -- leaves a trial behind, carrying only the metrics a gate reads: the candidate keeps
+the whole measurement, but the ledger has one row per evaluation and would otherwise grow the
+run's record with the budget. Fourth the review: the frozen tail is fetched once, scored
 by that same research engine over its own window, and judged by the sign and selection-bias
 gates, which are told the run's whole trial count because that count is what prices the search.
 
@@ -65,6 +67,7 @@ from app.services.factor_mining.gates import (
 from app.services.factor_mining.templates import DEFAULT_BUDGET, MAX_BUDGET, expand_candidates
 from app.services.strategy_v2.contract import StrategyV2ContractError, compile_strategy_v2
 from app.services.strategy_v2.factor_research import FactorResearchEngine
+from app.services.strategy_v2.frequencies import periods_per_year
 from app.services.strategy_v2.models import StrategyManifest
 from app.services.strategy_v2.service import StrategyV2BacktestService, _enforce_backtest_range
 from app.services.strategy_v2.snapshot import canonical_frame_bytes
@@ -334,7 +337,7 @@ class FactorMiningEngine:
                 "stage": verdict.stage,
                 "verdict": "pass" if verdict.passed else "reject",
                 "reason": verdict.reason,
-                "metrics": metrics,
+                "metrics": _trial_metrics(metrics),
             })
             if verdict.passed:
                 candidates.append({
@@ -349,7 +352,7 @@ class FactorMiningEngine:
                 })
             self._progress(evaluated, len(seeds))
         return {
-            "config": asdict(config),
+            "config": self._config_payload(config),
             "split": self._split_payload(split),
             "trials": trials,
             "candidates": candidates,
@@ -373,6 +376,11 @@ class FactorMiningEngine:
         deflated-Sharpe denominator, and pricing the search with the survivor count instead would
         understate exactly the bias the correction exists for. Nothing is reviewed when nothing
         survived, so a search that kept no candidate does not open the tail at all.
+
+        Every survivor is reported before it is scored. That report is where ``agent_jobs``
+        checks for cancellation, and it is unmodded rather than paced like the search's: a
+        review that never reported would let a cancelled job keep writing candidates into its
+        run and close it as a success, so the two records would disagree about one event.
         """
         if not survivors:
             return []
@@ -382,10 +390,13 @@ class FactorMiningEngine:
         # them rather than rebuilding anything it was handed.
         evaluator = ExpressionEvaluator(panel.fields)
         members = _resolved_members(panel.members)
-        return [
-            self._review(survivor, evaluator, config, split, panel, members, trials_count)
-            for survivor in survivors
-        ]
+        reviewed: list[dict[str, Any]] = []
+        for evaluated, survivor in enumerate(survivors, start=1):
+            self._report({"stage": "review", "evaluated": evaluated, "total": len(survivors)})
+            reviewed.append(
+                self._review(survivor, evaluator, config, split, panel, members, trials_count)
+            )
+        return reviewed
 
     def _evaluate(
         self,
@@ -513,6 +524,12 @@ class FactorMiningEngine:
         through this same call rather than a second one, so both windows are cut and priced
         identically -- the frozen tail is the one measurement that must not differ in kind from
         the search that produced the candidate.
+
+        The annualization follows the run's own timeframe and markets, the way the factor-research
+        entry derives it. ICIR scales with ``sqrt(annualization / holding_period)``, so leaving
+        the engine's 252-bar default in place would inflate a weekly run's ICIR by about 2.2x and
+        quietly relax ``min_icir`` by the same factor -- a bar in one unit and a measurement in
+        another is exactly the incomparability reusing this engine is meant to prevent.
         """
         return FactorResearchEngine().run(
             frames=panel.frames,
@@ -526,6 +543,9 @@ class FactorMiningEngine:
             slippage=config.slippage,
             neutralize_industry=config.neutralize_industry,
             members=members,
+            annualization_periods=periods_per_year(
+                config.timeframe, {str(member.get("market") or "") for member in members},
+            ),
         )
 
     def _correlations(self, metrics: Mapping[str, Any]) -> dict[str, float]:
@@ -537,11 +557,17 @@ class FactorMiningEngine:
         redundancy`` filters to finite values itself, and a zero this method invented would read
         as a measurement that cleared a duplicate. An unreadable study yields an empty mapping,
         which the gate rejects as unverifiable -- the gate owns that decision, not this method.
+
+        The selected factor is named ``"expression"``, and the guard against reading the row
+        below it as the candidate's own is deliberate: the study only lists a factor it could
+        compare, so the candidate's row can be missing while the matrix still holds built-ins.
+        Trimming the names list by position would then measure the candidate against a built-in's
+        correlations -- one factor short, and silently.
         """
         block = metrics.get("factorCorrelation") or {}
         names = list(block.get("factors") or ())
         matrix = list(block.get("matrix") or ())
-        if not names or not matrix:
+        if not names or not matrix or names[0] != "expression":
             return {}
         return {
             name: value
@@ -550,8 +576,28 @@ class FactorMiningEngine:
 
     def _progress(self, evaluated: int, total: int) -> None:
         """Report every ``PROGRESS_EVERY``th candidate, so a long run is not a black box."""
-        if self._on_progress and evaluated % PROGRESS_EVERY == 0:
-            self._on_progress({"stage": "search", "evaluated": evaluated, "total": total})
+        if evaluated % PROGRESS_EVERY == 0:
+            self._report({"stage": "search", "evaluated": evaluated, "total": total})
+
+    def _report(self, event: dict) -> None:
+        """Hand one progress event to the job's callback; without one there is nothing to report."""
+        if self._on_progress:
+            self._on_progress(event)
+
+    @staticmethod
+    def _config_payload(config: MiningConfig) -> dict[str, Any]:
+        """The run's config, with its dates spelled the way ``split`` spells its own.
+
+        ``asdict`` keeps native ``datetime`` objects, and the durable job store renders what
+        ``json`` cannot with ``default=str`` -- ``"2024-01-01 00:00:00"``, which a browser's
+        ``new Date()`` reads as Invalid Date, inside the same response whose ``split`` block is
+        ISO-8601. Both blocks leave through one spelling, written here rather than patched at
+        the exit, so no serialization path has to know about the difference.
+        """
+        payload = asdict(config)
+        for key in ("start_date", "end_date"):
+            payload[key] = payload[key].isoformat()
+        return payload
 
     @staticmethod
     def _split_payload(split: PeriodSplit) -> dict[str, str]:
@@ -619,7 +665,10 @@ def _metrics_payload(result: Mapping[str, Any], config: MiningConfig) -> dict[st
     series as "not evaluated" and skips the check, so a run that forgot it would quietly lose
     the one check that catches a factor whose edge lives in a single stretch of the window. The
     execution assumptions are re-stamped with the costs this run actually passed in rather than
-    the research engine's defaults, so a stored trial explains its own numbers.
+    the research engine's defaults, so a stored trial explains its own numbers -- and they are
+    spread over the engine's own block rather than written beside it, because that block is where
+    the signal, entry, exit and annualization declarations live, and a stored candidate without
+    them cannot say what it measured.
     """
     return {
         **result,
@@ -630,6 +679,31 @@ def _metrics_payload(result: Mapping[str, Any], config: MiningConfig) -> dict[st
             "slippage": config.slippage,
         },
     }
+
+
+# What a stored trial keeps of its metrics. The four screens are their only reader, and this is
+# the set of keys they read -- plus the execution assumptions, which are the trial's own account
+# of how it was priced. Everything else (the IC series, the group and long/short curves, the
+# per-date cross-sections, the correlation matrix) stays on the candidate: a trial row exists for
+# every candidate the run evaluated, so it is the trial ledger that makes a run's record grow
+# with the budget. At 200 symbols one untrimmed trial is 0.78 MB, and a budget of 400 would
+# persist a third of a gigabyte per run, three times over.
+_TRIAL_METRIC_KEYS = (
+    "coverage", "rankIc", "icir", "foldIcSigns", "averageTurnover", "stability",
+    "executionAssumptions",
+)
+
+
+def _trial_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """One trial's metrics, cut to what the gates read off a ledger row.
+
+    ``icSeries`` becomes its length under ``icObservations``: L2 asks how many observations there
+    were, never what they were. That is the one key whose shape differs from the candidate's copy
+    of the same measurement, and ``screen_metrics`` reads both spellings.
+    """
+    trimmed = {key: metrics[key] for key in _TRIAL_METRIC_KEYS if key in metrics}
+    trimmed["icObservations"] = len(metrics.get("icSeries") or ())
+    return trimmed
 
 
 def _fold_ic_signs(ic_series: Any) -> list[float]:
@@ -663,10 +737,18 @@ def _payload_int(payload: Mapping[str, Any], key: str, default: int) -> int:
     """Read an integer payload field; only an absent key falls back to the default.
 
     ``payload.get(key) or default`` would read an explicit 0 as absent, and a budget of 0 would
-    then never reach the validator that owns the ``factorMining.budgetInvalid`` key.
+    then never reach the validator that owns the ``factorMining.budgetInvalid`` key. A value
+    that cannot be read as an integer is refused by key rather than allowed to escape as a bare
+    ``TypeError`` or ``ValueError``: the route layer turns those into a 500, and its message is
+    the internals of ``int()``, which is neither a closed key nor anything a client should read.
     """
     value = payload.get(key)
-    return default if value is None else int(value)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("factorMining.invalidParameter") from exc
 
 
 def _payload_datetime(value: Any) -> datetime:

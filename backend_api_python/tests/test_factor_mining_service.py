@@ -228,8 +228,9 @@ def test_get_job_speaks_the_camel_case_envelope(monkeypatch):
     job = FactorMiningService().get_job("job-1", user_id=USER_ID)
     assert job["jobId"] == "job-1"
     assert job["result"] == {"summary": {"frozen": 1}}
+    assert job["hasResult"] is True
     assert job["createdAt"] == datetime(2026, 1, 1)
-    assert set(job) == {"jobId", "status", "progress", "result", "error",
+    assert set(job) == {"jobId", "status", "progress", "result", "hasResult", "error",
                         "createdAt", "startedAt", "finishedAt"}
 
 
@@ -287,6 +288,98 @@ def test_list_jobs_leaves_a_running_job_inside_its_time_limit_alone(monkeypatch)
     _list_one_running_job(monkeypatch, fresh, failed)
 
     assert failed == []
+
+
+def test_list_jobs_leaves_the_run_record_out_of_every_row(monkeypatch):
+    """A listing is not a run record: the result stays behind ``hasResult``.
+
+    A finished run's result carries every surviving candidate's full metrics and every trial's
+    ledger row, so a page of twenty of them is more JSON than a poller can use -- it lists jobs
+    to find the one that finished.
+    """
+    monkeypatch.setattr(mining_service.agent_jobs, "list_jobs",
+                        lambda **_: [{"job_id": "job-1"}, {"job_id": "job-2"}])
+    monkeypatch.setattr(
+        mining_service.agent_jobs, "get_job",
+        lambda job_id, *, user_id: _job_row(
+            job_id=job_id, result={"summary": {"frozen": 1}} if job_id == "job-1" else None),
+    )
+
+    jobs = FactorMiningService().list_jobs(user_id=USER_ID)
+
+    assert [job["result"] for job in jobs] == [None, None]
+    assert [job["hasResult"] for job in jobs] == [True, False]
+    # The detail read is where the record is, unchanged and still flagged.
+    detail = FactorMiningService().get_job("job-1", user_id=USER_ID)
+    assert detail["result"] == {"summary": {"frozen": 1}}
+    assert detail["hasResult"] is True
+
+
+def test_the_active_job_gate_counts_this_features_jobs_only(monkeypatch):
+    """A running backtest is not a mining slot, and a mining job of one's own is.
+
+    The stand-in models the filter the counter's SQL applies, so the subject here is which kind
+    the service asks for; ``test_count_active_jobs_narrows_to_a_kind`` pins the statement itself.
+    """
+    rows = [{"user_id": USER_ID, "kind": "backtest"}]
+
+    def _count_active_jobs(*, user_id, agent_token_id=None, kind=None):
+        return sum(1 for row in rows if row["user_id"] == user_id
+                   and (kind is None or row["kind"] == kind))
+
+    monkeypatch.setattr(mining_service.agent_jobs, "count_active_jobs", _count_active_jobs)
+    monkeypatch.setattr(mining_service.agent_jobs, "submit_job",
+                        lambda **_: {"job_id": "job-1", "status": "queued"})
+
+    assert FactorMiningService().submit(user_id=USER_ID, payload=_payload())["jobId"] == "job-1"
+
+    rows.append({"user_id": USER_ID, "kind": "factor_mining"})
+    with pytest.raises(ValueError, match="factorMining.concurrentLimit"):
+        FactorMiningService().submit(user_id=USER_ID, payload=_payload())
+
+    # The other tenant's job is still nobody's business: the count stays scoped by user.
+    rows[:] = [{"user_id": USER_ID + 1, "kind": "factor_mining"}]
+    assert FactorMiningService().submit(user_id=USER_ID, payload=_payload())["jobId"] == "job-1"
+
+
+def test_count_active_jobs_narrows_to_a_kind(monkeypatch):
+    """The shared counter's own statement: a ``kind`` narrows it, and its absence does not."""
+    from app.utils import agent_jobs as jobs
+
+    executed: list[tuple[str, tuple]] = []
+
+    class _Cursor:
+        def execute(self, statement, parameters=()):
+            executed.append((" ".join(statement.split()), parameters))
+
+        def fetchone(self):
+            return {"count": 0}
+
+        def close(self):
+            pass
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def cursor(self):
+            return _Cursor()
+
+    monkeypatch.setattr(jobs, "get_db_connection", _Connection)
+
+    assert jobs.count_active_jobs(user_id=USER_ID, kind="factor_mining") == 0
+    statement, parameters = executed[-1]
+    assert "kind = %s" in statement
+    assert parameters == (USER_ID, "factor_mining")
+
+    jobs.count_active_jobs(user_id=USER_ID, agent_token_id=9)
+    statement, parameters = executed[-1]
+    assert "kind" not in statement
+    assert "agent_token_id = %s" in statement
+    assert parameters == (USER_ID, 9)
 
 
 def test_cancel_job_cancels_only_the_callers_own_job(monkeypatch):
@@ -381,6 +474,32 @@ def test_blank_integer_fields_read_as_absent(monkeypatch):
 def test_unknown_market_is_rejected_by_key(market):
     with pytest.raises(ValueError, match="factorMining.invalidMarket"):
         FactorMiningService().estimate(_payload(market=market))
+
+
+@pytest.mark.parametrize("field", ["seed", "groups", "holdingPeriod"])
+@pytest.mark.parametrize("value", [[], "abc", {}], ids=["list", "text", "object"])
+def test_an_unreadable_integer_field_is_refused_by_key(field, value):
+    """``int([])`` is a ``TypeError`` and ``int("abc")`` a bare ``ValueError``.
+
+    Neither reaches the caller as a key: the route turns the first into a 500 with no key at all
+    and hands the second's message -- the internals of ``int()`` -- straight back as ``msg``.
+    """
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        FactorMiningService().estimate(_payload(**{field: value}))
+
+
+@pytest.mark.parametrize("value", [[], "abc"], ids=["list", "text"])
+def test_an_unreadable_budget_keeps_its_own_key(value):
+    """The generic key must not swallow the field that already owns a specific one."""
+    with pytest.raises(ValueError, match="factorMining.budgetInvalid"):
+        FactorMiningService().estimate(_payload(budget=value))
+
+
+@pytest.mark.parametrize("thresholds", [[1], "min_icir=0.4", 5], ids=["list", "text", "number"])
+def test_thresholds_that_are_not_an_object_are_refused_by_key(thresholds):
+    """A list has no ``.get``: reading one is an ``AttributeError``, which is a 500 with no key."""
+    with pytest.raises(ValueError, match="factorMining.thresholdsInvalid"):
+        FactorMiningService().estimate(_payload(thresholds=thresholds))
 
 
 def test_estimate_reports_candidate_count_within_budget():

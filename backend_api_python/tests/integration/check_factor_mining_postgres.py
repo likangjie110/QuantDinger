@@ -146,6 +146,27 @@ def main():
         assert repository.count_trials(run_id, user_id=1) == 2, "ledger count is not 2"
         ok("trial_ledger_counted")
 
+        # ``finish_run`` lifts the three counts out of ``summary`` and gives each its own column,
+        # and ``list_runs`` reads them back. Neither is covered anywhere else: the unit tests pin
+        # the SQL text and the parameter positions, so swapping two of the three counts there
+        # would pass every one of them and still persist the wrong numbers against a real ledger.
+        repository.finish_run(run_id, user_id=1, status="success", result={"summary": {
+            "trials": 2, "candidates": 1, "frozen": 1, "snapshotId": "d" * 64}})
+        closed = query("SELECT status, trials_count, candidates_count, frozen_count, snapshot_id "
+                       "FROM qd_factor_mining_runs WHERE id = %s", (run_id,))[0]
+        assert closed["status"] == "success", f"finish_run wrote status {closed['status']}"
+        assert closed["trials_count"] == 2, f"trials_count is {closed['trials_count']}"
+        assert closed["candidates_count"] == 1, f"candidates_count is {closed['candidates_count']}"
+        assert closed["frozen_count"] == 1, f"frozen_count is {closed['frozen_count']}"
+        assert closed["snapshot_id"] == "d" * 64, "the fingerprint was not backfilled"
+        runs = repository.list_runs(user_id=1)
+        assert runs and runs[0]["id"] == run_id, "the owner's run list does not carry the run"
+        assert runs[0]["trialsCount"] == 2, "list_runs and the table disagree about the ledger"
+        assert runs[0]["frozenCount"] == 1, "list_runs and the table disagree about the review"
+        assert "result" not in runs[0], "the run list dragged the stored payload along"
+        assert repository.list_runs(user_id=2) == [], "cross-tenant run list leaked"
+        ok("finish_run_writes_the_counts_and_list_runs_reads_them")
+
         # The migration runs again on every backend start, so re-applying it over live rows has to
         # be a no-op rather than a second create or a data loss.
         with admin.cursor() as cur:

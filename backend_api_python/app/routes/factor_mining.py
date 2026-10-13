@@ -98,6 +98,11 @@ def estimate_factor_mining():
         return jsonify({"code": 1, "msg": "common.success", "data": data})
     except ValueError as exc:
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    except Exception:
+        # The same envelope ``/run`` answers an unexpected failure with. Without this arm an
+        # unhandled exception leaves as a generic 500 with no key for the caller to read.
+        logger.exception("Factor mining estimate failed")
+        return jsonify({"code": 0, "msg": "factorMining.estimateFailed", "data": None}), 500
 
 
 @factor_mining_blp.route("/run", methods=["POST"])
