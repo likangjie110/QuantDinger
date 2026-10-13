@@ -238,6 +238,43 @@ def test_cancel_job_leaves_an_unknown_id_alone(monkeypatch):
     assert FactorMiningService().cancel_job("job-9", user_id=USER_ID) is None
 
 
+# ──────────────────────────── the candidate library ────────────────────────────
+
+class _CandidateRepository:
+    """The two reads the service forwards to; the run ledger is not needed for them."""
+
+    def __init__(self):
+        self.calls = []
+
+    def list_candidates(self, **kwargs):
+        self.calls.append(("list_candidates", kwargs))
+        return [{"id": 5, "status": "frozen"}]
+
+    def get_candidate(self, candidate_id, *, user_id):
+        self.calls.append(("get_candidate", {"candidate_id": candidate_id, "user_id": user_id}))
+        return {"id": candidate_id} if candidate_id == 5 else None
+
+
+def test_candidate_reads_forward_to_the_repository_untouched():
+    """Filtering, paging, and the not-found ``None`` are the repository's: forward, add nothing."""
+    repository = _CandidateRepository()
+    service = FactorMiningService(repository=repository)
+
+    items = service.list_candidates(user_id=USER_ID, run_id=RUN_ID, status="frozen", market="USStock")
+    candidate = service.get_candidate(5, user_id=USER_ID)
+    missing = service.get_candidate(999, user_id=USER_ID)
+
+    assert repository.calls == [
+        ("list_candidates", {"user_id": USER_ID, "run_id": RUN_ID, "status": "frozen",
+                             "market": "USStock", "limit": 50, "offset": 0}),
+        ("get_candidate", {"candidate_id": 5, "user_id": USER_ID}),
+        ("get_candidate", {"candidate_id": 999, "user_id": USER_ID}),
+    ]
+    assert items == [{"id": 5, "status": "frozen"}]
+    assert candidate == {"id": 5}
+    assert missing is None
+
+
 # ────────────────────────────────── validation ──────────────────────────────────
 
 def test_submit_requires_source_and_dates():

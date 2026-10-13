@@ -139,6 +139,35 @@ class FactorMiningService:
             return None
         return _public_job(agent_jobs.cancel_job(str(job_id), user_id=int(user_id)))
 
+    def list_candidates(
+        self,
+        *,
+        user_id: int,
+        run_id: int | None = None,
+        status: str = "",
+        market: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """The caller's candidate library, newest first: the repository's own filtered, paged read.
+
+        A forwarder on purpose. The filter set, the page window, and the choice to leave a list
+        row's metrics behind are the repository's decisions -- it documents each of them -- and a
+        second copy here would be a second place for the library view to drift.
+        """
+        return self._repository.list_candidates(
+            user_id=int(user_id),
+            run_id=run_id,
+            status=status,
+            market=market,
+            limit=limit,
+            offset=offset,
+        )
+
+    def get_candidate(self, candidate_id: int, *, user_id: int) -> dict[str, Any] | None:
+        """One candidate with its metrics and out-of-sample block; not the caller's reads as ``None``."""
+        return self._repository.get_candidate(candidate_id, user_id=int(user_id))
+
     def _run_mining_job(self, payload: Mapping[str, Any], on_progress: Callable | None = None) -> dict[str, Any]:
         """Run one submitted job: open the run, search, ledger it, review it, close it.
 
