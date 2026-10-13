@@ -38,7 +38,7 @@ from app.services.factor_mining.gates import GateThresholds
 from app.services.factor_mining.templates import DEFAULT_BUDGET, MAX_BUDGET
 from app.services.strategy_v2.contract import StrategyV2ContractError, compile_strategy_v2
 from app.services.strategy_v2.models import StrategyManifest
-from app.services.strategy_v2.service import StrategyV2BacktestService
+from app.services.strategy_v2.service import StrategyV2BacktestService, _enforce_backtest_range
 from app.services.strategy_v2.snapshot import canonical_frame_bytes
 
 
@@ -84,10 +84,9 @@ class MiningConfig:
         hard cap and a freeze ratio that would leave no usable search window are rejected by
         key rather than clamped, because silently searching a different run is worse.
         """
-        budget = int(payload.get("budget") or DEFAULT_BUDGET)
+        budget = _payload_int(payload, "budget", DEFAULT_BUDGET)
         if budget > MAX_BUDGET:
             raise ValueError("factorMining.budgetExceeded")
-        seed = payload.get("seed")
         return cls(
             market=str(payload.get("market") or ""),
             timeframe=normalize_chart_timeframe(str(payload.get("timeframe") or "1D")),
@@ -95,14 +94,14 @@ class MiningConfig:
             end_date=_payload_datetime(payload.get("endDate")).replace(
                 hour=23, minute=59, second=59,
             ),
-            source_id=int(payload.get("sourceId") or 0),
+            source_id=_payload_int(payload, "sourceId", 0),
             source_name=str(payload.get("sourceName") or ""),
             freeze_ratio=_freeze_ratio(payload.get("freezeRatio")),
             budget=budget,
-            seed=DEFAULT_SEED if seed is None else int(seed),
+            seed=_payload_int(payload, "seed", DEFAULT_SEED),
             template_ids=tuple(str(item) for item in payload.get("templateIds") or ()),
-            groups=int(payload.get("groups") or 5),
-            holding_period=int(payload.get("holdingPeriod") or 5),
+            groups=_payload_int(payload, "groups", 5),
+            holding_period=_payload_int(payload, "holdingPeriod", 5),
             commission=parse_rate(payload.get("commission"), default=default_commission),
             slippage=parse_rate(payload.get("slippage"), default=default_slippage),
             neutralize_industry=bool(payload.get("neutralizeIndustry", False)),
@@ -179,22 +178,48 @@ class MiningDataProvider:
         )
         if len(candidates) < MINIMUM_SYMBOLS:
             raise ValueError("factorMining.universeTooSmall")
+        fetch_start = _warmup_start(config.timeframe, split.search_start)
+        # The same range check the factor-research entry runs before fetching, against the
+        # window this call actually loads: the freeze tail is task 8's separate request.
+        _enforce_backtest_range(
+            candidates=candidates,
+            timeframe=config.timeframe,
+            start_date=split.search_start,
+            end_date=split.search_end,
+            warmup_bars=MAX_LOOKBACK,
+            fetch_start=fetch_start,
+        )
         frames, skipped = self._backtest_service.fetch_frames(
             candidates,
             config.timeframe,
-            _warmup_start(config.timeframe, split.search_start),
+            fetch_start,
             split.search_end,
         )
         if not frames:
             raise ValueError("factorMining.noMarketData")
+        # Fetching drops members non-deterministically, and a cross-section of one or two
+        # symbols cannot be grouped, ranked or correlated -- so a degraded panel fails here
+        # instead of producing trials that dilute the selection-bias correction.
+        if len(frames) < MINIMUM_SYMBOLS:
+            raise ValueError("factorMining.usableUniverseTooSmall")
         return PreparedPanel(
             frames=frames,
             members=list(candidates),
             fields=_field_panels(frames),
             snapshot_id=_data_digest(frames),
             frequency=config.timeframe,
-            warnings=[_skipped_warning(item) for item in skipped],
+            warnings=sorted(_skipped_warning(item) for item in skipped),
         )
+
+
+def _payload_int(payload: Mapping[str, Any], key: str, default: int) -> int:
+    """Read an integer payload field; only an absent key falls back to the default.
+
+    ``payload.get(key) or default`` would read an explicit 0 as absent, and a budget of 0 would
+    then never reach the validator that owns the ``factorMining.budgetInvalid`` key.
+    """
+    value = payload.get(key)
+    return default if value is None else int(value)
 
 
 def _payload_datetime(value: Any) -> datetime:

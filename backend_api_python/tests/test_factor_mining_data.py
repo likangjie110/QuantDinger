@@ -11,20 +11,25 @@ import re
 import pandas as pd
 import pytest
 
+from app.services.backtest_limits import BacktestRangeLimitError
 from app.services.factor_mining.engine import MiningConfig, MiningDataProvider, split_periods
 from app.services.factor_mining.templates import MAX_BUDGET
 
 
 # Minimal compilable portfolio source: the manifest needs initialize/universe/subscription
 # and more than one instrument to be a portfolio strategy.
-_SOURCE = '''
+def _source(*instruments):
+    return f'''
 def initialize(context):
-    context.set_universe(["USStock:AAPL", "USStock:MSFT", "USStock:NVDA"])
+    context.set_universe([{", ".join(f'"{item}"' for item in instruments)}])
     context.subscribe(frequency="1d")
 
 def handle_data(context, data):
     pass
 '''
+
+
+_SOURCE = _source("USStock:AAPL", "USStock:MSFT", "USStock:NVDA", "USStock:TSLA")
 
 
 class _FakeBacktestService:
@@ -136,9 +141,32 @@ def test_prepare_panel_rejects_a_source_without_market_data():
 
 
 def test_prepare_panel_rejects_a_single_instrument_source():
-    single = _SOURCE.replace('"USStock:AAPL", "USStock:MSFT", "USStock:NVDA"', '"USStock:AAPL"')
     with pytest.raises(ValueError, match="strategyV2.factorResearchPortfolioOnly"):
-        _provider(_FakeBacktestService()).prepare(user_id=1, code=single, config=_config())
+        _provider(_FakeBacktestService()).prepare(
+            user_id=1, code=_source("USStock:AAPL"), config=_config())
+
+
+def test_prepare_panel_rejects_a_usable_universe_smaller_than_three():
+    class _DegradedService(_FakeBacktestService):
+        def fetch_frames(self, candidates, frequency, start_date, end_date):
+            frames, _ = super().fetch_frames(candidates, frequency, start_date, end_date)
+            frames.pop("USStock:NVDA")
+            return frames, [{"symbol": "USStock:NVDA", "reason": "strategyV2.noMarketData"}]
+
+    with pytest.raises(ValueError, match="factorMining.usableUniverseTooSmall"):
+        _provider(_DegradedService()).prepare(user_id=1, code=_SOURCE, config=_config())
+
+
+def test_prepare_panel_rejects_a_window_beyond_the_market_data_policy():
+    class _AShareService(_FakeBacktestService):
+        def resolve_candidates(self, *, user_id, manifest, start_date, end_date):
+            return ([{"market": "AStock", "symbol": symbol, "effectiveFrom": None}
+                     for symbol in ("600000.SH", "600519.SH", "000001.SZ")], None)
+
+    service = _AShareService()
+    with pytest.raises(BacktestRangeLimitError):
+        _provider(service).prepare(user_id=1, code=_SOURCE, config=_config())
+    assert service.fetch_calls == []
 
 
 def test_prepare_panel_looks_back_warmup_bars_but_stops_at_the_search_end():
@@ -162,6 +190,7 @@ def test_prepare_panel_keeps_panels_aligned_and_fills_missing_fields():
                 "USStock:MSFT": pd.DataFrame(
                     {name: value for name, value in full.items() if name != "volume"},
                     index=index[1:]),
+                "USStock:NVDA": pd.DataFrame(full, index=index),
             }, [])
 
     panel = _provider(_RaggedService()).prepare(user_id=1, code=_SOURCE, config=_config())
@@ -170,13 +199,19 @@ def test_prepare_panel_keeps_panels_aligned_and_fills_missing_fields():
         assert values.index.equals(close.index), field
         assert list(values.columns) == list(close.columns), field
     assert close.index.is_monotonic_increasing
-    assert list(close.columns) == ["USStock:AAPL", "USStock:MSFT"]
+    assert list(close.columns) == ["USStock:AAPL", "USStock:MSFT", "USStock:NVDA"]
     assert panel.fields["volume"]["USStock:MSFT"].isna().all()
     assert close["USStock:MSFT"].isna().iloc[0]
 
 
 def test_prepare_panel_records_skipped_symbols_as_warnings():
     class _SkippingService(_FakeBacktestService):
+        def resolve_candidates(self, *, user_id, manifest, start_date, end_date):
+            members, universe_id = super().resolve_candidates(
+                user_id=user_id, manifest=manifest, start_date=start_date, end_date=end_date)
+            return ([*members, {"market": "USStock", "symbol": "TSLA", "effectiveFrom": None}],
+                    universe_id)
+
         def fetch_frames(self, candidates, frequency, start_date, end_date):
             frames, _ = super().fetch_frames(candidates, frequency, start_date, end_date)
             frames.pop("USStock:NVDA")
@@ -187,17 +222,42 @@ def test_prepare_panel_records_skipped_symbols_as_warnings():
     assert "USStock:NVDA" not in panel.frames
 
 
+def test_warnings_follow_a_stable_order_for_reproducible_run_records():
+    class _TwoSkippedService(_FakeBacktestService):
+        def resolve_candidates(self, *, user_id, manifest, start_date, end_date):
+            return ([{"market": "USStock", "symbol": symbol, "effectiveFrom": None}
+                     for symbol in ("AAPL", "MSFT", "NVDA", "TSLA", "AMZN")], None)
+
+        def fetch_frames(self, candidates, frequency, start_date, end_date):
+            frames, _ = super().fetch_frames(candidates, frequency, start_date, end_date)
+            frames.pop("USStock:TSLA")
+            frames.pop("USStock:AMZN")
+            return frames, [
+                {"symbol": "USStock:TSLA", "reason": "strategyV2.noMarketData"},
+                {"symbol": "USStock:AMZN", "reason": "strategyV2.noMarketData"},
+            ]
+
+    panel = _provider(_TwoSkippedService()).prepare(user_id=1, code=_SOURCE, config=_config())
+    assert panel.warnings == ["USStock:AMZN: strategyV2.noMarketData",
+                              "USStock:TSLA: strategyV2.noMarketData"]
+
+
 @pytest.mark.parametrize("ratio", [0.0, 0.5, -0.1])
 def test_split_periods_rejects_freeze_ratio_outside_the_open_interval(ratio):
     with pytest.raises(ValueError, match="factorMining.freezeRatioInvalid"):
         split_periods(_config(freeze_ratio=ratio))
 
 
+def _payload(**overrides):
+    base = {"market": "USStock", "timeframe": "1d", "startDate": "2024-01-01",
+            "endDate": "2024-12-31", "sourceId": 7}
+    base.update(overrides)
+    return base
+
+
 def test_from_payload_normalizes_timeframe_and_resolves_rates():
     config = MiningConfig.from_payload(
-        {"market": "USStock", "timeframe": "1d", "startDate": "2024-01-01",
-         "endDate": "2024-12-31", "sourceId": 7, "freezeRatio": 0.25,
-         "commission": "0.0008"},
+        _payload(freezeRatio=0.25, commission="0.0008"),
         default_commission=0.0005, default_slippage=0.0005,
     )
     assert config.timeframe == "1D"
@@ -208,7 +268,14 @@ def test_from_payload_normalizes_timeframe_and_resolves_rates():
     assert config.slippage == 0.0005
     with pytest.raises(ValueError, match="factorMining.budgetExceeded"):
         MiningConfig.from_payload(
-            {"market": "USStock", "timeframe": "1d", "startDate": "2024-01-01",
-             "endDate": "2024-12-31", "sourceId": 7, "budget": MAX_BUDGET + 1},
+            _payload(budget=MAX_BUDGET + 1),
             default_commission=0.0005, default_slippage=0.0005,
         )
+
+
+@pytest.mark.parametrize("budget", [0, -5])
+def test_from_payload_keeps_a_budget_the_validator_must_see(budget):
+    config = MiningConfig.from_payload(
+        _payload(budget=budget), default_commission=0.0005, default_slippage=0.0005,
+    )
+    assert config.budget == budget
