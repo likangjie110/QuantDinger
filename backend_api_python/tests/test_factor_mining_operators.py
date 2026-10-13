@@ -34,10 +34,13 @@ def test_lag_shifts_forward_only():
 
 def test_safe_div_returns_nan_on_zero_and_nan_denominator():
     numerator = _panel([[1.0, 1.0], [1.0, 1.0]])
-    denominator = _panel([[0.0, 2.0], [np.nan, np.nan]])
+    denominator = _panel([[0.0, 2.0], [np.nan, 4.0]])
     result = apply_operator("safe_div", [numerator, denominator], {})
-    assert np.isnan(result.iloc[0, 0]) and np.isnan(result.iloc[1, 0]) and np.isnan(result.iloc[1, 1])
+    assert np.isnan(result.iloc[0, 0]) and np.isnan(result.iloc[1, 0])
+    # Row 1 mixes a NaN denominator with a valid one: the guard is per element,
+    # not per row or per column.
     assert result.iloc[0, 1] == 0.5
+    assert result.iloc[1, 1] == 0.25
 
 
 def test_cs_rank_is_cross_sectional_per_row():
