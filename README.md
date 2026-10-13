@@ -582,6 +582,7 @@ QuantDinger/
 |   |   |   |-- backtest_engine/       Backtest execution components
 |   |   |   |-- factors/               Point-in-time factor research and diagnostics
 |   |   |   |-- strategy_evolution/    Parameter search, walk-forward validation, and robustness tests
+|   |   |   |-- factor_mining/         Expression DSL, template expansion, graded screening, and the candidate library
 |   |   |   |-- pending_orders/        Queued order submission, recovery, and reconciliation
 |   |   |   |-- live_trading/          Normalized crypto exchange adapters
 |   |   |   |-- alpaca_trading/        Alpaca broker integration

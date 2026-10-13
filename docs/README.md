@@ -86,6 +86,8 @@ ownership or shared state.
 - [AI Research guide](product/AI_RESEARCH.md)
 - [From strategy idea to operation](product/STRATEGY_WORKFLOW.md)
 - [Backtest Center guide](product/BACKTEST_CENTER.md)
+- [Automatic factor mining](product/FACTOR_MINING.md)
+- [全自动因子挖掘](product/FACTOR_MINING_CN.md)
 - [Live-trading safety guide](trading/LIVE_TRADING_SAFETY.md)
 - [Security, versions, and vulnerability reporting](security/README.md)
 

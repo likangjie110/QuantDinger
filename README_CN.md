@@ -534,6 +534,7 @@ QuantDinger/
 |   |   |   |-- backtest_engine/       回测执行组件
 |   |   |   |-- factors/               时点化因子研究与诊断
 |   |   |   |-- strategy_evolution/    参数搜索、滚动验证与稳健性检验
+|   |   |   |-- factor_mining/         表达式 DSL、模板展开、分级筛选与候选库
 |   |   |   |-- pending_orders/        排队订单提交、恢复与对账
 |   |   |   |-- live_trading/          统一规范的加密交易所适配器
 |   |   |   |-- alpaca_trading/        Alpaca 券商集成
