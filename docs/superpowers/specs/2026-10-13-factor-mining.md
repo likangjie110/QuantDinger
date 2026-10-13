@@ -83,7 +83,7 @@ backend_api_python/migrations/20261013_factor_mining.sql
 {"op": "ts_mean", "args": ["close"], "params": {"n": 20}}
 ```
 
-- 叶子：字符串字段名（必须在字段白名单内）。
+- 叶子：字符串字段名（必须在字段白名单内）。数值字面量不作为叶子，需要常量时写零元算子 `const`（见 6.3）。
 - 内部节点：`op` 必须在算子白名单内；`args` 为子节点（或字段名）列表；`params` 为标量参数。
 - 规范化：键序固定（`op` → `args` → `params`）、`params` 键排序、数字统一 `repr`；指纹 = `sha256(canonical_json)`。
 - 新增算子不改 schema，只加白名单条目并递增 `DSL_VERSION`。
@@ -119,6 +119,8 @@ backend_api_python/migrations/20261013_factor_mining.sql
 | `cs_zscore(x)` | 行内 `(x - mean) / std(ddof=0)`；`std = 0` → 0（对齐 `factors/research.py:winsorize_zscore`） |
 | `cs_demean(x)` | `x - 行均值` |
 
+**常量**：`const`（arity 0，无窗口，参数 `value` 为有限数）—— 表达式内的数值字面量一律写成 `const` 节点（如 `where(cond, x, const(0))`）；裸数字仍是非法节点。
+
 **算术与安全**：`add / sub / mul / div`（二元）、`neg / abs / sign / log / sqrt`（一元）、`safe_div(x, y)`（分母为 0 或 NaN → NaN）、`log`（`x <= 0` → NaN）、`sqrt`（`x < 0` → NaN）、`clip(x, lo, hi)`、`gt / lt / ge / le`（返回布尔面板）、`where(cond, a, b)`。
 
 **未来数据防护**：算子集合内**不存在负向位移**；`lag` 强制 `n >= 1`；任何算子窗口参数不接受 0 或负数。
@@ -129,7 +131,7 @@ backend_api_python/migrations/20261013_factor_mining.sql
 | --- | --- | --- |
 | `MAX_DEPTH` | 6 | 表达式树深度（根为 1） |
 | `MAX_NODES` | 24 | 节点总数 |
-| `WINDOW_MIN` / `WINDOW_MAX` | 2 / 252 | 单算子窗口 |
+| `WINDOW_MIN` / `WINDOW_MAX` | 1 / 252 | 单算子窗口。下界为 1：1 根 bar 的收益/位移是标准写法（低波、风险调整动量模板依赖 `ts_pct_change(close, 1)`）；退化的窗口（`ts_std`/`ts_zscore`/`ts_corr` 在 `n = 1`）产出 NaN 而非错误值，由 L2 的覆盖率门槛拦截。`0` 与负数一律拒绝，前视防护不受影响 |
 | `MAX_LOOKBACK` | 504 | 任一叶子到根路径上的窗口之和 |
 | `DSL_VERSION` | 1 | 语义版本，随语义变更递增并计入候选指纹 |
 
