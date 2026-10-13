@@ -51,9 +51,12 @@ class FactorResearchEngine:
         there. Every other branch is unchanged."""
         requested_groups = max(2, min(10, int(groups or 5)))
         holding_period = max(1, int(holding_period or 5))
-        # A caller that injects its own panel studies that panel, not a built-in -- and must not
-        # borrow a built-in's name, or the correlation study would de-duplicate the candidate
-        # away against the built-in it is named after and compare one factor fewer.
+        # A caller that injects its own panel studies that panel, not a built-in. The name it
+        # studies under must never equal a built-in's: the correlation study de-duplicates its
+        # name list, so a candidate named after a built-in would merge with that built-in's row
+        # and drop it from the comparison entirely. Hence the neutral "expression" and not the
+        # caller's own name -- passing an empty string straight through would land on
+        # ``momentum_20`` below and silently shrink the pool by exactly that factor.
         default_name = "expression" if factor_panel is not None else "momentum_20"
         factor_name = str(factor_id or default_name).strip().lower()
         start = self._timestamp(start_date)
