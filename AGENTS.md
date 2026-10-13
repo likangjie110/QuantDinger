@@ -36,6 +36,7 @@ Read only the documentation relevant to the change:
 - Preserve unrelated working-tree changes.
 - Use English for source-code comments. Keep user-facing application copy in the existing localization system rather than hardcoding it in source files.
 - Keep machine-readable contracts and identifiers in English. When a human guide has English and `_CN` editions, update both when the change affects both audiences.
+- Write every commit message in Chinese, keeping the Conventional Commits type token in English (for example `fix: 修复…`), so changelog tooling and history scans keep working.
 
 ## Verification
 
