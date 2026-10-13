@@ -73,6 +73,8 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | 比较 | 4 | `gt` `lt` `ge` `le` |
 | 其它 | 2 | `where`（三元） `clip`（参数 `lo` / `hi`） |
 
+逐算子的 arity 在这里写明，因为 DSL 编辑器需要它：时序算子全部只取一个参数，**唯独 `ts_corr` 是二元的**；截面算子全部只取一个；一元算术取一个，二元算术与比较取两个；`const` 取零个，`clip` 取一个，`where` 取三个。
+
 ### 3.3 约束常量
 
 | 常量 | 值 | 含义 |
@@ -86,7 +88,7 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 ### 3.4 前视防护
 
 - **没有负向位移**：`lag` / `delta` 的窗口参数 `n` 受 `WINDOW_MIN=1` 约束，不存在 `n ≤ 0` 的写法，因此无法把未来 bar 搬到现在。
-- **窗口只向过去看**：所有时序算子的滚动窗口都要求 `min_periods = n`，即窗口填满 `n` 个 bar 才出值，不满则缺失（NaN）。
+- **窗口只向过去看**：rolling 族算子与 `ts_corr` 要求 `min_periods = n`，即窗口填满 `n` 个 bar 才出值，不满则缺失（NaN）；`lag`、`delta`、`ts_pct_change` 则由 `shift` / `pct_change` 天然产生同样的前 `n` 根缺失，它们根本没有 `min_periods` 这个概念。
 - **缺失保持缺失**：NaN 输入传播；未定义结果（除零、零离散度、`log` 非正值）一律为 NaN，不产生 `inf`。
 - **点在不变成**：改写后面的 bar 不会改变前面 bar 的输出。
 
@@ -120,16 +122,16 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | 层级 | 检查内容 | 默认门槛 | 不通过时的原因键 |
 | --- | --- | --- | --- |
 | **L1 合法性** | DSL 形状、字段、算子、参数范围；以及求值本身（除零、溢出、标量传给面板算子等） | — | `factorMining.reject.invalid` |
-| **L2 快速筛选** | 覆盖率 → IC 观测数 → 信号强度（`\|rankIC\|`） | coverage ≥ 0.60；观测数 ≥ 30；`\|rankIC\|` ≥ 0.02 | `.lowCoverage` / `.insufficientObservations` / `.weakIc` |
-| **L3 稳定性** | ICIR → 分折符号一致性 → 前后半段同号 → 平均换手 | ICIR ≥ 0.30；分折一致 ≥ 0.60；前后半 IC 同号；换手 ≤ 0.70 | `.weakIcir` / `.unstableFolds` / `.unstableHalves` / `.highTurnover` |
-| **L4 与内置因子去重** | 与每个已打分内置因子的相关度（取绝对值） | < 0.85 | `.duplicateBuiltin` / `.unverifiableRedundancy` |
-| **L5 冻结段样本外** | 样本内外 `rankIC` 同号且强度；通缩夏普（DSR）概率 | `\|OOS rankIC\|` ≥ 0.01 且与 IS 同号；DSR 概率 ≥ 0.95 | `.weakOutOfSample` / `.selectionBias` |
+| **L2 快速筛选** | 覆盖率 → IC 观测数 → 信号强度（`\|rankIC\|`） | coverage ≥ 0.60；观测数 ≥ 30；`\|rankIC\|` ≥ 0.02 | `factorMining.reject.lowCoverage` / `factorMining.reject.insufficientObservations` / `factorMining.reject.weakIc` |
+| **L3 稳定性** | ICIR → 分折符号一致性 → 前后半段同号 → 平均换手 | ICIR ≥ 0.30；分折一致 ≥ 0.60；前后半 IC 同号；换手 ≤ 0.70 | `factorMining.reject.weakIcir` / `factorMining.reject.unstableFolds` / `factorMining.reject.unstableHalves` / `factorMining.reject.highTurnover` |
+| **L4 与内置因子去重** | 与每个已打分内置因子的相关度（取绝对值） | < 0.85 | `factorMining.reject.duplicateBuiltin` / `factorMining.reject.unverifiableRedundancy` |
+| **L5 冻结段样本外** | 样本内外 `rankIC` 同号且强度；通缩夏普（DSR）概率 | `\|OOS rankIC\|` ≥ 0.01 且与 IS 同号；DSR 概率 ≥ 0.95 | `factorMining.reject.weakOutOfSample` / `factorMining.reject.selectionBias` |
 
 **几个容易踩的点：**
 
-- **L4 的非有限相关度被忽略**：只有有限值才算证据。NaN 表示「引擎没能测到」——价量运行下基本面因子本来就没有可比数据——跳过它**不等于**放行。因此当**过滤后一个有限值都没有**时，L4 无法执行，直接以 `.unverifiableRedundancy` 淘汰，而不是让候选白过唯一的冗余关卡。
-- **不可测的换手不算低换手**：`.highTurnover` 的判定写成 `not (turnover <= max_turnover)`，NaN 与 `inf` 都会失败（fail-closed）。
-- **分折一致性缺省即跳过**：`foldIcSigns` 由搜索引擎写入（把 IC 序列等分成最多 4 折，取每折均值符号）。序列缺失表示「没评估过」，该检查跳过。
+- **L4 的非有限相关度被忽略**：只有有限值才算证据。NaN 表示「引擎没能测到」——价量运行下基本面因子本来就没有可比数据——跳过它**不等于**放行。因此当**过滤后一个有限值都没有**时，L4 无法执行，直接以 `factorMining.reject.unverifiableRedundancy` 淘汰，而不是让候选白过唯一的冗余关卡。
+- **不可测的换手不算低换手**：`factorMining.reject.highTurnover` 的判定写成 `not (turnover <= max_turnover)`，NaN 与 `inf` 都会失败（fail-closed）。
+- **分折一致性缺省即跳过**：`foldIcSigns` 由搜索引擎写入（把 IC 序列等分成最多 4 折，取每折均值符号）。序列缺失、或折数不足两项时，都表示「没评估过」，该检查跳过。
 - **L5 的 `trials` 用全部试验数**：DSR 的分母是**本次运行评估过的全部候选数（含被淘汰的）**，不是幸存者数。用幸存者数会给搜索本身定价过低，正好低估了它要修正的选择偏差。
 - **门槛可覆盖**：`POST /run` 的 payload 可以带 `thresholds` 对象，键名是 `GateThresholds` 的字段名（snake_case）：`min_coverage`、`min_ic_observations`、`min_abs_rank_ic`、`min_icir`、`min_fold_consistency`、`max_turnover`、`max_builtin_correlation`、`min_oos_abs_rank_ic`、`min_deflated_sharpe_probability`。未识别或为 `null` 的键保留默认值。
 

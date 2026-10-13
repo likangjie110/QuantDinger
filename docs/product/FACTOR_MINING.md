@@ -88,6 +88,11 @@ Five price-volume fields only: `open`, `high`, `low`, `close`, `volume`.
 | Comparison | 4 | `gt` `lt` `ge` `le` |
 | Other | 2 | `where` (three-arity), `clip` (parameters `lo` / `hi`) |
 
+Operator arity, spelled out because a DSL editor needs it: every time-series operator takes one
+argument **except the binary `ts_corr`**; every cross-sectional operator takes one; the unary
+arithmetic operators take one, the binary arithmetic and comparison operators take two; `const`
+takes none, `clip` takes one, and `where` takes three.
+
 ### 3.3 Constraint constants
 
 | Constant | Value | Meaning |
@@ -103,8 +108,10 @@ Five price-volume fields only: `open`, `high`, `low`, `close`, `volume`.
 - **No negative shift.** The window parameter `n` of `lag` / `delta` is bounded by
   `WINDOW_MIN=1`, so there is no `n <= 0` spelling and no way to move a future bar into the
   present.
-- **Windows only look backwards.** Every time-series operator requires `min_periods = n`, so a
-  window reports only once it is full and is missing (NaN) before that.
+- **Windows only look backwards.** The rolling-family operators and `ts_corr` use
+  `min_periods = n`, so a window reports only once it is full and is missing (NaN) before that;
+  `lag`, `delta`, and `ts_pct_change` get the same leading-`n` gap from `shift` / `pct_change`
+  instead, which have no `min_periods` notion at all.
 - **Missing stays missing.** NaN inputs propagate, and undefined results (division by zero, zero
   dispersion, `log` of a non-positive value) are NaN rather than `inf`.
 - **Point-in-time.** Rewriting a later bar can never change an earlier bar's output.
@@ -150,23 +157,24 @@ further is checked.
 | Stage | What it checks | Default bar | Reject key on failure |
 | --- | --- | --- | --- |
 | **L1 legality** | DSL shape, fields, operators, parameter ranges -- and the evaluation itself (division by zero, overflow, a scalar handed to a panel operator) | -- | `factorMining.reject.invalid` |
-| **L2 quick screen** | Coverage, then IC observation count, then signal strength (`\|rankIC\|`) | coverage >= 0.60; observations >= 30; `\|rankIC\|` >= 0.02 | `.lowCoverage` / `.insufficientObservations` / `.weakIc` |
-| **L3 stability** | ICIR, fold sign agreement, first/second half agreement, average turnover | ICIR >= 0.30; fold agreement >= 0.60; halves agree in sign; turnover <= 0.70 | `.weakIcir` / `.unstableFolds` / `.unstableHalves` / `.highTurnover` |
-| **L4 built-in redundancy** | Absolute correlation against every built-in factor that was scored | < 0.85 | `.duplicateBuiltin` / `.unverifiableRedundancy` |
-| **L5 frozen out-of-sample** | In-sample and out-of-sample `rankIC` agree and clear the strength bar; deflated-Sharpe probability | `\|OOS rankIC\|` >= 0.01 and same sign as IS; DSR probability >= 0.95 | `.weakOutOfSample` / `.selectionBias` |
+| **L2 quick screen** | Coverage, then IC observation count, then signal strength (`\|rankIC\|`) | coverage >= 0.60; observations >= 30; `\|rankIC\|` >= 0.02 | `factorMining.reject.lowCoverage` / `factorMining.reject.insufficientObservations` / `factorMining.reject.weakIc` |
+| **L3 stability** | ICIR, fold sign agreement, first/second half agreement, average turnover | ICIR >= 0.30; fold agreement >= 0.60; halves agree in sign; turnover <= 0.70 | `factorMining.reject.weakIcir` / `factorMining.reject.unstableFolds` / `factorMining.reject.unstableHalves` / `factorMining.reject.highTurnover` |
+| **L4 built-in redundancy** | Absolute correlation against every built-in factor that was scored | < 0.85 | `factorMining.reject.duplicateBuiltin` / `factorMining.reject.unverifiableRedundancy` |
+| **L5 frozen out-of-sample** | In-sample and out-of-sample `rankIC` agree and clear the strength bar; deflated-Sharpe probability | `\|OOS rankIC\|` >= 0.01 and same sign as IS; DSR probability >= 0.95 | `factorMining.reject.weakOutOfSample` / `factorMining.reject.selectionBias` |
 
 **Details that are easy to get wrong:**
 
 - **L4 ignores non-finite correlations.** Only finite values count as evidence. A NaN means "the
   engine could not measure it" -- fundamental factors carry no data on a price-volume run --
   and skipping one is **not** a clearance. So when **nothing finite survives the filter**, L4
-  cannot run at all and rejects with `.unverifiableRedundancy` rather than waving the candidate
-  past the ladder's only redundancy checkpoint.
-- **An unmeasurable turnover is not a low one.** The `.highTurnover` test is written as
-  `not (turnover <= max_turnover)`, so both NaN and `inf` fail it (fail-closed).
+  cannot run at all and rejects with `factorMining.reject.unverifiableRedundancy` rather than
+  waving the candidate past the ladder's only redundancy checkpoint.
+- **An unmeasurable turnover is not a low one.** The `factorMining.reject.highTurnover` test is
+  written as `not (turnover <= max_turnover)`, so both NaN and `inf` fail it (fail-closed).
 - **Absent fold consistency is skipped.** `foldIcSigns` is written by the search engine (the IC
   series split into at most 4 equal folds, each fold contributing the sign of its mean). A missing
-  series means "not evaluated", so that check is skipped.
+  series -- or one that yielded fewer than two folds -- means "not evaluated", so that check is
+  skipped.
 - **L5's `trials` is the whole ledger.** The deflated-Sharpe denominator is **every candidate the
   run evaluated, rejections included**, not the survivor count. Using survivors would underprice
   the search itself and understate exactly the selection bias the correction exists for.
