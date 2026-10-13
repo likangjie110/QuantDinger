@@ -7,6 +7,7 @@ import pytest
 from app.services.factor_mining.gates import (GateThresholds, GateVerdict, net_return_series,
                                               screen_metrics, screen_out_of_sample,
                                               screen_redundancy, screen_stability)
+from app.services.strategy_evolution.statistics import deflated_sharpe, sample_sharpe
 
 
 def _metrics(**overrides):
@@ -98,6 +99,20 @@ def test_screen_metrics_reads_missing_metrics_as_unmet():
         "factorMining.reject.insufficientObservations")
 
 
+def test_gates_neutralize_nan_and_keep_infinities():
+    # NaN compares False against every bar, so left alone it would walk a poisoned candidate
+    # through the whole ladder. An infinity is a real reading, and it fails the gate it faces.
+    assert screen_metrics(_metrics(coverage=float("nan")), GateThresholds()).reason == (
+        "factorMining.reject.lowCoverage")
+    assert screen_metrics(_metrics(rankIc=float("nan")), GateThresholds()).reason == "factorMining.reject.weakIc"
+    assert screen_stability(_metrics(icir=float("nan")), GateThresholds()).reason == "factorMining.reject.weakIcir"
+    assert screen_stability(_metrics(averageTurnover=float("inf")), GateThresholds()).reason == (
+        "factorMining.reject.highTurnover")
+    # A NaN turnover is no evidence either, and no evidence passes a friction gate -- the same
+    # direction an absent turnover takes.
+    assert screen_stability(_metrics(averageTurnover=float("nan")), GateThresholds()).passed is True
+
+
 def test_screen_stability_thresholds_are_inclusive():
     assert screen_stability(_metrics(icir=0.30), GateThresholds()).passed is True
     assert screen_stability(_metrics(icir=0.2999), GateThresholds()).reason == "factorMining.reject.weakIcir"
@@ -114,6 +129,7 @@ def test_screen_stability_does_not_absolutize_icir():
 
 def test_screen_stability_rejects_inconsistent_folds():
     assert screen_stability(_metrics(foldIcSigns=[1, 1, 1, -1]), GateThresholds()).passed is True
+    assert screen_stability(_metrics(foldIcSigns=[1, 1, 1, -1, -1]), GateThresholds()).passed is True
     assert screen_stability(_metrics(foldIcSigns=[1, 1, -1, -1]), GateThresholds()).reason == (
         "factorMining.reject.unstableFolds")
 
@@ -131,7 +147,20 @@ def test_screen_redundancy_threshold_is_inclusive_and_two_sided():
     assert screen_redundancy({"momentum_20": 0.8499}, GateThresholds()).passed is True
     assert screen_redundancy({"momentum_20": -0.92}, GateThresholds()).reason == "factorMining.reject.duplicateBuiltin"
     assert screen_redundancy({"momentum_20": 0.3, "reversal_5": -0.84}, GateThresholds()).passed is True
-    assert screen_redundancy({}, GateThresholds()).passed is True
+    assert screen_redundancy({}, GateThresholds()).reason == "factorMining.reject.unverifiableRedundancy"
+
+
+def test_screen_redundancy_ignores_pairs_that_were_never_measured():
+    # The fundamental factors carry no data on a price-volume run, so those pairs come back NaN
+    # and are skipped -- but the pairs that were computed still decide the gate.
+    assert screen_redundancy({"momentum_20": 0.3, "value": float("nan")}, GateThresholds()).passed is True
+    assert screen_redundancy({"momentum_20": 0.92, "value": float("nan")}, GateThresholds()).reason == (
+        "factorMining.reject.duplicateBuiltin")
+    assert screen_redundancy({"value": float("nan"), "quality": None}, GateThresholds()).reason == (
+        "factorMining.reject.unverifiableRedundancy")
+    # An infinite correlation is not a finite measurement either, so it is no evidence.
+    assert screen_redundancy({"momentum_20": float("inf")}, GateThresholds()).reason == (
+        "factorMining.reject.unverifiableRedundancy")
 
 
 def test_screen_out_of_sample_rejects_thin_out_of_sample_ic():
@@ -139,6 +168,34 @@ def test_screen_out_of_sample_rejects_thin_out_of_sample_ic():
     verdict = screen_out_of_sample(is_metrics=_metrics(rankIc=0.05), oos_metrics=_metrics(rankIc=0.008),
                                    returns=[0.007, -0.003] * 20, trials=1, thresholds=GateThresholds())
     assert verdict.reason == "factorMining.reject.weakOutOfSample"
+
+
+def test_screen_out_of_sample_hinges_on_the_exact_strength_bar():
+    # An |out-of-sample rank IC| equal to the bar is met, not missed; a notch below is rejected.
+    returns = [0.007, -0.003] * 20
+    met = screen_out_of_sample(is_metrics=_metrics(rankIc=0.05), oos_metrics=_metrics(rankIc=0.01),
+                               returns=returns, trials=1, thresholds=GateThresholds())
+    missed = screen_out_of_sample(is_metrics=_metrics(rankIc=0.05), oos_metrics=_metrics(rankIc=0.009999),
+                                  returns=returns, trials=1, thresholds=GateThresholds())
+    assert met.passed is True
+    assert missed.reason == "factorMining.reject.weakOutOfSample"
+
+
+def test_screen_out_of_sample_compares_the_probability_inclusively():
+    # The selection-bias bar is met at equality. It is read from the review itself so the check
+    # stays pinned on the comparison rather than on the formula, and one notch above it rejects.
+    returns = [0.007, -0.003] * 20
+    observed = sample_sharpe(returns)
+    for trials in (1, 250):
+        probability = deflated_sharpe(returns, observed_sharpe=observed, trials=trials)["probability"]
+        met = screen_out_of_sample(is_metrics=_metrics(rankIc=0.05), oos_metrics=_metrics(rankIc=0.04),
+                                   returns=returns, trials=trials,
+                                   thresholds=GateThresholds(min_deflated_sharpe_probability=probability))
+        missed = screen_out_of_sample(is_metrics=_metrics(rankIc=0.05), oos_metrics=_metrics(rankIc=0.04),
+                                      returns=returns, trials=trials,
+                                      thresholds=GateThresholds(min_deflated_sharpe_probability=probability + 1e-6))
+        assert met.passed is True
+        assert missed.reason == "factorMining.reject.selectionBias"
 
 
 def test_screen_out_of_sample_tightens_as_the_trial_ledger_grows():

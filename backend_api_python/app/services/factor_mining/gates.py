@@ -6,10 +6,12 @@ window out-of-sample review (L5). Each returns the first check a candidate fails
 closed reason key, so every rejection stays explainable; the caller owns the ordering and the
 trial ledger.
 
-A missing or non-finite metric is read as 0.0: that fails a minimum and passes a maximum, so no
-evidence never buys a pass on a strength threshold and never invents a rejection on a friction
-threshold. The one exception is fold consistency -- ``foldIcSigns`` is written by the search
-engine, so an absent series means "not evaluated" and that check is skipped.
+A missing, NaN, or unreadable metric is read as 0.0 -- no evidence fails a minimum and passes a
+maximum -- while an infinite reading is kept, so it fails exactly the gates where more of that
+quantity is worse. Redundancy is the one place where no evidence cannot stand: a correlation the
+engine never computed is neither a duplicate nor a clearance, so an L4 call with nothing finite to
+compare is rejected as unverifiable. The other exception is fold consistency -- ``foldIcSigns`` is
+written by the search engine, so an absent series means "not evaluated" and that check is skipped.
 
 No database, clock, or network access here. ``deflated_sharpe`` is reused from
 :mod:`app.services.strategy_evolution.statistics` as the spec requires; importing it also executes
@@ -64,12 +66,27 @@ class GateVerdict:
 
 
 def _number(value: Any) -> float:
-    """Read a metric as a finite float; anything missing or unusable reads as 0.0."""
+    """Read a metric as a float to compare against a bar.
+
+    A missing or unreadable value becomes 0.0, which fails a minimum and passes a maximum. NaN
+    joins it there on purpose: NaN compares False against every bar, so left alone it would walk
+    a poisoned candidate through the whole ladder. Infinities are kept -- they compare correctly,
+    failing exactly the gates where more of the quantity is worse.
+    """
     try:
         number = float(value)
     except (TypeError, ValueError):
         return 0.0
-    return number if math.isfinite(number) else 0.0
+    return 0.0 if math.isnan(number) else number
+
+
+def _finite(value: Any) -> float | None:
+    """Read a correlation as evidence: None unless it is a finite number."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _passed(stage: str) -> GateVerdict:
@@ -113,9 +130,19 @@ def screen_stability(metrics: Mapping[str, Any], thresholds: GateThresholds) -> 
 
 
 def screen_redundancy(correlations: Mapping[str, float], thresholds: GateThresholds) -> GateVerdict:
-    """L4: reject when any built-in factor correlates at or above the bar, in either direction."""
-    worst = max((abs(_number(value)) for value in correlations.values()), default=0.0)
-    if worst >= thresholds.max_builtin_correlation:
+    """L4: reject when any built-in factor correlates at or above the bar, in either direction.
+
+    Only finite correlations count as evidence. A NaN pair is one the engine could not compare --
+    the fundamental factors carry no data on a price-volume run -- and skipping it is not the same
+    as clearing the candidate. So when nothing finite was measured the gate cannot run at all, and
+    an unrun de-duplication check rejects rather than waves a candidate past the ladder's only
+    redundancy checkpoint.
+    """
+    measured = [abs(value) for value in (_finite(value) for value in correlations.values())
+                if value is not None]
+    if not measured:
+        return _failed("L4", "factorMining.reject.unverifiableRedundancy")
+    if max(measured) >= thresholds.max_builtin_correlation:
         return _failed("L4", "factorMining.reject.duplicateBuiltin")
     return _passed("L4")
 
