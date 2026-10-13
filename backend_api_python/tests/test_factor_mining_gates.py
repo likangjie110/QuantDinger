@@ -57,7 +57,7 @@ def test_screen_redundancy_rejects_builtin_duplicate():
 def test_screen_out_of_sample_uses_total_trial_count():
     curve = [{"time": "2025-01-01", "gross": 1.0, "net": 1.0}, {"time": "2025-01-02", "gross": 1.1, "net": 1.09}]
     returns = net_return_series(curve)
-    assert returns == [0.09]
+    assert returns == pytest.approx([0.09])
     verdict = screen_out_of_sample(is_metrics=_metrics(rankIc=0.05),
                                    oos_metrics=_metrics(rankIc=0.04),
                                    returns=[0.01, -0.002, 0.004, 0.006], trials=250,

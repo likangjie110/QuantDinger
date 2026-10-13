@@ -121,15 +121,15 @@ def screen_redundancy(correlations: Mapping[str, float], thresholds: GateThresho
 
 
 def net_return_series(long_short_curve: Sequence[Mapping[str, Any]]) -> list[float]:
-    """Point-to-point net returns of a long/short curve, rounded to six decimals.
+    """Point-to-point net returns of a long/short curve.
 
-    The rounding makes the series reproducible: a NAV ratio such as ``1.09 / 1.0 - 1`` is
-    0.09000000000000008 in binary floating point. A step taken from a non-positive NAV is dropped
-    rather than divided through -- its return is undefined -- which is also what
+    Values stay at full precision: this series feeds :func:`deflated_sharpe` directly. A step
+    taken from a non-positive NAV is dropped rather than divided through -- its return is
+    undefined -- which is also what
     :func:`app.services.strategy_evolution.statistics.equity_returns` does.
     """
     values = [_number(point.get("net")) for point in long_short_curve]
-    return [round(current / previous - 1.0, 6)
+    return [current / previous - 1.0
             for previous, current in zip(values, values[1:]) if previous > 0]
 
 
