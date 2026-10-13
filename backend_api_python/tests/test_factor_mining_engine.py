@@ -439,6 +439,44 @@ def test_an_injected_panel_is_never_studied_under_a_builtin_name():
     assert result["factorCorrelation"]["factors"][0] == result["factorId"]
 
 
+def test_the_correlation_study_reads_the_injected_panel_not_a_lookalike():
+    """The L4 measurement must come from the panel handed in, not from one that ranks alike.
+
+    Correlation values cannot tell the injected panel apart from any positive monotone transform
+    of it: every cross-section ranks the same way, so every coefficient comes out equal. The
+    observation counts can. Blanking the first half of the search window leaves every value the
+    panel still carries exactly as it was, so a study that read the injected panel scores one
+    cross-section fewer per blanked date, while one that read any rank-equivalent panel scores
+    the same as before -- which is the failure this pins, without inferring it from the signs.
+    """
+    frames, members = _fixture()
+    split = split_periods(_config(thresholds=_NO_DEDUPLICATION))
+    sessions = pd.bdate_range(split.search_start, split.search_end)
+    cutoff = sessions[len(sessions) // 2]
+    whole_panel = _evaluator(frames, _MOMENTUM_5)
+    assert int((~whole_panel.loc[whole_panel.index < cutoff].isna()).sum().sum()) > 0, \
+        "the half about to be blanked must carry values for their loss to mean anything"
+
+    def study(panel):
+        return FactorResearchEngine().run(
+            frames=frames, factor_panel=panel, factor_id="", start_date=split.search_start,
+            end_date=split.search_end, members=members)
+
+    whole = study(whole_panel)
+    partial_panel = whole_panel.copy()
+    partial_panel.loc[partial_panel.index < cutoff] = float("nan")
+    partial = study(partial_panel)
+
+    # Same comparison pool, so the two counts below are like for like.
+    assert whole["factorCorrelation"]["factors"] == partial["factorCorrelation"]["factors"]
+    whole_observed = whole["factorCorrelation"]["observations"][0][0]
+    partial_observed = partial["factorCorrelation"]["observations"][0][0]
+    blanked = [item for item in whole["icSeries"]
+               if datetime.fromisoformat(item["time"]) < cutoff]
+    assert blanked, "the blanked half must have scored something before it was blanked"
+    assert whole_observed - partial_observed == len(blanked)
+
+
 def test_members_without_a_key_are_reported_as_no_membership():
     """Members the research engine cannot map to a symbol must not blank the cross-section.
 
