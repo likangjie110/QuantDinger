@@ -21,7 +21,7 @@
 ### 2.1 目标（v1 验收）
 
 1. 给定市场/资产池、周期、区间与预算，一次作业自动完成：表达式候选生成 → 逐级评估淘汰 → 与内置因子去重 → 冻结段样本外复评 → 全量试验留痕。
-2. 任意结论可复现：同 seed + 同配置 + 同数据快照 → 同候选集与同指标。
+2. 任意结论可复现：同 seed + 同配置 + 同数据指纹 → 同候选集与同指标。
 3. 全部候选（含失败）可查询，试验次数用于选择偏差校正。
 
 **全自动覆盖的是研究流程，不承诺挖出的因子持续盈利。**
@@ -50,7 +50,7 @@
 | 通用建议 | 本仓库采用 | 依据 |
 | --- | --- | --- |
 | 元数据 SQLite | PostgreSQL 新表 + `migrations/*.sql` | `AGENTS.md`：PG 是 durable source of truth |
-| Parquet/DuckDB 数据层 | 复用 Strategy V2 数据面：`resolve_candidates` / `fetch_frames` / `MarketDataSnapshotStore` / `fundamental_data.enrich_panel` | `app/services/strategy_v2/service.py:438,466`、`snapshot.py:18`；自建数据层会破坏时间口径一致性 |
+| Parquet/DuckDB 数据层 | 复用 Strategy V2 数据面：`resolve_candidates` / `fetch_frames` / `fundamental_data.enrich_panel`，数据版本用按标的逐个规范化后合并的 sha256 指纹（**不复用** `MarketDataSnapshotStore`：它只规范化扁平 OHLCV 帧，多标的面板只能得到日历指纹，且会写入没有任何加载路径的文件） | `app/services/strategy_v2/service.py:438,466`、`snapshot.py:18`；自建数据层会破坏时间口径一致性 |
 | 独立后台任务进程 | `agent_jobs.submit_job(kind="factor_mining")`（celery-worker 执行，本地回退线程池） | `docs/architecture/README.md` 进程所有权：celery-worker owns 有限、可重试任务；`app/utils/agent_jobs.py:81` |
 | 自建评估器 | 复用 `FactorResearchEngine` 口径 | 单因子诊断已在使用，口径不一致则研究结论不可比 |
 | 自建滚动验证与统计 | 复用 `strategy_evolution.statistics.deflated_sharpe` / `probability_of_backtest_overfitting` / `monte_carlo_bootstrap` 与 `walk_forward.build_walk_forward_plan` | `statistics.py:61,96,129`、`walk_forward.py:66` |
@@ -183,7 +183,7 @@ backend_api_python/migrations/20261013_factor_mining.sql
 
 ## 11. 数据模型（PostgreSQL，3 张表）
 
-- `qd_factor_mining_runs`：一次作业（配置、数据快照、状态、计数）。
+- `qd_factor_mining_runs`：一次作业（配置、数据指纹、状态、计数）。
 - `qd_factor_candidates`：去重后的候选（表达式、指纹、来源、状态、指标、样本外指标），`UNIQUE (user_id, expression_hash)`。
 - `qd_factor_trials`：每次评估一行（stage、verdict、reason、指标），随 run 级联删除。
 
