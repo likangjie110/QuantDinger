@@ -18,6 +18,7 @@ assert the candidate list is non-empty, because a run that rejects everything ca
 whether the search works.
 """
 
+from contextlib import contextmanager
 from datetime import datetime
 
 import pandas as pd
@@ -164,9 +165,29 @@ def _seeds(count):
     return seeds
 
 
-def _run_with_seeds(monkeypatch, seeds, **overrides):
+@contextmanager
+def _patched_expansion(monkeypatch, seeds):
+    """Expand ``seeds`` instead of the templates for the duration of the block.
+
+    Entries the block added are dropped on the way out -- in ``finally``, so an aborted block
+    cannot leave one behind either. Only those entries go, never the whole memo: the cross-test
+    reuse is what keeps this suite's runtime down, and a template search memoized by an earlier
+    test is still valid. ``_search`` already refuses to memoize a run made under a patch, so with
+    that check in place this drops nothing; it is the second lock on the same door, and it is
+    what keeps the memo honest if that check is ever changed.
+    """
     monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: seeds)
-    return _run(*_fixture(), **overrides)
+    memoized = set(_SEARCH_CACHE)
+    try:
+        yield
+    finally:
+        for key in set(_SEARCH_CACHE) - memoized:
+            del _SEARCH_CACHE[key]
+
+
+def _run_with_seeds(monkeypatch, seeds, **overrides):
+    with _patched_expansion(monkeypatch, seeds):
+        return _run(*_fixture(), **overrides)
 
 
 def test_search_records_one_trial_per_evaluated_candidate():
@@ -492,6 +513,9 @@ def test_a_run_made_under_a_patched_expansion_is_never_memoized(monkeypatch):
     key -- which only shows up in a subset run, where no earlier test repopulated the entry
     first. That is the shape of the false red this suite already had once, so the memo refuses
     to store a run it cannot attribute to the real expansion.
+
+    This patches by hand rather than through ``_patched_expansion``: that helper's ``finally``
+    empties the memo, which would hide the very write being asserted here.
     """
     monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: _seeds(1))
     patched, _ = _search(thresholds=_NO_DEDUPLICATION)
@@ -546,8 +570,8 @@ def test_the_point_in_time_universe_is_applied_per_date(monkeypatch):
     actually being evaluated rather than waved through.
     """
     frames, members = _fixture()
-    monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: _seeds(1))
-    result, _ = _run(frames, members, thresholds=_NO_DEDUPLICATION)
+    with _patched_expansion(monkeypatch, _seeds(1)):
+        result, _ = _run(frames, members, thresholds=_NO_DEDUPLICATION)
     groups = result["candidates"][0]["metrics"]["groupObservations"]
     assert groups, "no cross-section was grouped"
     joined = datetime(2024, 5, 1)
@@ -571,8 +595,8 @@ def test_keyless_members_leave_the_search_running_rather_than_blanking_it(monkey
     frames, _ = _fixture()
     keyless = [{"market": "USStock", "symbol": symbol, "effectiveFrom": None}
                for symbol in ["A", "B", "C", "D", "E", "F"]]
-    monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: _seeds(1))
-    result, _ = _run(frames, keyless, thresholds=_NO_DEDUPLICATION)
+    with _patched_expansion(monkeypatch, _seeds(1)):
+        result, _ = _run(frames, keyless, thresholds=_NO_DEDUPLICATION)
     assert [item["verdict"] for item in result["trials"]] == ["pass"]
     assert result["trials"][0]["stage"] != "L1"
     assert result["candidates"], "a keyless run must still produce candidates"
