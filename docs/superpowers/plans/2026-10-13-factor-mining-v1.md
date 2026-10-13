@@ -29,7 +29,7 @@
 1. **前视偏差**：任何算子或求值路径读到未来 bar → 因子值虚高。钉住：任务 2 `test_operators_do_not_leak_future_bars`（改未来行不改变历史输出）+ 任务 7 `test_search_is_isolated_from_freeze_segment`。
 2. **幸存者偏差**：用今天的成分股回测历史 → IC/分组全失真。钉住：任务 6 `test_prepare_panel_uses_point_in_time_members`。
 3. **字段口径不成立却照跑**：生成了依赖不存在/口径不明数据的候选，或候选被静默丢弃无法复盘。钉住：任务 1 `test_normalize_rejects_unknown_field` + 任务 7 `test_rejected_candidates_still_record_trials`。
-4. **选择偏差**：试验次数漏记 → DSR 校正失效、指标虚高。钉住：任务 5 `test_out_of_sample_uses_total_trial_count` + 任务 9 `test_save_trials_counts_failures`。
+4. **选择偏差**：试验次数漏记 → DSR 校正失效、指标虚高。钉住：任务 5 `test_screen_out_of_sample_tightens_as_the_trial_ledger_grows`（同一收益序列，`trials=1` 通过、`trials=250` 以 `selectionBias` 淘汰——分母方向可被否证）+ 任务 9 `test_save_trials_counts_failures`（失败候选同样入账）。
 5. **成本与换手失真**：手续费/滑点静默走成 0，或换手爆炸的因子被当成可用。钉住：任务 5 `test_screen_stability_rejects_high_turnover` + 任务 7 `test_metrics_carry_execution_assumptions`。
 
 ---

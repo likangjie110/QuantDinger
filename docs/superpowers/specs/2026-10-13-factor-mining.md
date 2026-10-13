@@ -195,7 +195,7 @@ backend_api_python/migrations/20261013_factor_mining.sql
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/factor-mining/run` | 提交挖掘作业 → `202 {jobId, status}` |
-| POST | `/api/factor-mining/estimate` | 预算预估（候选数、观测规模、预计耗时） |
+| POST | `/api/factor-mining/estimate` | 预算预估（**候选数与模板数**——实现只承诺这两项，落库/耗时预估不在 v1 契约内） |
 | GET | `/api/factor-mining/jobs` | 作业列表（`limit` <= 50） |
 | GET | `/api/factor-mining/jobs/<job_id>` | 作业详情（含 `progress`） |
 | POST | `/api/factor-mining/jobs/<job_id>/cancel` | 取消（协作式） |
