@@ -106,6 +106,18 @@ class _Repository:
                               "result": result, "error_message": error_message})
 
 
+class _BacktestService:
+    """The data path a provider reads through, recording the calls it receives."""
+
+    def __init__(self, candidates=()):
+        self.calls = []
+        self.candidates = list(candidates)
+
+    def resolve_candidates(self, *, user_id, manifest, start_date, end_date):
+        self.calls.append("resolve_candidates")
+        return list(self.candidates), 0
+
+
 class _Engine:
     """A stand-in for ``FactorMiningEngine`` that records what the search and review were told."""
 
@@ -117,9 +129,11 @@ class _Engine:
         self.review_error = review_error
         self.trials_counts = []
         self.survivors = None
+        self.configs = []
 
     def run(self, *, user_id, code, config):
         self.trace.append("engine.run")
+        self.configs.append(config)
         if self.error is not None:
             raise self.error
         return self.run_result
@@ -384,6 +398,17 @@ def test_estimate_narrows_the_candidate_count_to_a_small_template_set():
     assert estimate["candidateBudget"] < 20
 
 
+def test_estimate_counts_each_template_once():
+    """``expand_candidates`` dedupes by fingerprint, so a repeated id must not inflate the count."""
+    estimate = FactorMiningService().estimate(
+        _payload(budget=20, templateIds=["momentum", "momentum"]),
+    )
+    assert estimate["templateCount"] == 1
+    assert estimate["candidateBudget"] == len(
+        expand_candidates(template_ids=["momentum"], budget=20, seed=DEFAULT_SEED)
+    )
+
+
 def test_estimate_validates_without_reading_the_source(monkeypatch):
     monkeypatch.setattr(mining_service, "get_script_source_service",
                         lambda: pytest.fail("estimate must not read the source"))
@@ -411,10 +436,8 @@ def test_runner_ledgers_every_trial_and_writes_the_frozen_count_back(monkeypatch
     build, built = _factory(repository.trace, engine)
     sources = _SourceService(_SOURCE)
     monkeypatch.setattr(mining_service, "get_script_source_service", lambda: sources)
-    backtest = object()
 
-    service = FactorMiningService(engine_factory=build, repository=repository,
-                                  backtest_service=backtest)
+    service = FactorMiningService(engine_factory=build, repository=repository)
     result = service._run_mining_job({"__userId": USER_ID, **_payload(budget=3)}, _PROGRESS)
 
     assert repository.trace == ["persist_run", "engine_factory", "engine.run", "save_trials",
@@ -422,7 +445,6 @@ def test_runner_ledgers_every_trial_and_writes_the_frozen_count_back(monkeypatch
                                 "finish_run"]
     assert sources.calls == [(3, USER_ID)]
     assert isinstance(built["data_provider"], MiningDataProvider)
-    assert built["data_provider"]._backtest_service is backtest
     assert built["on_progress"] is _PROGRESS
     assert repository.runs[0]["user_id"] == USER_ID
     assert repository.runs[0]["source_name"] == "US equity portfolio"
@@ -445,6 +467,30 @@ def test_runner_ledgers_every_trial_and_writes_the_frozen_count_back(monkeypatch
     assert persisted["trials"] == trials
     assert persisted["split"] == run_result["split"]
     assert result["summary"]["frozen"] == 1
+
+
+def test_runner_reads_panels_through_the_injected_backtest_service(monkeypatch):
+    """The provider is observable only through its data path: reaching the fake proves the wiring.
+
+    ``prepare`` stops at the universe check -- the fake returns no candidates -- so nothing is
+    fetched and no real service is ever constructed.
+    """
+    repository = _Repository()
+    engine = _Engine(repository.trace, run_result=_run_result([], []))
+    build, built = _factory(repository.trace, engine)
+    backtest = _BacktestService()
+    monkeypatch.setattr(mining_service, "get_script_source_service", lambda: _SourceService(_SOURCE))
+
+    FactorMiningService(engine_factory=build, repository=repository,
+                        backtest_service=backtest)._run_mining_job(
+        {"__userId": USER_ID, **_payload()}, _PROGRESS,
+    )
+
+    with pytest.raises(ValueError, match="factorMining.universeTooSmall"):
+        built["data_provider"].prepare(
+            user_id=USER_ID, code=_SOURCE_CODE, config=engine.configs[0],
+        )
+    assert backtest.calls == ["resolve_candidates"]
 
 
 def test_runner_closes_the_run_as_failed_then_reraises(monkeypatch):

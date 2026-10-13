@@ -99,8 +99,10 @@ class FactorMiningService:
             budget=config.budget,
             seed=config.seed,
         )
+        # Deduped like the expansion dedupes: a repeated id contributes nothing to the search, and
+        # counting it twice would report a template total the candidate count cannot come from.
         return {
-            "templateCount": len(config.template_ids) or len(template_catalog()),
+            "templateCount": len(set(config.template_ids)) or len(template_catalog()),
             "candidateBudget": len(seeds),
         }
 
