@@ -268,10 +268,11 @@ class FactorMiningEngine:
         """
         panel = self._data_provider.prepare(user_id=user_id, code=code, config=config)
         split = split_periods(config)
-        # Candidates evaluate against the field panels the provider pinned to one shared index,
-        # which is what keeps a candidate's dates and symbols aligned with ``fields["close"]``.
-        # A provider that carries only frames is accepted by deriving them the same way.
-        evaluator = ExpressionEvaluator(panel.fields or _field_panels(panel.frames))
+        # The provider owns the field panels: they are pinned to one shared index and column
+        # order, which is what keeps a candidate's dates and symbols aligned with
+        # ``fields["close"]``. Recomputing them here would silently paper over a provider that
+        # handed out nothing.
+        evaluator = ExpressionEvaluator(panel.fields)
         seeds = expand_candidates(
             template_ids=config.template_ids or None,
             budget=config.budget,

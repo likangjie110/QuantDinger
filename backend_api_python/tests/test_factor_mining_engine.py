@@ -13,7 +13,7 @@ inactive, and leaves every candidate unscorable -- a shape only a test double ca
 Its prices are exact geometric curves with no idiosyncratic component, so every candidate
 ranks the six symbols the same way and correlates with the ``reversal_5`` built-in almost
 perfectly. The default redundancy bar rejects all twelve; only a permissive bar lets any of
-them reach the candidate list. Several tests below therefore run with ``_PERMISSIVE`` and
+them reach the candidate list. Several tests below therefore run with ``_NO_DEDUPLICATION`` and
 assert the candidate list is non-empty, because a run that rejects everything cannot show
 whether the search works.
 """
@@ -38,11 +38,16 @@ from app.services.factor_mining.gates import GateThresholds
 
 
 class _FakeProvider:
+    """A stand-in for ``MiningDataProvider`` that shapes its panel the way the real one does.
+
+    ``fields`` is built by the same ``_field_panels`` the provider uses rather than left empty:
+    the fake stands in for the provider, so a field mapping it never filled would hide a real
+    provider bug behind a candidate panel of nothing.
+    """
+
     def __init__(self, frames, members):
-        self.panel = type("Panel", (), {
-            "frames": frames, "members": members, "fields": {},
-            "snapshot_id": "b" * 64, "frequency": "1d", "warnings": [],
-        })()
+        self.panel = PreparedPanel(frames=frames, members=members, fields=_field_panels(frames),
+                                   snapshot_id="b" * 64, frequency="1d", warnings=[])
 
     def prepare(self, *, user_id, code, config):
         return self.panel
@@ -80,11 +85,12 @@ def _config(**overrides):
 
 
 # The fixture ranks the symbols identically for every candidate, so L4 is the gate that
-# decides this fixture's runs. A bar above 1.0 is what lets a candidate through on data whose
-# only signal is the drift the built-ins already carry; every other gate is turned off.
-_PERMISSIVE = GateThresholds(min_ic_observations=5, min_abs_rank_ic=0.0, min_icir=0.0,
-                             min_fold_consistency=0.0, max_turnover=1.0, min_coverage=0.0,
-                             max_builtin_correlation=2.0)
+# decides this fixture's runs. A bar of 1.1 is above every possible correlation, so the
+# de-duplication gate can never fire and the run has a genuine end-to-end pass path; every
+# other gate is turned off for the same reason.
+_NO_DEDUPLICATION = GateThresholds(min_ic_observations=5, min_abs_rank_ic=0.0, min_icir=0.0,
+                                   min_fold_consistency=0.0, max_turnover=1.0, min_coverage=0.0,
+                                   max_builtin_correlation=1.1)
 
 
 def _run(frames, members, **overrides):
@@ -145,38 +151,41 @@ def _run_with_seeds(monkeypatch, seeds, **overrides):
 
 
 def test_search_records_one_trial_per_evaluated_candidate():
-    """Run at the permissive bar, because the default one rejects all twelve on this fixture.
-
-    Every candidate here tracks ``reversal_5`` almost perfectly, so the default redundancy bar
-    rejects the whole run. That is a correct verdict on this data, but it would leave the
-    assertions below comparing nothing, hence ``_PERMISSIVE`` plus an explicit check that
-    something did clear the ladder.
-    """
-    result, _ = _search(thresholds=_PERMISSIVE)
+    result, _ = _search()
     assert len(result["trials"]) == len({item["fingerprint"] for item in result["trials"]})
     assert len(result["trials"]) >= 1
     assert all(item["stage"] in {"L1", "L2", "L3", "L4", "L5"} for item in result["trials"])
-    # A run where every candidate dies before the ladder is scored proves nothing about the
-    # search, so at least one trial has to clear every gate with its metrics intact.
-    passed = [item for item in result["trials"] if item["verdict"] == "pass"]
-    assert passed, "no candidate cleared the ladder"
-    for key in ("rankIc", "icir", "averageTurnover"):
-        assert key in passed[0]["metrics"], key
 
 
-def test_the_gate_ladder_actually_runs_on_this_fixture():
-    """L4 must run on a real correlation measurement, and a candidate must clear it.
+def test_the_pipeline_runs_past_the_observation_gate_on_real_correlations():
+    """L3 is reached, and L4 rejects the fixture's candidates as duplicates, not as unverifiable.
 
-    The loop reads the candidate's measured correlations out of the correlation study, so a
-    study that came back unreadable would leave L4 rejecting everything as unverifiable and
-    the search would never produce a candidate -- green, but proving nothing.
+    Together those say the run really walked the ladder on a measurement. A run that stalled at
+    L2 would mean the cross-section never resolved; a run whose L4 rejected everything as
+    ``unverifiableRedundancy`` would mean the correlation study came back unreadable and the
+    de-duplication check never actually compared anything.
     """
-    result, _ = _search(thresholds=_PERMISSIVE)
-    assert any(item["stage"] == "L4" for item in result["trials"]), \
-        "no trial reached the redundancy gate"
-    assert all(item["reason"] != "factorMining.reject.unverifiableRedundancy"
-               for item in result["trials"]), "L4 was handed no measurement at all"
+    result, _ = _search()
+    assert any(item["stage"] == "L3" for item in result["trials"]), \
+        "every candidate stopped at or before the observation gate"
+    l4 = [item for item in result["trials"] if item["stage"] == "L4"]
+    assert l4, "no trial reached the redundancy gate"
+    assert {item["reason"] for item in l4} == {"factorMining.reject.duplicateBuiltin"}
+
+
+def test_a_run_with_no_deduplication_produces_candidates():
+    """The end-to-end pass path, with the de-duplication gate unable to fire at all.
+
+    This is the only configuration in which this fixture can produce a survivor: every
+    candidate here tracks ``reversal_5`` almost perfectly, so the default bar rejects all
+    twelve as duplicates -- a correct verdict, but one that would leave the search's pass path
+    untested.
+    """
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
     assert result["candidates"], "no candidate cleared the ladder"
+    assert any(item["verdict"] == "pass" for item in result["trials"])
+    for key in ("rankIc", "icir", "averageTurnover", "foldIcSigns"):
+        assert key in result["candidates"][0]["metrics"], key
 
 
 def test_rejected_candidates_still_record_trials():
@@ -198,8 +207,8 @@ def test_a_frozen_tail_that_cannot_be_seen_cannot_change_the_search():
     honest. Both candidate lists are asserted non-empty: comparing two empty lists would hold
     no matter what the loop did.
     """
-    first, _ = _search(thresholds=_PERMISSIVE)
-    second, _ = _run(*_fixture("frozen-tail-mutated"), thresholds=_PERMISSIVE)
+    first, _ = _search(thresholds=_NO_DEDUPLICATION)
+    second, _ = _run(*_fixture("frozen-tail-mutated"), thresholds=_NO_DEDUPLICATION)
     assert first["trials"] and second["trials"], "the fixture must evaluate candidates"
     assert first["candidates"] and second["candidates"], "no candidate survived to compare"
     assert [item["fingerprint"] for item in first["candidates"]] == \
@@ -218,9 +227,9 @@ def test_the_search_window_is_cut_from_the_panel_that_carries_warmup():
     the research directly over that window must reproduce the trial's metrics exactly.
     """
     frames, members = _fixture()
-    result, _ = _search(thresholds=_PERMISSIVE)
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
     trial = result["candidates"][0]
-    config = _config(thresholds=_PERMISSIVE)
+    config = _config(thresholds=_NO_DEDUPLICATION)
     panel = PreparedPanel(frames=frames, members=members, fields={}, snapshot_id="b" * 64,
                           frequency="1d", warnings=[])
     candidate_panel = _evaluator(frames, trial["expression"])
@@ -262,15 +271,15 @@ def test_run_is_reproducible_with_same_seed():
 
 
 def test_run_is_reproducible_on_the_candidate_sequence_too():
-    first, _ = _search(seed=11, thresholds=_PERMISSIVE)
-    second, _ = _search(seed=11, thresholds=_PERMISSIVE)
+    first, _ = _search(seed=11, thresholds=_NO_DEDUPLICATION)
+    second, _ = _search(seed=11, thresholds=_NO_DEDUPLICATION)
     assert first["candidates"] and second["candidates"]
     assert [item["fingerprint"] for item in first["candidates"]] == \
            [item["fingerprint"] for item in second["candidates"]]
 
 
 def test_trials_carry_the_ladder_verdict_shape():
-    result, _ = _search(thresholds=_PERMISSIVE)
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
     assert result["candidates"], "a permissive fixture must clear the ladder"
     assert len(result["trials"]) == 12
     for item in result["trials"]:
@@ -283,7 +292,7 @@ def test_trials_carry_the_ladder_verdict_shape():
 
 
 def test_candidates_carry_the_search_records_shape():
-    result, _ = _search(thresholds=_PERMISSIVE)
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
     assert result["candidates"]
     for item in result["candidates"]:
         assert set(item) == {"expression", "fingerprint", "origin", "template_id", "status",
@@ -302,7 +311,7 @@ def test_candidates_carry_the_search_records_shape():
 
 def test_gates_get_fold_ic_signs_from_the_ic_series():
     """L3's fold check reads ``foldIcSigns``; a run that omits it loses that check silently."""
-    result, _ = _search(thresholds=_PERMISSIVE)
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
     signs = result["candidates"][0]["metrics"]["foldIcSigns"]
     assert len(signs) == 4, "the IC series is cut into four folds"
     assert all(sign in {-1.0, 0.0, 1.0} for sign in signs)
@@ -328,7 +337,7 @@ def test_redundancy_gate_rejects_a_builtin_duplicate(monkeypatch):
     """
     from app.services.factor_mining.templates import CandidateSeed
 
-    baseline, _ = _search(thresholds=_PERMISSIVE)
+    baseline, _ = _search(thresholds=_NO_DEDUPLICATION)
     duplicate = baseline["candidates"][0]
     assert duplicate, "the fixture must have a candidate to re-run the redundancy gate on"
     seeds = [CandidateSeed(expression=duplicate["expression"],
@@ -347,13 +356,33 @@ def test_redundancy_gate_rejects_a_builtin_duplicate(monkeypatch):
 def test_members_without_a_key_are_reported_as_no_membership():
     """Members the research engine cannot map to a symbol must not blank the cross-section.
 
-    ``_membership_panel`` matches on ``member["key"]``; a member that has a ``symbol`` but no
+    ``_membership_panel`` matches on ``member["key"]``. A member that has a ``symbol`` but no
     ``key`` is an entry that matches nothing, which reads as inactive on every date and turns
-    every candidate into an inconclusive rejection.
+    every candidate into an inconclusive rejection -- a worse failure than having no
+    membership information at all, because it is silent. So they are reported as the empty
+    sequence, which the research engine documents as "no membership restrictions".
     """
     assert _resolved_members([{"market": "USStock", "symbol": "A", "effectiveFrom": None}]) == ()
     keyed = [{"key": "USStock:A", "market": "USStock", "symbol": "A"}]
     assert _resolved_members(keyed) == keyed
+
+
+def test_keyless_members_leave_the_search_running_rather_than_blanking_it(monkeypatch):
+    """The keyless branch observed end to end: the run still scores its candidates.
+
+    Passing those members through unchanged would give ``_membership_panel`` an entry matching
+    no symbol, so every date would have an empty cross-section and every candidate would die
+    at ``insufficientObservations``. The assertions below fail on that outcome, so the branch
+    is exercised rather than merely asserted in isolation.
+    """
+    frames, _ = _fixture()
+    keyless = [{"market": "USStock", "symbol": symbol, "effectiveFrom": None}
+               for symbol in ["A", "B", "C", "D", "E", "F"]]
+    monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: _seeds(1))
+    result, _ = _run(frames, keyless, thresholds=_NO_DEDUPLICATION)
+    assert [item["verdict"] for item in result["trials"]] == ["pass"]
+    assert result["trials"][0]["stage"] != "L1"
+    assert result["candidates"], "a keyless run must still produce candidates"
 
 
 def test_progress_is_reported_every_ten_candidates():
@@ -432,7 +461,7 @@ def test_a_failing_candidate_does_not_stop_the_candidates_after_it(monkeypatch):
     ], "params": {}}
     healthy = _seed_for({"op": "ts_pct_change", "args": ["close"], "params": {"n": 3}})
     result, _ = _run_with_seeds(monkeypatch, [_seed_for(zero_division), healthy],
-                                thresholds=_PERMISSIVE)
+                                thresholds=_NO_DEDUPLICATION)
     assert [item["verdict"] for item in result["trials"]] == ["reject", "pass"]
     assert result["trials"][0]["reason"] == "factorMining.reject.invalid"
     assert result["trials"][1]["reason"] == ""
