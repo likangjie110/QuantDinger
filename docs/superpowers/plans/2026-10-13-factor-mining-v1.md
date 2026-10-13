@@ -1271,7 +1271,7 @@ def main() -> int: ...   # 0 = pass；对齐 tests/integration/check_agent_billi
 
 - [ ] **步骤 1：编写集成检查脚本**
 
-按 `tests/integration/check_agent_billing_postgres.py` 的既有约定：读 `DATABASE_URL`（缺失则打印阻塞点并以非 0 退出码结束）、用 `psycopg2` 建一个唯一命名的临时 schema，把 `migrations/20261013_factor_mining.sql` 的建表语句（去掉 `qd_` 前缀依赖，`search_path` 指向临时 schema）应用进去，**不触碰业务表**，`finally` 里 DROP SCHEMA。断言：三张表存在；插入一条 run + 两条 trial 后 `count_trials` 返回 2；同一 `(user_id, expression_hash)` 二次写入走更新而非报错；跨 `user_id` 读取返回空。
+按 `tests/integration/check_agent_billing_postgres.py` 的既有约定：读 `DATABASE_URL`（缺失则打印阻塞点并以非 0 退出码结束）、用 `psycopg2` 建一个唯一命名的临时 schema，在其中先建一张 `qd_users` 桩表（迁移 DDL 硬引用 `qd_users(id)`，外键需要它存在），把 `search_path` 指向该 schema 后应用 `migrations/20261013_factor_mining.sql` 的建表语句——**表名保持 `qd_` 前缀原样**（要改的只是它们落在哪个 schema，不是名字），**不触碰业务表**，`finally` 里 DROP SCHEMA。断言：三张表存在；插入一条 run + 两条 trial 后 `count_trials(run_id, user_id=...)` 返回 **2**（该方法签名已改为关键字 `user_id`，计划正文里的旧调用是过期的）；同一 `(user_id, expression_hash)` 二次写入走**更新**而非报错，且 `run_id` 指向最近一次、`created_at` 不被覆盖；**同一份迁移连续执行两次仍成功**（幂等）；删除该 run 后其 trials **级联消失**；用另一个 `user_id` 调 `count_trials` 得到 **0**；跨 `user_id` 读取返回空。
 
 - [ ] **步骤 2：运行集成检查**
 
