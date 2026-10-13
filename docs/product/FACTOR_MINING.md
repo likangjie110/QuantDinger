@@ -182,7 +182,11 @@ further is checked.
   are the `GateThresholds` field names (snake_case): `min_coverage`, `min_ic_observations`,
   `min_abs_rank_ic`, `min_icir`, `min_fold_consistency`, `max_turnover`,
   `max_builtin_correlation`, `min_oos_abs_rank_ic`, `min_deflated_sharpe_probability`. An
-  unrecognised key or a `null` keeps the default.
+  unrecognised key or a `null` keeps the default. A value must read as its own field's type: the
+  integer-count threshold `min_ic_observations` accepts `30` and `30.0` but refuses `0.5` (which
+  `int()` would silently turn into `0` and switch L2's observation floor off), and no threshold
+  accepts a boolean or a non-finite number. A payload that is not an object, or a value that fails
+  these rules, returns 400 with `factorMining.thresholdsInvalid` rather than a coerced bar.
 
 ## 6. Time semantics and bias controls
 
@@ -204,6 +208,16 @@ ever touch the bars that are going to judge it.
 **Every trial is on the ledger, failures included.** Each evaluated candidate writes one row into
 `qd_factor_trials`, passes and rejections alike. That ledger's size is the deflated-Sharpe
 denominator used at L5.
+
+**A ledger row keeps only what the gates read.** The trial's `metrics` carries `coverage`,
+`rankIc`, `icir`, `foldIcSigns`, `averageTurnover`, `stability`, the `executionAssumptions` block,
+and `icObservations` -- the **length** of the IC series, under its own key, because L2 asks how many
+observations there were and never what they were. Everything else (the IC series itself, the group
+and long/short curves, the per-date cross-sections, the correlation matrix) stays on the
+**candidate**, whose detail view serves it. The ledger has one row per evaluation, so an untrimmed
+row is what makes a run's record grow with the budget: at 200 symbols one is 0.78 MB, and a budget
+of 400 would persist roughly a third of a gigabyte per run -- three times over, since the record is
+written to `qd_factor_trials`, `qd_factor_mining_runs.result_json`, and `qd_agent_jobs.result`.
 
 **Data fingerprint.** `summary.snapshotId` is a real fingerprint of the panel's contents: symbols
 are visited in sorted order and each one's canonical OHLCV bytes are mixed into a `sha256` (the
@@ -230,10 +244,10 @@ section 10, and `data` is `null`.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/catalog` | The DSL's own vocabulary: `fields`, `operators`, `templates` |
-| `POST` | `/estimate` | Static price of a search, returning `{templateCount, candidateBudget}`; no source read, no panel, no job |
+| `POST` | `/estimate` | Static price of a search, returning **exactly** `{templateCount, candidateBudget}` and nothing else; no source read, no panel, no job |
 | `POST` | `/run` | Submit a mining run; **HTTP 202**, returns the job receipt |
-| `GET` | `/jobs` | The caller's mining jobs, newest first |
-| `GET` | `/jobs/<job_id>` | One job, with `progress` and `result` |
+| `GET` | `/jobs` | The caller's mining jobs, newest first, **without** `result` |
+| `GET` | `/jobs/<job_id>` | One job, with `progress` and the full `result` |
 | `POST` | `/jobs/<job_id>/cancel` | Cancel; the runner stops at its next progress report |
 | `GET` | `/candidates` | The candidate library, filtered and paged |
 | `GET` | `/candidates/<candidate_id>` | One candidate, with `metrics` and `outOfSample` |
@@ -252,14 +266,26 @@ Required: `sourceId` (positive integer), `market` (a known market key), and `sta
 
 ```json
 {"jobId": "<uuid>", "status": "queued", "progress": {}, "result": null,
- "error": null, "createdAt": "2026-10-13T09:00:00+00:00",
+ "hasResult": false, "error": null, "createdAt": "2026-10-13T09:00:00+00:00",
  "startedAt": null, "finishedAt": null}
 ```
+
+**List view versus detail view, for jobs.** `/jobs` answers every item with `result: null` and
+`hasResult` saying whether there is one; the run record -- every surviving candidate's full metrics
+and every trial's ledger row -- is served by `/jobs/<job_id>` alone. A page of twenty full records
+is more JSON than a client polling for "the one that finished" can use. `POST /run`'s receipt is
+the same envelope, and a queued job has no result yet, so `hasResult` is `false` there.
 
 **`GET /jobs` parameters:** `limit` (1-50, default 20).
 **`GET /candidates` parameters:** `runId` (integer), `status` (`search` / `frozen` / `rejected`),
 `market`, `limit` (1-200, default 50), `offset` (>= 0, default 0). An unreadable integer returns
 400 with `factorMining.invalidQuery`.
+
+**`?runId=` is not a stable view of "this run's candidates".** The library deduplicates by
+`(user_id, expression_hash)`, and `runId` points at the run that judged an expression **last**, so
+re-running an expression moves its row out of the older run's view and into the newer one. The
+filter answers "which run last judged these rows", which is what the library is for; it does not
+answer "what did run 7 evaluate".
 
 **List view versus detail view.** `/candidates` **omits** `metrics` and `outOfSample` -- a
 candidate's metrics carry its whole IC series and curves, which a page of fifty does not need. Read
@@ -292,10 +318,11 @@ the kind). The in-process pool and Celery both end up calling one implementation
 polls. The run row (`qd_factor_mining_runs`) is the audit record, and it is opened **before the
 search starts**, so a crash mid-run still leaves a row saying which config was being searched.
 
-**Concurrency cap.** One tenant may have **1 active job** at a time. Hitting it returns 400 with
-`factorMining.concurrentLimit`. Note that the gate counts every `queued` / `running` row that user
-has in the shared job table, with no `kind` filter -- so another running job of theirs occupies the
-slot too.
+**Concurrency cap.** One tenant may have **1 active mining job** at a time. Hitting it returns 400
+with `factorMining.concurrentLimit`. The gate counts that tenant's `queued` / `running` rows **of
+`kind = "factor_mining"`** -- the Agent Gateway's tenant-wide cap still counts every kind, but this
+feature's own limit is its own: a running backtest is not a mining slot, and an unswept ghost from
+another feature (which this feature's sweep does not retire) cannot block mining forever.
 
 **Budget caps.**
 
@@ -338,14 +365,17 @@ written. That silent version would lose a 250-trial ledger without a trace.
 The front-end copy lives in another repository. These are **all** the `factorMining.*` keys the
 backend can emit; the backend emits keys only and never renders copy.
 
-**API and service layer (21 keys)**
+**API and service layer (24 keys)**
 
 | Key | When it fires |
 | --- | --- |
 | `factorMining.runFailed` | An unexpected server-side failure while submitting (500) |
+| `factorMining.estimateFailed` | An unexpected server-side failure while pricing a search (500) |
 | `factorMining.jobNotFound` | The job does not exist, is not the caller's, or is not a mining job |
 | `factorMining.candidateNotFound` | The candidate does not exist or is not the caller's; also when the id is not an integer |
 | `factorMining.invalidQuery` | A query parameter is not a readable integer |
+| `factorMining.invalidParameter` | An integer run field (`seed` / `groups` / `holdingPeriod`) is not readable as an integer |
+| `factorMining.thresholdsInvalid` | `thresholds` is not an object, or a threshold cannot be read as its own field's type (a fractional `min_ic_observations`, a boolean, a non-finite value) |
 | `factorMining.sourceRequired` | `sourceId` is missing or not a positive integer |
 | `factorMining.sourceNotFound` | The `sourceId` script source does not exist or is not the caller's |
 | `factorMining.sourceCodeRequired` | The script source exists but its code is empty |

@@ -133,7 +133,7 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 - **不可测的换手不算低换手**：`factorMining.reject.highTurnover` 的判定写成 `not (turnover <= max_turnover)`，NaN 与 `inf` 都会失败（fail-closed）。
 - **分折一致性缺省即跳过**：`foldIcSigns` 由搜索引擎写入（把 IC 序列等分成最多 4 折，取每折均值符号）。序列缺失、或折数不足两项时，都表示「没评估过」，该检查跳过。
 - **L5 的 `trials` 用全部试验数**：DSR 的分母是**本次运行评估过的全部候选数（含被淘汰的）**，不是幸存者数。用幸存者数会给搜索本身定价过低，正好低估了它要修正的选择偏差。
-- **门槛可覆盖**：`POST /run` 的 payload 可以带 `thresholds` 对象，键名是 `GateThresholds` 的字段名（snake_case）：`min_coverage`、`min_ic_observations`、`min_abs_rank_ic`、`min_icir`、`min_fold_consistency`、`max_turnover`、`max_builtin_correlation`、`min_oos_abs_rank_ic`、`min_deflated_sharpe_probability`。未识别或为 `null` 的键保留默认值。
+- **门槛可覆盖**：`POST /run` 的 payload 可以带 `thresholds` 对象，键名是 `GateThresholds` 的字段名（snake_case）：`min_coverage`、`min_ic_observations`、`min_abs_rank_ic`、`min_icir`、`min_fold_consistency`、`max_turnover`、`max_builtin_correlation`、`min_oos_abs_rank_ic`、`min_deflated_sharpe_probability`。未识别或为 `null` 的键保留默认值。值必须能按字段自身类型读取：整数计数门槛 `min_ic_observations` 接受 `30` 与 `30.0`，但拒绝 `0.5`（`int()` 会把它静默变成 `0`，等于把 L2 的观测数下限关掉）；任何门槛都不接受布尔值和非有限数值。`thresholds` 不是对象、或某个值不满足上述规则时，返回 400 + `factorMining.thresholdsInvalid`，绝不落成一个被强制转换过的门槛。
 
 ## 6. 时间口径与防偏差
 
@@ -144,6 +144,8 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 **搜索段与冻结段严格隔离。** 请求区间按**交易日**切分：末尾 `freezeRatio`（默认 0.3，必须落在 `(0, 0.5)`）比例的交易日构成冻结段，冻结段从搜索段最后一个交易日的**次日**开始，两段不共享任何一根 bar。搜索阶段的数据源调用止于搜索段末尾；**冻结段只被读取一次**——在 `review_frozen` 里，且只在有幸存者时才读。没有任何候选能接触到将要评判它的那段行情。
 
 **全部试验（含失败）留痕。** 每个被评估的候选都往 `qd_factor_trials` 写一行，通过和淘汰一视同仁。这份台账的条数就是 L5 里 DSR 的分母。
+
+**台账行只保留门槛会读的字段。** 试验的 `metrics` 里只有 `coverage`、`rankIc`、`icir`、`foldIcSigns`、`averageTurnover`、`stability`、`executionAssumptions`，以及 `icObservations`——IC 序列的**长度**，单独一个键，因为 L2 只问观测数有多少，从不问观测值是什么。其余内容（IC 序列本身、分组与多空曲线、逐日截面、相关度矩阵）只留在**候选**上，由候选详情接口提供。台账是一次评估一行，所以不裁剪的就是让运行记录随预算膨胀的那一项：200 标的时单行 0.78 MB，`budget=400` 的一次运行要落大约三分之一 GB——而且是三份，因为同一份记录同时写进 `qd_factor_trials`、`qd_factor_mining_runs.result_json` 与 `qd_agent_jobs.result`。
 
 **数据指纹。** `summary.snapshotId` 是对面板内容算出的真实指纹：按标的排序，逐个把该标的的规范 OHLCV 字节混入 `sha256`（标的代码也参与哈希）。它是**数据指纹，不是可重放副本**——v1 只存指纹，不存行情快照。
 
@@ -158,10 +160,10 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/catalog` | DSL 词表：`fields`、`operators`、`templates` |
-| `POST` | `/estimate` | 静态估价，返回 `{templateCount, candidateBudget}`；不读数据源、不建面板、不开作业 |
+| `POST` | `/estimate` | 静态估价，**只**返回 `{templateCount, candidateBudget}` 这两项；不读数据源、不建面板、不开作业 |
 | `POST` | `/run` | 提交一次挖掘，**HTTP 202**，返回作业回执 |
-| `GET` | `/jobs` | 当前用户的挖掘作业列表，最新在前 |
-| `GET` | `/jobs/<job_id>` | 单个作业（含 `progress` 与 `result`） |
+| `GET` | `/jobs` | 当前用户的挖掘作业列表，最新在前，**不带** `result` |
+| `GET` | `/jobs/<job_id>` | 单个作业（含 `progress` 与完整 `result`） |
 | `POST` | `/jobs/<job_id>/cancel` | 取消；执行体在下次进度上报时停下 |
 | `GET` | `/candidates` | 候选库列表，支持过滤与分页 |
 | `GET` | `/candidates/<candidate_id>` | 单个候选，含 `metrics` 与 `outOfSample` |
@@ -176,12 +178,16 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 ```json
 {"jobId": "<uuid>", "status": "queued", "progress": {}, "result": null,
- "error": null, "createdAt": "2026-10-13T09:00:00+00:00",
+ "hasResult": false, "error": null, "createdAt": "2026-10-13T09:00:00+00:00",
  "startedAt": null, "finishedAt": null}
 ```
 
+**作业的列表视图与详情视图。** `/jobs` 每一项的 `result` 都是 `null`，`hasResult` 说明有没有可取的记录；运行记录（每个幸存候选的完整 metrics 加每条试验台账行）只由 `/jobs/<job_id>` 提供。一页二十份完整记录，对「只想找出刚跑完的那个」的轮询端来说是白拿的流量。`POST /run` 的回执用的是同一个信封，此时作业还没跑，所以 `hasResult` 是 `false`。
+
 **`GET /jobs` 参数：** `limit`（1–50，缺省 20）。
 **`GET /candidates` 参数：** `runId`（整数）、`status`（`search` / `frozen` / `rejected`）、`market`、`limit`（1–200，缺省 50）、`offset`（≥ 0，缺省 0）。非法整数返回 400 + `factorMining.invalidQuery`。
+
+**`?runId=` 不是「本次运行的候选」的稳定视图。** 候选库按 `(user_id, expression_hash)` 归并，`runId` 指向**最后一次**审判该表达式的那次运行，所以重跑同一表达式会把候选行从旧运行的视图里搬走、挪进新运行的视图。这个过滤器回答的是「这些行最后一次是被哪次运行审判的」，这正是候选库的语义；它不回答「第 7 次运行评估了什么」。
 
 **列表视图与详情视图的差别：** `/candidates` 列表**不带** `metrics` 和 `outOfSample`（一个候选的 metrics 含整条 IC 序列和曲线，一页 50 条不需要）。要这两块就取 `/candidates/<id>`。
 
@@ -199,7 +205,7 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 **两张记录，写入时机不同。** 作业行（`qd_agent_jobs`）是 API 轮询的时间线；运行行（`qd_factor_mining_runs`）是审计口径，它在**搜索开始之前**就写入——崩在半路也留下「当时在搜什么配置」的记录。
 
-**并发上限。** 每用户同时只能有 **1 个活跃作业**。触发时 `/run` 返回 400 + `factorMining.concurrentLimit`。注意这个闸门统计的是该用户在共享作业表里所有 `queued` / `running` 的行，不按 `kind` 过滤——因此该用户另一个正在跑的作业也会占住这个名额。
+**并发上限。** 每用户同时只能有 **1 个活跃挖掘作业**。触发时 `/run` 返回 400 + `factorMining.concurrentLimit`。这个闸门统计的是该用户 `kind = "factor_mining"` 的 `queued` / `running` 行——Agent 网关侧的租户总闸仍然统计全部 kind，但本功能自己的上限只算自己的作业：正在跑的 backtest 不占挖掘名额，别的功能留下的、本功能清扫不到（只清自己的 kind）的幽灵作业也挡不住挖掘提交。
 
 **预算上限。**
 
@@ -231,14 +237,17 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 前端文案在另一个仓库。以下是后端会产出的**全部** `factorMining.*` 键，后端只发键，不渲染文案。
 
-**接口与服务层（21 个）**
+**接口与服务层（24 个）**
 
 | 键 | 触发场景 |
 | --- | --- |
 | `factorMining.runFailed` | 提交作业时发生未预期的服务端异常（500） |
+| `factorMining.estimateFailed` | 估价时发生未预期的服务端异常（500） |
 | `factorMining.jobNotFound` | 作业不存在、不属于该用户、或不是挖掘作业 |
 | `factorMining.candidateNotFound` | 候选不存在，或不属于该用户；id 无法解析为整数时同样 |
 | `factorMining.invalidQuery` | 查询参数不是合法整数 |
+| `factorMining.invalidParameter` | 整数类型的运行字段（`seed` / `groups` / `holdingPeriod`）无法按整数读取 |
+| `factorMining.thresholdsInvalid` | `thresholds` 不是对象，或某个门槛无法按字段自身类型读取（`min_ic_observations` 给了小数、给了布尔值、给了非有限数值） |
 | `factorMining.sourceRequired` | 缺少 `sourceId` 或不是正整数 |
 | `factorMining.sourceNotFound` | `sourceId` 指向的脚本源不存在或不属于该用户 |
 | `factorMining.sourceCodeRequired` | 脚本源存在但代码为空 |
