@@ -11,6 +11,9 @@ def test_catalog_exposes_hypothesis_keys_and_grids():
     assert set(catalog) >= {"momentum", "reversal", "low_volatility", "liquidity",
                             "volume_price_confirm", "risk_adjusted_momentum", "conditional_filter"}
     assert catalog["momentum"]["hypothesisI18nKey"] == "factorMining.template.momentum"
+    # One hypothesis per template: no non-window selector axis may creep back into a grid.
+    assert set(catalog["liquidity"]["parameterGrid"]) == {"N", "M"}
+    assert set(catalog["liquidity_level"]["parameterGrid"]) == {"N"}
 
 
 def test_every_expanded_candidate_passes_dsl_validation():
@@ -40,6 +43,11 @@ def test_expansion_can_be_restricted_to_one_template():
 def test_budget_above_hard_limit_is_rejected():
     with pytest.raises(ValueError, match="factorMining.budgetExceeded"):
         expand_candidates(budget=MAX_BUDGET + 1)
+
+
+def test_unknown_template_id_is_rejected_with_a_stable_code():
+    with pytest.raises(ValueError, match="factorMining.templateNotFound"):
+        expand_candidates(template_ids=["nope"], budget=10)
 
 
 def test_over_budget_truncation_is_order_preserving_and_seed_stable():

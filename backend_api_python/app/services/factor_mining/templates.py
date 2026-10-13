@@ -221,14 +221,18 @@ def expand_candidates(
     Templates run in :data:`TEMPLATES` order and every grid point contributes its base
     expression plus, when ``smoothing``, one ``ts_mean(expr, k)`` variant per entry of
     :data:`SMOOTHING_WINDOWS`. Candidates are deduped by expression fingerprint (first
-    spelling wins) before truncation, so a truncated run is reproducible.
+    spelling wins) before truncation, so a truncated run is reproducible. An unknown
+    template id and a budget above :data:`MAX_BUDGET` both raise ``ValueError`` carrying a
+    stable ``factorMining.*`` key, so callers never translate a bare ``KeyError``.
     """
     if budget > MAX_BUDGET:
         raise ValueError("factorMining.budgetExceeded")
     seeds: list[CandidateSeed] = []
     seen: set[str] = set()
     for template_id in list(TEMPLATES) if template_ids is None else list(template_ids):
-        template = TEMPLATES[template_id]
+        template = TEMPLATES.get(template_id)
+        if template is None:
+            raise ValueError(f"factorMining.templateNotFound:{template_id}")
         for params in _grid_points(template.parameter_grid):
             base = template.build(params)
             variants = [base]
