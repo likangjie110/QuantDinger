@@ -5,16 +5,17 @@ dependency is ``FactorResearchEngine``, because the loop scores candidates throu
 
 Two properties of the shared fixture are load-bearing for what these tests can assert.
 
-Its ``members`` carry ``market``/``symbol`` but not the ``key`` that
-``StrategyV2BacktestService.resolve_candidates`` always injects, so
-``FactorResearchEngine._membership_panel`` cannot resolve them and would read every symbol as
-inactive. The loop therefore reports members it cannot build a universe mapping from as no
-membership at all, which is the documented "no membership restrictions" path.
+Its ``members`` carry the ``key`` handle that ``StrategyV2BacktestService.resolve_candidates``
+always injects, which is what lets ``FactorResearchEngine._membership_panel`` resolve them and
+run the point-in-time universe on every date. A member without one matches no symbol, reads as
+inactive, and leaves every candidate unscorable -- a shape only a test double can produce.
 
 Its prices are exact geometric curves with no idiosyncratic component, so every candidate
 ranks the six symbols the same way and correlates with the ``reversal_5`` built-in almost
 perfectly. The default redundancy bar rejects all twelve; only a permissive bar lets any of
-them reach the candidate list.
+them reach the candidate list. Several tests below therefore run with ``_PERMISSIVE`` and
+assert the candidate list is non-empty, because a run that rejects everything cannot show
+whether the search works.
 """
 
 from datetime import datetime
@@ -53,11 +54,16 @@ def _frames_and_members(periods=200):
     for offset, symbol in enumerate(["A", "B", "C", "D", "E", "F"]):
         drift = 0.002 * (offset + 1)
         close = [100 * (1 + drift) ** day for day in range(periods)]
-        frames[f"USStock:{symbol}"] = pd.DataFrame(
+        key = f"USStock:{symbol}"
+        frames[key] = pd.DataFrame(
             {"open": close, "high": [value * 1.001 for value in close],
              "low": [value * 0.999 for value in close], "close": close,
              "volume": [1000.0 + day * (offset + 1) for day in range(periods)]}, index=index)
-        members.append({"market": "USStock", "symbol": symbol, "effectiveFrom": None})
+        # ``key`` is the handle the real ``resolve_candidates`` always injects and the one
+        # ``_membership_panel`` matches on. Without it the panel reads every symbol as
+        # inactive, the cross-section is empty, and the point-in-time universe never runs.
+        members.append({"key": key, "market": "USStock", "symbol": symbol,
+                        "effectiveFrom": None})
     return frames, members
 
 
@@ -139,10 +145,38 @@ def _run_with_seeds(monkeypatch, seeds, **overrides):
 
 
 def test_search_records_one_trial_per_evaluated_candidate():
-    result, _ = _search()
+    """Run at the permissive bar, because the default one rejects all twelve on this fixture.
+
+    Every candidate here tracks ``reversal_5`` almost perfectly, so the default redundancy bar
+    rejects the whole run. That is a correct verdict on this data, but it would leave the
+    assertions below comparing nothing, hence ``_PERMISSIVE`` plus an explicit check that
+    something did clear the ladder.
+    """
+    result, _ = _search(thresholds=_PERMISSIVE)
     assert len(result["trials"]) == len({item["fingerprint"] for item in result["trials"]})
     assert len(result["trials"]) >= 1
     assert all(item["stage"] in {"L1", "L2", "L3", "L4", "L5"} for item in result["trials"])
+    # A run where every candidate dies before the ladder is scored proves nothing about the
+    # search, so at least one trial has to clear every gate with its metrics intact.
+    passed = [item for item in result["trials"] if item["verdict"] == "pass"]
+    assert passed, "no candidate cleared the ladder"
+    for key in ("rankIc", "icir", "averageTurnover"):
+        assert key in passed[0]["metrics"], key
+
+
+def test_the_gate_ladder_actually_runs_on_this_fixture():
+    """L4 must run on a real correlation measurement, and a candidate must clear it.
+
+    The loop reads the candidate's measured correlations out of the correlation study, so a
+    study that came back unreadable would leave L4 rejecting everything as unverifiable and
+    the search would never produce a candidate -- green, but proving nothing.
+    """
+    result, _ = _search(thresholds=_PERMISSIVE)
+    assert any(item["stage"] == "L4" for item in result["trials"]), \
+        "no trial reached the redundancy gate"
+    assert all(item["reason"] != "factorMining.reject.unverifiableRedundancy"
+               for item in result["trials"]), "L4 was handed no measurement at all"
+    assert result["candidates"], "no candidate cleared the ladder"
 
 
 def test_rejected_candidates_still_record_trials():
@@ -159,18 +193,21 @@ def test_a_frozen_tail_that_cannot_be_seen_cannot_change_the_search():
     """The search scores the search window, so the frozen tail cannot reach its metrics.
 
     Both runs use one config -- same range, same split, same search window -- and differ only
-    in the bars after ``split.search_end``. Identical trials mean the tail was neither scored
-    nor able to leak into scoring, which is what keeps the out-of-sample review honest.
+    in the bars after ``split.search_end``. Identical candidates and metrics mean the tail was
+    neither scored nor able to leak into scoring, which is what keeps the out-of-sample review
+    honest. Both candidate lists are asserted non-empty: comparing two empty lists would hold
+    no matter what the loop did.
     """
     first, _ = _search(thresholds=_PERMISSIVE)
     second, _ = _run(*_fixture("frozen-tail-mutated"), thresholds=_PERMISSIVE)
-    assert first["trials"], "the fixture must evaluate candidates"
-    assert [item["fingerprint"] for item in first["trials"]] == \
-           [item["fingerprint"] for item in second["trials"]]
-    assert [item["verdict"] for item in first["trials"]] == \
-           [item["verdict"] for item in second["trials"]]
-    assert [item["metrics"].get("rankIc") for item in first["trials"]] == \
-           [item["metrics"].get("rankIc") for item in second["trials"]]
+    assert first["trials"] and second["trials"], "the fixture must evaluate candidates"
+    assert first["candidates"] and second["candidates"], "no candidate survived to compare"
+    assert [item["fingerprint"] for item in first["candidates"]] == \
+           [item["fingerprint"] for item in second["candidates"]]
+    assert [item["metrics"]["rankIc"] for item in first["candidates"]] == \
+           [item["metrics"]["rankIc"] for item in second["candidates"]]
+    assert [item["metrics"]["averageTurnover"] for item in first["candidates"]] == \
+           [item["metrics"]["averageTurnover"] for item in second["candidates"]]
 
 
 def test_the_search_window_is_cut_from_the_panel_that_carries_warmup():
