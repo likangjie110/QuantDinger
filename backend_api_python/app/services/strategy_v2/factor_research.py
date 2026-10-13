@@ -58,7 +58,9 @@ class FactorResearchEngine:
         # caller's own name -- passing an empty string straight through would land on
         # ``momentum_20`` below and silently shrink the pool by exactly that factor.
         default_name = "expression" if factor_panel is not None else "momentum_20"
-        factor_name = str(factor_id or default_name).strip().lower()
+        factor_name = default_name if factor_panel is not None else (
+            str(factor_id or default_name).strip().lower()
+        )
         start = self._timestamp(start_date)
         end = self._timestamp(end_date)
         prepared = self._prepare_frames(frames, end)

@@ -36,6 +36,7 @@ from app.services.factor_mining.engine import (
 )
 from app.services.factor_mining.gates import GateThresholds
 from app.services.factor_mining.templates import expand_candidates
+from app.services.strategy_v2.factor_research import FactorResearchEngine
 
 
 class _FakeProvider:
@@ -280,9 +281,14 @@ def test_run_is_reproducible_trial_sequence_including_order():
     Comparing fingerprints as sets, or sorted, cannot see an ordering difference -- which is
     the half of determinism that matters, because the trial ledger's order is the expansion
     order the budget truncated. The final assertion fails if the sequence is ever a constant.
+
+    The second run goes through ``_run`` rather than ``_search``: ``_search`` is memoized, so
+    asking it twice hands back one and the same record and every equality below would hold for
+    free. The identity assertion keeps that trap from coming back.
     """
     first, _ = _search(seed=11)
-    second, _ = _search(seed=11)
+    second, _ = _run(*_fixture(), seed=11)
+    assert first is not second, "a memoized second run would compare a record with itself"
     first_trials = [(item["fingerprint"], item["stage"], item["verdict"], item["reason"])
                     for item in first["trials"]]
     second_trials = [(item["fingerprint"], item["stage"], item["verdict"], item["reason"])
@@ -292,8 +298,10 @@ def test_run_is_reproducible_trial_sequence_including_order():
 
 
 def test_run_is_reproducible_candidate_sequence_including_order():
+    """The candidate sequence, likewise over two records rather than one memoized record."""
     first, _ = _search(seed=11, thresholds=_NO_DEDUPLICATION)
-    second, _ = _search(seed=11, thresholds=_NO_DEDUPLICATION)
+    second, _ = _run(*_fixture(), seed=11, thresholds=_NO_DEDUPLICATION)
+    assert first is not second, "a memoized second run would compare a record with itself"
     first_candidates = [item["fingerprint"] for item in first["candidates"]]
     second_candidates = [item["fingerprint"] for item in second["candidates"]]
     assert first_candidates == second_candidates
@@ -413,29 +421,22 @@ def test_redundancy_gate_rejects_the_candidate_that_duplicates_a_builtin(monkeyp
     assert rejected["trials"][0]["stage"] == "L4"
     assert rejected["trials"][0]["reason"] == "factorMining.reject.duplicateBuiltin"
 
-    """L4 is reached and handed real correlations, and rejects a duplicate as one.
 
-    The fixture's candidates track the ``reversal_5`` built-in at a correlation of 1.0, so a
-    bar below that rejects them as duplicates. A gate handed no measurement at all reports
-    ``unverifiableRedundancy`` instead, which this pins apart -- a search that never actually
-    compared a candidate against the built-in pool would look identical otherwise.
+def test_an_injected_panel_is_never_studied_under_a_builtin_name():
+    """A caller's factor id must not become the label of an injected panel.
+
+    ``_factor_correlation`` de-duplicates its name list before building the matrix, so a panel
+    handed in under ``momentum_20`` merges with that built-in's row: the comparison silently
+    loses the built-in and the candidate is measured against a pool one factor smaller. The
+    engine therefore labels every injected panel neutrally, whatever id the caller passed. This
+    is the mining path's own invariant -- it passes an empty id -- stated where it can break.
     """
-    from app.services.factor_mining.templates import CandidateSeed
-
-    baseline, _ = _search(thresholds=_NO_DEDUPLICATION)
-    duplicate = baseline["candidates"][0]
-    assert duplicate, "the fixture must have a candidate to re-run the redundancy gate on"
-    seeds = [CandidateSeed(expression=duplicate["expression"],
-                           fingerprint=duplicate["fingerprint"],
-                           template_id=duplicate["template_id"], origin="template",
-                           params={"N": 1})]
-    result, _ = _run_with_seeds(monkeypatch, seeds, thresholds=GateThresholds(
-        min_ic_observations=5, min_abs_rank_ic=0.0, min_icir=0.0, min_fold_consistency=0.0,
-        max_turnover=1.0, min_coverage=0.0, max_builtin_correlation=0.5))
-    assert [item["verdict"] for item in result["trials"]] == ["reject"]
-    assert result["trials"][0]["stage"] == "L4"
-    assert result["trials"][0]["reason"] == "factorMining.reject.duplicateBuiltin"
-    assert result["candidates"] == []
+    frames, members = _fixture()
+    result = FactorResearchEngine().run(
+        frames=frames, factor_panel=_evaluator(frames, _MOMENTUM_5), factor_id="momentum_20",
+        start_date=datetime(2024, 1, 1), end_date=datetime(2024, 6, 28), members=members)
+    assert result["factorId"] not in FactorResearchEngine._CORRELATION_FACTORS
+    assert result["factorCorrelation"]["factors"][0] == result["factorId"]
 
 
 def test_members_without_a_key_are_reported_as_no_membership():
