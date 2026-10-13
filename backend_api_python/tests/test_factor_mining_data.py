@@ -6,6 +6,7 @@ universe from the compiled manifest.
 """
 
 from datetime import datetime
+import re
 
 import pandas as pd
 import pytest
@@ -46,11 +47,6 @@ class _FakeBacktestService:
         return frames, []
 
 
-class _FakeSnapshotStore:
-    def save(self, frame):
-        return {"snapshotId": "a" * 64, "snapshotFormat": "test"}
-
-
 def _config(**overrides):
     base = dict(market="USStock", timeframe="1d",
                 start_date=datetime(2024, 1, 1), end_date=datetime(2024, 12, 31),
@@ -60,7 +56,7 @@ def _config(**overrides):
 
 
 def _provider(service):
-    return MiningDataProvider(backtest_service=service, snapshot_store=_FakeSnapshotStore())
+    return MiningDataProvider(backtest_service=service)
 
 
 def test_split_periods_keeps_freeze_tail_disjoint_from_search():
@@ -77,7 +73,35 @@ def test_prepare_panel_uses_point_in_time_members():
     assert service.resolve_calls[0][0] == 5
     assert [item["symbol"] for item in panel.members] == ["AAPL", "MSFT", "NVDA"]
     assert set(panel.fields) >= {"open", "high", "low", "close", "volume"}
-    assert panel.snapshot_id == "a" * 64
+    assert re.fullmatch(r"[0-9a-f]{64}", panel.snapshot_id)
+
+
+def test_snapshot_id_tracks_the_data_of_every_symbol():
+    config = _config()
+    first = _provider(_FakeBacktestService()).prepare(user_id=1, code=_SOURCE, config=config)
+    again = _provider(_FakeBacktestService()).prepare(user_id=1, code=_SOURCE, config=config)
+    assert first.snapshot_id == again.snapshot_id
+
+    class _RevisedService(_FakeBacktestService):
+        def fetch_frames(self, candidates, frequency, start_date, end_date):
+            frames, skipped = super().fetch_frames(candidates, frequency, start_date, end_date)
+            frames["USStock:NVDA"] = frames["USStock:NVDA"] * 2.0
+            return frames, skipped
+
+    revised = _provider(_RevisedService()).prepare(user_id=1, code=_SOURCE, config=config)
+    assert revised.snapshot_id != first.snapshot_id
+
+
+def test_snapshot_id_survives_symbols_with_missing_bars():
+    class _GappyService(_FakeBacktestService):
+        def fetch_frames(self, candidates, frequency, start_date, end_date):
+            frames, skipped = super().fetch_frames(candidates, frequency, start_date, end_date)
+            frame = frames["USStock:AAPL"]
+            frame.iloc[0, frame.columns.get_loc("close")] = float("nan")
+            return frames, skipped
+
+    panel = _provider(_GappyService()).prepare(user_id=1, code=_SOURCE, config=_config())
+    assert re.fullmatch(r"[0-9a-f]{64}", panel.snapshot_id)
 
 
 def test_prepare_panel_fetches_only_the_search_window():

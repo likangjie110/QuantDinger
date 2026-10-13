@@ -22,6 +22,7 @@ mocks the network.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -38,7 +39,7 @@ from app.services.factor_mining.templates import DEFAULT_BUDGET, MAX_BUDGET
 from app.services.strategy_v2.contract import StrategyV2ContractError, compile_strategy_v2
 from app.services.strategy_v2.models import StrategyManifest
 from app.services.strategy_v2.service import StrategyV2BacktestService
-from app.services.strategy_v2.snapshot import MarketDataSnapshotStore
+from app.services.strategy_v2.snapshot import canonical_frame_bytes
 
 
 MINIMUM_SYMBOLS = 3
@@ -159,10 +160,8 @@ class MiningDataProvider:
         self,
         *,
         backtest_service: StrategyV2BacktestService | None = None,
-        snapshot_store: MarketDataSnapshotStore | None = None,
     ) -> None:
         self._backtest_service = backtest_service or StrategyV2BacktestService()
-        self._snapshot_store = snapshot_store or MarketDataSnapshotStore()
 
     def prepare(self, *, user_id: int, code: str, config: MiningConfig) -> PreparedPanel:
         """Fetch the point-in-time search panel for ``code``'s compiled universe.
@@ -188,15 +187,11 @@ class MiningDataProvider:
         )
         if not frames:
             raise ValueError("factorMining.noMarketData")
-        # shortcut: the snapshot store canonicalizes flat OHLCV frames, so a multi-symbol
-        # panel is versioned by its calendar, not its values; upgrade if the store gains a
-        # panel encoder.
-        snapshot = self._snapshot_store.save(pd.concat(frames, axis=1))
         return PreparedPanel(
             frames=frames,
             members=list(candidates),
             fields=_field_panels(frames),
-            snapshot_id=str(snapshot.get("snapshotId") or ""),
+            snapshot_id=_data_digest(frames),
             frequency=config.timeframe,
             warnings=[_skipped_warning(item) for item in skipped],
         )
@@ -265,3 +260,20 @@ def _field_panels(frames: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFrame]
 def _skipped_warning(item: Mapping[str, Any]) -> str:
     """One skipped symbol as a display string, so a dropped member is never silent."""
     return f"{item.get('symbol') or ''}: {item.get('reason') or ''}"
+
+
+def _data_digest(frames: Mapping[str, pd.DataFrame]) -> str:
+    """Content hash of the panel: every symbol's canonical OHLCV bytes, symbol names included.
+
+    Hashing per symbol is what makes this a fingerprint of the data. The shared canonical
+    encoder reads flat OHLCV columns only, so handing it a merged multi-symbol panel hashes the
+    calendar alone and reports two differently-priced runs as the same dataset. ``dropna`` is
+    required, not cosmetic: that encoder refuses NaN, and one symbol with a missing bar would
+    otherwise fail the run. Dropping rows stays deterministic, so the digest still moves when
+    the data does. v1 keeps this fingerprint only -- there is no replayable copy of the panel.
+    """
+    digest = hashlib.sha256()
+    for symbol in sorted(frames):
+        digest.update(symbol.encode("utf-8"))
+        digest.update(canonical_frame_bytes(frames[symbol].dropna()))
+    return digest.hexdigest()
