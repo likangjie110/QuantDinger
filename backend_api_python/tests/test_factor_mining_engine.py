@@ -55,6 +55,11 @@ class _FakeProvider:
     def prepare(self, *, user_id, code, config):
         return self.panel
 
+    def prepare_freeze(self, *, user_id, code, config):
+        # The real provider fetches the frozen tail on this call. The fake holds one panel and
+        # serves it for both, so a test that needs a disagreeing tail hands in different frames.
+        return self.panel
+
 
 def _frames_and_members(periods=200):
     """One frame per symbol plus the members a real ``resolve_candidates`` would return.

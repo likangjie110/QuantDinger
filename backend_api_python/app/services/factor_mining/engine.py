@@ -7,7 +7,9 @@ layer with its own time semantics. Second the split: the requested range is cut 
 window and a frozen tail, and the tail is never fetched by the search; the out-of-sample review
 asks for it separately, once. Third the loop: every expanded candidate is scored through
 ``FactorResearchEngine`` and walked down the graded gate ladder, and every one of them -- pass
-or reject -- leaves a trial behind.
+or reject -- leaves a trial behind. Fourth the review: the frozen tail is fetched once, scored
+by that same research engine over its own window, and judged by the sign and selection-bias
+gates, which are told the run's whole trial count because that count is what prices the search.
 
 Decisions that are invisible in the signatures. The fetch carries enough history *before* the
 search window for the candidates this run will actually evaluate -- the same template
@@ -54,7 +56,9 @@ from app.services.factor_mining.evaluator import ExpressionEvaluator
 from app.services.factor_mining.gates import (
     GateThresholds,
     GateVerdict,
+    net_return_series,
     screen_metrics,
+    screen_out_of_sample,
     screen_redundancy,
     screen_stability,
 )
@@ -196,8 +200,48 @@ class MiningDataProvider:
         Only the search window, with its warmup lookback, is requested. The frozen tail is the
         out-of-sample review's input and its single read happens there.
         """
-        manifest = _portfolio_manifest(code)
         split = split_periods(config)
+        return self._prepare_window(
+            user_id=user_id, code=code, config=config,
+            start_date=split.search_start, end_date=split.search_end,
+        )
+
+    def prepare_freeze(self, *, user_id: int, code: str, config: MiningConfig) -> PreparedPanel:
+        """Fetch the frozen tail's panel: the same path, the window the search never read.
+
+        The overlap check is structural, not conventional. ``split_periods`` already returns
+        disjoint windows, so this can only fire if the split changes meaning -- and a tail that
+        overlaps the search window is not a frozen tail. Every candidate would already have been
+        fitted to the very bars that are supposed to judge it, so refusing is the honest outcome:
+        a review that cannot falsify anything is worse than no review.
+        """
+        split = split_periods(config)
+        if split.freeze_start <= split.search_end:
+            raise ValueError("factorMining.searchFreezeOverlap")
+        return self._prepare_window(
+            user_id=user_id, code=code, config=config,
+            start_date=split.freeze_start, end_date=split.freeze_end,
+        )
+
+    def _prepare_window(
+        self,
+        *,
+        user_id: int,
+        code: str,
+        config: MiningConfig,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> PreparedPanel:
+        """One window's panel, through the one data path both callers share.
+
+        The window is the only thing that differs between the search panel and the frozen one.
+        The manifest, the as-of universe, the candidate-derived warmup, the range check and the
+        data fingerprint are applied identically -- and the universe is resolved over the whole
+        requested range rather than the window, so both panels carry the same members and the
+        same point-in-time membership. A second copy of this method would be a second time
+        semantics, and the frozen tail is the last place that may drift.
+        """
+        manifest = _portfolio_manifest(code)
         candidates, _universe_id = self._backtest_service.resolve_candidates(
             user_id=user_id,
             manifest=manifest,
@@ -207,14 +251,14 @@ class MiningDataProvider:
         if len(candidates) < MINIMUM_SYMBOLS:
             raise ValueError("factorMining.universeTooSmall")
         warmup_bars = _warmup_bars(config)
-        fetch_start = _warmup_start(config.timeframe, split.search_start, warmup_bars)
+        fetch_start = _warmup_start(config.timeframe, start_date, warmup_bars)
         # The same range check the factor-research entry runs before fetching, against the
-        # window this call actually loads: the freeze tail is task 8's separate request.
+        # window this call actually loads.
         _enforce_backtest_range(
             candidates=candidates,
             timeframe=config.timeframe,
-            start_date=split.search_start,
-            end_date=split.search_end,
+            start_date=start_date,
+            end_date=end_date,
             warmup_bars=warmup_bars,
             fetch_start=fetch_start,
         )
@@ -222,7 +266,7 @@ class MiningDataProvider:
             candidates,
             config.timeframe,
             fetch_start,
-            split.search_end,
+            end_date,
         )
         if not frames:
             raise ValueError("factorMining.noMarketData")
@@ -312,6 +356,37 @@ class FactorMiningEngine:
             "summary": self._summary(config, panel, trials, candidates),
         }
 
+    def review_frozen(
+        self,
+        *,
+        user_id: int,
+        code: str,
+        config: MiningConfig,
+        survivors: Sequence[Mapping[str, Any]],
+        trials_count: int,
+    ) -> list[dict[str, Any]]:
+        """Judge every survivor on the frozen tail: the one read of the out-of-sample segment.
+
+        The frozen panel is fetched here and nowhere else -- the search's own provider call stops
+        at the search end -- so no candidate can have been shaped by the bars that judge it.
+        ``trials_count`` is the run's *whole* ledger, rejected candidates included: it is the
+        deflated-Sharpe denominator, and pricing the search with the survivor count instead would
+        understate exactly the bias the correction exists for. Nothing is reviewed when nothing
+        survived, so a search that kept no candidate does not open the tail at all.
+        """
+        if not survivors:
+            return []
+        panel = self._data_provider.prepare_freeze(user_id=user_id, code=code, config=config)
+        split = split_periods(config)
+        # Same contract as the search: the provider owns the field panels, and the review reads
+        # them rather than rebuilding anything it was handed.
+        evaluator = ExpressionEvaluator(panel.fields)
+        members = _resolved_members(panel.members)
+        return [
+            self._review(survivor, evaluator, config, split, panel, members, trials_count)
+            for survivor in survivors
+        ]
+
     def _evaluate(
         self,
         expression: Mapping[str, Any],
@@ -353,6 +428,58 @@ class FactorMiningEngine:
                 return verdict, metrics
         return GateVerdict(passed=True, stage="L4", reason=""), metrics
 
+    def _review(
+        self,
+        survivor: Mapping[str, Any],
+        evaluator: ExpressionEvaluator,
+        config: MiningConfig,
+        split: PeriodSplit,
+        panel: PreparedPanel,
+        members: Sequence[Mapping[str, Any]],
+        trials_count: int,
+    ) -> dict[str, Any]:
+        """L5 on one survivor: the frozen metrics, then the sign and selection-bias gates.
+
+        The guard mirrors ``_evaluate``'s, and for the same reasons: the frozen panel is a second
+        evaluation of an expression that was only ever proven on the search window, and a
+        candidate that cannot be scored there is rejected rather than allowed to end the review.
+        ``outOfSample`` stays empty in that case -- there is no measurement to report -- and the
+        survivor's own fields are copied, not rewritten, so the caller's run record is never
+        edited behind its back. The frozen result is read through the same missing-key discipline
+        as the search segment: an absent IC series or long/short curve is an upstream bug, and it
+        surfaces as this candidate's invalid verdict instead of a silently weaker gate.
+        """
+        try:
+            normalize_expression(survivor["expression"])
+            candidate_panel = evaluator.evaluate(survivor["expression"])
+            out_of_sample = _metrics_payload(
+                self._research_window(
+                    config, panel, members, candidate_panel,
+                    split.freeze_start, split.freeze_end,
+                ),
+                config,
+            )
+            verdict = screen_out_of_sample(
+                is_metrics=survivor["metrics"],
+                oos_metrics=out_of_sample,
+                returns=net_return_series(out_of_sample["longShortCurve"]),
+                trials=trials_count,
+                thresholds=config.thresholds,
+            )
+        except Exception:
+            return {
+                **survivor,
+                "status": "rejected",
+                "reason": INVALID_EXPRESSION_REASON,
+                "outOfSample": {},
+            }
+        return {
+            **survivor,
+            "status": "frozen" if verdict.passed else "rejected",
+            "reason": verdict.reason,
+            "outOfSample": out_of_sample,
+        }
+
     def _research(
         self,
         config: MiningConfig,
@@ -361,21 +488,38 @@ class FactorMiningEngine:
         members: Sequence[Mapping[str, Any]],
         candidate_panel: pd.DataFrame,
     ) -> dict[str, Any]:
-        """Score the candidate panel over the search window only.
+        """Score the candidate panel over the search window."""
+        return self._research_window(
+            config, panel, members, candidate_panel, split.search_start, split.search_end,
+        )
 
-        ``panel.frames`` reach back before ``split.search_start`` by the warmup the candidates
-        need, and ``PreparedPanel`` carries no split of its own, so the window is passed on every
-        call. The research engine re-cuts the frames to it (``factor_research.py`` builds
-        ``research_index`` from ``start_date``/``end_date``); nothing here assumes the panel is
-        already the search segment, because the alternative is the warmup leaking into the
-        in-sample metrics and, on a mis-split panel, the frozen tail leaking into the search.
+    def _research_window(
+        self,
+        config: MiningConfig,
+        panel: PreparedPanel,
+        members: Sequence[Mapping[str, Any]],
+        candidate_panel: pd.DataFrame,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> dict[str, Any]:
+        """Score the candidate panel over one window of the panel's frames.
+
+        ``panel.frames`` reach back before the window by the warmup the candidates need, and
+        ``PreparedPanel`` carries no split of its own, so the window is passed on every call. The
+        research engine re-cuts the frames to it (``factor_research.py`` builds ``research_index``
+        from ``start_date``/``end_date``); nothing here assumes the panel is already one segment,
+        because the alternative is the warmup leaking into the in-sample metrics and, on a
+        mis-split panel, the frozen tail leaking into the search. The freeze review scores
+        through this same call rather than a second one, so both windows are cut and priced
+        identically -- the frozen tail is the one measurement that must not differ in kind from
+        the search that produced the candidate.
         """
         return FactorResearchEngine().run(
             frames=panel.frames,
             factor_panel=candidate_panel,
             factor_id="",
-            start_date=split.search_start,
-            end_date=split.search_end,
+            start_date=start_date,
+            end_date=end_date,
             groups=config.groups,
             holding_period=config.holding_period,
             commission=config.commission,
@@ -436,6 +580,9 @@ class FactorMiningEngine:
             "warnings": list(panel.warnings),
             "trials": len(trials),
             "candidates": len(candidates),
+            # Zero here, and only here: the search cannot know how many survivors hold up out of
+            # sample. The review runs after this record is persisted, so the caller that owns the
+            # run writes the count back from the statuses it gets from ``review_frozen``.
             "frozen": 0,
             "executionAssumptions": {
                 "commission": config.commission,
