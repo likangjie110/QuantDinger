@@ -1,4 +1,4 @@
-import zhCN from './zh-CN'
+import zhCN from '../i18n/zh-CN'
 
 const messages = {
   'zh-CN': zhCN
