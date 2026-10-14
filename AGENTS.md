@@ -14,6 +14,8 @@ This is the canonical instruction file for coding agents working in this reposit
 
 Read only the documentation relevant to the change:
 
+- When project-local skills are installed, read `.agents/README.md` for their trigger rules and client entrypoints. Skills supplement these repository instructions; they do not replace architecture, trading safety, or verification requirements. Load only the skills needed for the current task.
+
 - Agent Gateway or MCP: [Agent documentation](docs/agent/README.md), [Agent OpenAPI](docs/agent/agent-openapi.json), and [MCP package documentation](mcp_server/README.md).
 - Strategy API, backtests, or trading behavior: [Strategy development guide](docs/trading/STRATEGY_DEV_GUIDE.md) and [live-trading safety](docs/trading/LIVE_TRADING_SAFETY.md).
 - Runtime ownership, concurrency, Kafka, workers, or durable state: [architecture index](docs/architecture/README.md) and the task-specific document it links.
