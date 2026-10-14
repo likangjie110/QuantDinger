@@ -246,7 +246,7 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | `factorMining.jobNotFound` | 作业不存在、不属于该用户、或不是挖掘作业 |
 | `factorMining.candidateNotFound` | 候选不存在，或不属于该用户；id 无法解析为整数时同样 |
 | `factorMining.invalidQuery` | 查询参数不是合法整数 |
-| `factorMining.invalidParameter` | 整数类型的运行字段（`seed` / `groups` / `holdingPeriod`）无法按整数读取 |
+| `factorMining.invalidParameter` | 运行字段无法按其计价类型读取：整数字段（`seed` / `groups` / `holdingPeriod`）不是整数、`commission` / `slippage` 不是数值，或 `timeframe` 不在支持的形状内（`<数字><m\|h\|d\|w>`） |
 | `factorMining.thresholdsInvalid` | `thresholds` 不是对象，或某个门槛无法按字段自身类型读取（`min_ic_observations` 给了小数、给了布尔值、给了非有限数值） |
 | `factorMining.sourceRequired` | 缺少 `sourceId` 或不是正整数 |
 | `factorMining.sourceNotFound` | `sourceId` 指向的脚本源不存在或不属于该用户 |

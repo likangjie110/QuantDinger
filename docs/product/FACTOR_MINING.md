@@ -372,7 +372,7 @@ backend can emit; the backend emits keys only and never renders copy.
 | `factorMining.jobNotFound` | The job does not exist, is not the caller's, or is not a mining job |
 | `factorMining.candidateNotFound` | The candidate does not exist or is not the caller's; also when the id is not an integer |
 | `factorMining.invalidQuery` | A query parameter is not a readable integer |
-| `factorMining.invalidParameter` | An integer run field (`seed` / `groups` / `holdingPeriod`) is not readable as an integer |
+| `factorMining.invalidParameter` | A run field cannot be read as the type it is priced with: an integer field (`seed` / `groups` / `holdingPeriod`) that is not an integer, a `commission` / `slippage` that is not a number, or a `timeframe` outside the supported shape (`<digits><m\|h\|d\|w>`) |
 | `factorMining.thresholdsInvalid` | `thresholds` is not an object, or a threshold cannot be read as its own field's type (a fractional `min_ic_observations`, a boolean, a non-finite value) |
 | `factorMining.sourceRequired` | `sourceId` is missing or not a positive integer |
 | `factorMining.sourceNotFound` | The `sourceId` script source does not exist or is not the caller's |

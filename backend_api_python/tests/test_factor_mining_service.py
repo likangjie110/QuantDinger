@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.services.factor_mining import service as mining_service
-from app.services.factor_mining.engine import DEFAULT_SEED, MiningDataProvider
+from app.services.factor_mining.engine import DEFAULT_SEED, MiningConfig, MiningDataProvider
 from app.services.factor_mining.service import FactorMiningService
 from app.services.factor_mining.templates import DEFAULT_BUDGET, expand_candidates
 from app.tasks import agent_jobs as celery_agent_jobs
@@ -505,6 +505,29 @@ def test_an_unreadable_source_id_is_not_a_positive_int():
     """
     with pytest.raises(ValueError, match="factorMining.sourceRequired"):
         FactorMiningService().estimate(_payload(sourceId=float("inf")))
+
+
+@pytest.mark.parametrize("timeframe", ["1e400m", "1" + "0" * 309 + "m", "abc", "1d2"],
+                         ids=["exponent", "huge-int", "word", "extra-digit"])
+def test_a_timeframe_the_readers_cannot_price_is_refused_by_key(timeframe):
+    """Two shared readers turn this field into numbers, and neither can price every string.
+
+    ``periods_per_year`` reads the digits with a bare ``int()`` and
+    ``backtest_warmup_calendar_days`` multiplies them, so ``"1e400m"`` (six characters) raises --
+    per candidate, inside the candidate guard -- and the run is recorded as a *success* whose
+    every trial blames the DSL. Refusing the shape at the boundary keeps the blame on the request.
+    """
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        FactorMiningService().estimate(_payload(timeframe=timeframe))
+
+
+@pytest.mark.parametrize("timeframe,expected", [("60m", "1H"), ("4h", "4H"), ("1week", "1W"),
+                                                ("d", "1D"), ("15m", "15m"), ("1D", "1D")])
+def test_the_timeframe_contract_keeps_the_existing_alias_behaviour(timeframe, expected):
+    """A shape bound must not quietly rewrite what callers already send."""
+    config = MiningConfig.from_payload({**_payload(timeframe=timeframe)},
+                                       default_commission=0.0005, default_slippage=0.0005)
+    assert config.timeframe == expected
 
 
 @pytest.mark.parametrize("field,key", [("freezeRatio", "factorMining.freezeRatioInvalid"),

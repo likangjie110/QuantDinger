@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 import statistics
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
@@ -124,7 +125,7 @@ class MiningConfig:
             raise ValueError("factorMining.budgetExceeded")
         return cls(
             market=str(payload.get("market") or ""),
-            timeframe=normalize_chart_timeframe(str(payload.get("timeframe") or "1D")),
+            timeframe=_timeframe(payload.get("timeframe"), "1D"),
             start_date=_payload_datetime(payload.get("startDate")),
             end_date=_payload_datetime(payload.get("endDate")).replace(
                 hour=23, minute=59, second=59,
@@ -731,6 +732,25 @@ def _fold_ic_signs(ic_series: Any) -> list[float]:
         signs.append(float((mean > 0) - (mean < 0)))
     return signs
 
+
+
+_TIMEFRAME_SHAPE = re.compile(r"^\d{1,6}[mhdw]$")
+
+
+def _timeframe(value: Any, default: str) -> str:
+    """Normalise the chart timeframe and refuse one the shared readers cannot price.
+
+    ``frequencies.periods_per_year`` parses the digits with a bare ``int()`` and
+    ``backtest_limits.backtest_warmup_calendar_days`` multiplies them, so an unconstrained
+    value like ``"1e400m"`` (six characters) raises inside one of those helpers -- and because
+    the raise happens per candidate, inside the candidate guard, the run is recorded as a
+    *success* whose every trial blames the DSL. Bounding the shape here keeps both readers
+    total and keeps the blame where it belongs: on the request.
+    """
+    normalized = normalize_chart_timeframe(str(value or default).strip() or default)
+    if not _TIMEFRAME_SHAPE.match(normalized.lower()):
+        raise ValueError("factorMining.invalidParameter")
+    return normalized
 
 
 def _rate(value: Any, default: float) -> float:
