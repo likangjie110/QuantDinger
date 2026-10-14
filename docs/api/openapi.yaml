@@ -669,6 +669,8 @@ tags:
   description: Point-in-time strategy universes (Internal)
 - name: Factor
   description: Versioned factor catalog and research diagnostics (Internal)
+- name: FactorMining
+  description: Automated factor mining runs and candidate library (Internal)
 - name: Indicator
   description: Indicator IDE workspace (Public)
 - name: Backtest
@@ -3032,6 +3034,216 @@ paths:
       schema:
         type: integer
         minimum: 0
+  /api/factor-mining/catalog:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: Get Api Factor Mining Catalog
+      tags:
+      - FactorMining
+      operationId: getApiFactorMiningCatalog
+      description: 'The DSL''s own vocabulary: searchable fields, operators, and hypothesis
+        templates.'
+      x-visibility: internal
+  /api/factor-mining/estimate:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: 'Price a search before submitting it: no source read, no panel, no
+        job.'
+      tags:
+      - FactorMining
+      operationId: postApiFactorMiningEstimate
+      x-visibility: internal
+  /api/factor-mining/run:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: 'Queue one mining run. 202: the receipt is the job, not its result.'
+      tags:
+      - FactorMining
+      operationId: postApiFactorMiningRun
+      x-visibility: internal
+  /api/factor-mining/jobs:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: Get Api Factor Mining Jobs
+      tags:
+      - FactorMining
+      operationId: getApiFactorMiningJobs
+      description: The caller's mining jobs, newest first, each with the progress
+        its summary lacks.
+      x-visibility: internal
+  /api/factor-mining/jobs/{job_id}:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: Get Api Factor Mining Jobs Job Id
+      tags:
+      - FactorMining
+      operationId: getApiFactorMiningJobsJobId
+      description: One job of the caller's. Another tenant's and another feature's
+        are both not found.
+      parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      x-visibility: internal
+    parameters:
+    - in: path
+      name: job_id
+      required: true
+      schema:
+        type: string
+        minLength: 1
+  /api/factor-mining/jobs/{job_id}/cancel:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: Stop one of the caller's jobs; the runner halts at its next progress
+        report.
+      tags:
+      - FactorMining
+      operationId: postApiFactorMiningJobsJobIdCancel
+      parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      x-visibility: internal
+    parameters:
+    - in: path
+      name: job_id
+      required: true
+      schema:
+        type: string
+        minLength: 1
+  /api/factor-mining/candidates:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: Get Api Factor Mining Candidates
+      tags:
+      - FactorMining
+      operationId: getApiFactorMiningCandidates
+      description: The caller's candidate library. Filters and the page window are
+        the repository's own.
+      x-visibility: internal
+  /api/factor-mining/candidates/{candidate_id}:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: One candidate with the metrics and out-of-sample block a list row leaves
+        behind.
+      tags:
+      - FactorMining
+      operationId: getApiFactorMiningCandidatesCandidateId
+      parameters:
+      - name: candidate_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      x-visibility: internal
+    parameters:
+    - in: path
+      name: candidate_id
+      required: true
+      schema:
+        type: string
+        minLength: 1
   /api/market-modules/:
     get:
       responses:

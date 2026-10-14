@@ -43,10 +43,24 @@ class FactorResearchEngine:
         neutralize_industry: bool = False,
         members: Sequence[Mapping[str, Any]] | None = None,
         annualization_periods: float = 252.0,
+        factor_panel: pd.DataFrame | None = None,
     ) -> dict[str, Any]:
+        """Run one factor's cross-sectional research. ``factor_panel`` overrides the built-in
+        factor named by ``factor_id``, which factor mining uses to score a DSL expression --
+        a candidate that is not one of the built-ins has no id, so ``factor_id`` may be empty
+        there. Every other branch is unchanged."""
         requested_groups = max(2, min(10, int(groups or 5)))
         holding_period = max(1, int(holding_period or 5))
-        factor_name = str(factor_id or "momentum_20").strip().lower()
+        # A caller that injects its own panel studies that panel, not a built-in. The name it
+        # studies under must never equal a built-in's: the correlation study de-duplicates its
+        # name list, so a candidate named after a built-in would merge with that built-in's row
+        # and drop it from the comparison entirely. Hence the neutral "expression" and not the
+        # caller's own name -- passing an empty string straight through would land on
+        # ``momentum_20`` below and silently shrink the pool by exactly that factor.
+        default_name = "expression" if factor_panel is not None else "momentum_20"
+        factor_name = default_name if factor_panel is not None else (
+            str(factor_id or default_name).strip().lower()
+        )
         start = self._timestamp(start_date)
         end = self._timestamp(end_date)
         prepared = self._prepare_frames(frames, end)
@@ -61,7 +75,7 @@ class FactorResearchEngine:
         if not research_dates:
             raise ValueError("strategyV2.factorResearchInsufficientObservations")
 
-        factor = self._factor_panel(prepared, factor_name, close)
+        factor = factor_panel if factor_panel is not None else self._factor_panel(prepared, factor_name, close)
         entry = open_price.shift(-1)
         exit_price = open_price.shift(-(holding_period + 1))
         forward_return = exit_price / entry - 1.0
@@ -260,6 +274,7 @@ class FactorResearchEngine:
                 membership,
                 research_dates,
                 factor_name,
+                selected_panel=factor_panel,
             ),
             "stability": {
                 "firstHalfIc": float(first_half.mean()) if not first_half.empty else 0.0,
@@ -443,11 +458,22 @@ class FactorResearchEngine:
         membership: pd.DataFrame,
         research_dates: Sequence[pd.Timestamp],
         selected_factor: str,
+        selected_panel: pd.DataFrame | None = None,
     ) -> dict[str, Any]:
+        """Correlate the studied factor against the built-in pool, one cross-section at a time.
+
+        ``selected_panel`` is the studied factor's own values, for a caller whose factor is not
+        a built-in: without it the selected name is looked up as a built-in like any other, and
+        a caller that injected its own panel would silently get the built-in's correlations --
+        a matrix that is identical for every candidate, which de-duplicates nothing.
+        """
         names = list(dict.fromkeys((selected_factor, *self._CORRELATION_FACTORS)))
         panels: dict[str, pd.DataFrame] = {}
         for name in names:
-            panel = self._factor_panel(frames, name, close)
+            if selected_panel is not None and name == selected_factor:
+                panel = selected_panel
+            else:
+                panel = self._factor_panel(frames, name, close)
             visible = panel.reindex(index=research_dates)
             if int(visible.notna().sum().sum()) >= 3:
                 panels[name] = panel

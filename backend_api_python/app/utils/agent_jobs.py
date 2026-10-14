@@ -547,28 +547,33 @@ def list_jobs(
     return rows or []
 
 
-def count_active_jobs(*, user_id: int, agent_token_id: Optional[int] = None) -> int:
+def count_active_jobs(*, user_id: int, agent_token_id: Optional[int] = None,
+                      kind: Optional[str] = None) -> int:
+    """Count the caller's queued/running jobs.
+
+    ``kind=None`` counts every kind, which is the tenant-wide cap the Agent Gateway
+    enforces. A caller passing ``kind`` gets that feature's own slots instead: a
+    concurrency limit that fires because an unrelated feature is busy, or that a ghost
+    from another feature can hold forever, is not a limit on this caller.
+    """
+    conditions = ["user_id = %s", "status IN ('queued', 'running')"]
+    parameters: list[Any] = [int(user_id)]
+    if agent_token_id is not None:
+        conditions.append("agent_token_id = %s")
+        parameters.append(int(agent_token_id))
+    if kind is not None:
+        conditions.append("kind = %s")
+        parameters.append(str(kind))
     with get_db_connection() as db:
         cur = db.cursor()
-        if agent_token_id is None:
-            cur.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM qd_agent_jobs
-                WHERE user_id = %s AND status IN ('queued', 'running')
-                """,
-                (int(user_id),),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM qd_agent_jobs
-                WHERE user_id = %s AND agent_token_id = %s
-                  AND status IN ('queued', 'running')
-                """,
-                (int(user_id), int(agent_token_id)),
-            )
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM qd_agent_jobs
+            WHERE {' AND '.join(conditions)}
+            """,
+            tuple(parameters),
+        )
         row = cur.fetchone() or {}
         cur.close()
     return int(row.get("count") or 0)

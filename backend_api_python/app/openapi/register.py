@@ -23,6 +23,7 @@ _PREFIX_TAGS: list[tuple[str, str]] = [
     ("/api/market", "Market"),
     ("/api/universes", "Universe"),
     ("/api/factors", "Factor"),
+    ("/api/factor-mining", "FactorMining"),
     ("/api/market-modules", "Market"),
     ("/api/ai", "AIChat"),
     ("/api/account", "Account"),
@@ -66,6 +67,7 @@ def register_human_blueprints(api: Api) -> None:
     from app.routes.market import market_blp
     from app.routes.universe import universe_blp
     from app.routes.factors import factors_blp
+    from app.routes.factor_mining import factor_mining_blp
     import app.routes.fundamental_sync  # noqa: F401
     from app.routes.market_modules import market_modules_blp
     from app.routes.ai_chat import ai_chat_blp
@@ -96,6 +98,7 @@ def register_human_blueprints(api: Api) -> None:
         (market_blp, "/api/market"),
         (universe_blp, "/api/universes"),
         (factors_blp, "/api/factors"),
+        (factor_mining_blp, "/api/factor-mining"),
         (market_modules_blp, "/api/market-modules"),
         (ai_chat_blp, "/api/ai"),
         (indicator_blp, "/api/indicator"),

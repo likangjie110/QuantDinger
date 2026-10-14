@@ -1,0 +1,801 @@
+"""Search loop tests for factor mining.
+
+Every data source is faked: no network call and no database runs here. The one real
+dependency is ``FactorResearchEngine``, because the loop scores candidates through it.
+
+Two properties of the shared fixture are load-bearing for what these tests can assert.
+
+Its ``members`` carry the ``key`` handle that ``StrategyV2BacktestService.resolve_candidates``
+always injects, which is what lets ``FactorResearchEngine._membership_panel`` resolve them and
+run the point-in-time universe on every date. A member without one matches no symbol, reads as
+inactive, and leaves every candidate unscorable -- a shape only a test double can produce.
+
+Its prices are exact geometric curves with no idiosyncratic component, so every candidate
+ranks the six symbols the same way and correlates with the ``reversal_5`` built-in almost
+perfectly. The default redundancy bar rejects all twelve; only a permissive bar lets any of
+them reach the candidate list. Several tests below therefore run with ``_NO_DEDUPLICATION`` and
+assert the candidate list is non-empty, because a run that rejects everything cannot show
+whether the search works.
+"""
+
+from contextlib import contextmanager
+from datetime import datetime
+
+import pandas as pd
+import pytest
+
+from app.services.factor_mining import engine as engine_module
+from app.services.factor_mining.engine import (
+    FactorMiningEngine,
+    MiningConfig,
+    PreparedPanel,
+    _field_panels,
+    _fold_ic_signs,
+    _metrics_payload,
+    _resolved_members,
+    split_periods,
+)
+from app.services.factor_mining.gates import GateThresholds
+from app.services.factor_mining.templates import expand_candidates
+from app.services.strategy_v2.factor_research import FactorResearchEngine
+
+
+class _FakeProvider:
+    """A stand-in for ``MiningDataProvider`` that shapes its panel the way the real one does.
+
+    ``fields`` is built by the same ``_field_panels`` the provider uses rather than left empty:
+    the fake stands in for the provider, so a field mapping it never filled would hide a real
+    provider bug behind a candidate panel of nothing.
+    """
+
+    def __init__(self, frames, members):
+        self.panel = PreparedPanel(frames=frames, members=members, fields=_field_panels(frames),
+                                   snapshot_id="b" * 64, frequency="1d", warnings=[])
+
+    def prepare(self, *, user_id, code, config):
+        return self.panel
+
+    def prepare_freeze(self, *, user_id, code, config):
+        # The real provider fetches the frozen tail on this call. The fake holds one panel and
+        # serves it for both, so a test that needs a disagreeing tail hands in different frames.
+        return self.panel
+
+
+def _frames_and_members(periods=200):
+    """One frame per symbol plus the members a real ``resolve_candidates`` would return.
+
+    ``key`` is the handle ``_membership_panel`` matches on. ``membership_periods`` is the
+    point-in-time part: ``USStock:F`` only joins the universe from May, so a search that
+    really applies the membership panel sees a five-symbol cross-section before that and a
+    six-symbol one after. Without periods every member is active on every date and the
+    universe filter is never exercised.
+    """
+    index = pd.date_range("2024-01-01", periods=periods, freq="B")
+    frames, members = {}, []
+    for offset, symbol in enumerate(["A", "B", "C", "D", "E", "F"]):
+        drift = 0.002 * (offset + 1)
+        close = [100 * (1 + drift) ** day for day in range(periods)]
+        key = f"USStock:{symbol}"
+        frames[key] = pd.DataFrame(
+            {"open": close, "high": [value * 1.001 for value in close],
+             "low": [value * 0.999 for value in close], "close": close,
+             "volume": [1000.0 + day * (offset + 1) for day in range(periods)]}, index=index)
+        member = {"key": key, "market": "USStock", "symbol": symbol, "effectiveFrom": None}
+        if symbol == "F":
+            member["membership_periods"] = [
+                {"valid_from": datetime(2024, 5, 1), "valid_to": None},
+            ]
+        members.append(member)
+    return frames, members
+
+
+def _config(**overrides):
+    base = dict(market="USStock", timeframe="1d",
+                start_date=datetime(2024, 1, 1), end_date=datetime(2024, 10, 31), source_id=1,
+                budget=12, seed=3,
+                thresholds=GateThresholds(min_ic_observations=5, min_abs_rank_ic=0.0, min_icir=0.0,
+                                          min_fold_consistency=0.0, max_turnover=1.0,
+                                          min_coverage=0.0, min_oos_abs_rank_ic=0.0,
+                                          min_deflated_sharpe_probability=0.0))
+    base.update(overrides)
+    return MiningConfig(**base)
+
+
+# The fixture ranks the symbols identically for every candidate, so L4 is the gate that
+# decides this fixture's runs. A bar of 1.1 is above every possible correlation, so the
+# de-duplication gate can never fire and the run has a genuine end-to-end pass path; every
+# other gate is turned off for the same reason.
+_NO_DEDUPLICATION = GateThresholds(min_ic_observations=5, min_abs_rank_ic=0.0, min_icir=0.0,
+                                   min_fold_consistency=0.0, max_turnover=1.0, min_coverage=0.0,
+                                   max_builtin_correlation=1.1)
+
+
+def _run(frames, members, **overrides):
+    seen: list[dict] = []
+    engine = FactorMiningEngine(data_provider=_FakeProvider(frames, members), on_progress=seen.append)
+    result = engine.run(user_id=1, code="PORTFOLIO = {}", config=_config(**overrides))
+    return result, seen
+
+
+# A search over this fixture costs seconds, and most tests below assert on one of a handful
+# of them. Caching by object identity is safe because nothing in this module writes to the
+# frames it hands in or to a result it gets back.
+_FRAMES_CACHE: dict[tuple, tuple] = {}
+_SEARCH_CACHE: dict[tuple, tuple] = {}
+
+
+def _fixture(name="plain"):
+    """The fixture frames and members, memoized so runs over them stay cacheable."""
+    if name not in _FRAMES_CACHE:
+        frames, members = _frames_and_members()
+        if name == "frozen-tail-mutated":
+            for frame in frames.values():
+                frame.iloc[-40:] = frame.iloc[-40:] * 3.0
+        _FRAMES_CACHE[name] = (frames, members)
+    return _FRAMES_CACHE[name]
+
+
+def _search(**overrides):
+    """``_run`` over the plain fixture, memoized on the config overrides.
+
+    A run is memoized only while the real template expansion is in place. A test that patches
+    ``expand_candidates`` and calls this would otherwise store its result under the key the
+    template search owns, and every later test asking for that key -- in a subset run, where
+    nothing repopulated it first -- would read that run instead of a template search.
+    """
+    key = tuple(sorted((name, repr(value)) for name, value in overrides.items()))
+    if engine_module.expand_candidates is not expand_candidates:
+        return _run(*_fixture(), **overrides)
+    if key not in _SEARCH_CACHE:
+        _SEARCH_CACHE[key] = _run(*_fixture(), **overrides)
+    return _SEARCH_CACHE[key]
+
+
+def _seeds(count):
+    """``count`` distinct candidates over one expression, each with its own fingerprint.
+
+    Distinct params are what separate the fingerprints: the DSL folds ``params`` into the
+    canonical spelling, and the dedup key is the canonical form of the whole node.
+    """
+    from app.services.factor_mining.dsl import normalize_expression
+    from app.services.factor_mining.templates import CandidateSeed
+
+    seeds = []
+    for index in range(count):
+        expression = {"op": "ts_pct_change", "args": ["close"], "params": {"n": 3, "N": index}}
+        seeds.append(CandidateSeed(expression=expression,
+                                   fingerprint=normalize_expression(expression).fingerprint,
+                                   template_id="momentum", origin="template",
+                                   params={"N": index}))
+    return seeds
+
+
+@contextmanager
+def _patched_expansion(monkeypatch, seeds):
+    """Expand ``seeds`` instead of the templates for the duration of the block.
+
+    Entries the block added are dropped on the way out -- in ``finally``, so an aborted block
+    cannot leave one behind either. Only those entries go, never the whole memo: the cross-test
+    reuse is what keeps this suite's runtime down, and a template search memoized by an earlier
+    test is still valid. ``_search`` already refuses to memoize a run made under a patch, so with
+    that check in place this drops nothing; it is the second lock on the same door, and it is
+    what keeps the memo honest if that check is ever changed.
+    """
+    monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: seeds)
+    memoized = set(_SEARCH_CACHE)
+    try:
+        yield
+    finally:
+        for key in set(_SEARCH_CACHE) - memoized:
+            del _SEARCH_CACHE[key]
+
+
+def _run_with_seeds(monkeypatch, seeds, **overrides):
+    with _patched_expansion(monkeypatch, seeds):
+        return _run(*_fixture(), **overrides)
+
+
+def test_search_records_one_trial_per_evaluated_candidate():
+    result, _ = _search()
+    assert len(result["trials"]) == len({item["fingerprint"] for item in result["trials"]})
+    assert len(result["trials"]) >= 1
+    assert all(item["stage"] in {"L1", "L2", "L3", "L4", "L5"} for item in result["trials"])
+
+
+def test_a_ledger_row_keeps_only_the_metrics_a_gate_reads():
+    """The trial ledger is a run's size bound: one row per evaluation, so no row carries a curve.
+
+    ``icSeries`` is kept as its length under ``icObservations`` -- L2 counts the observations and
+    never reads their values, while the series itself is what makes one row 0.36 MB at 40 symbols.
+    The candidate keeps the whole measurement, and that is where the detail view reads it.
+    """
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
+    assert result["trials"] and result["candidates"]
+    heaviest = {"icSeries", "groupCurves", "longShortCurve", "groupObservations",
+                "factorCorrelation"}
+    for item in result["trials"]:
+        assert not (set(item["metrics"]) & heaviest), "a ledger row dragged a curve along"
+    for item in result["candidates"]:
+        assert heaviest <= set(item["metrics"]), "the candidate lost the measurement"
+    # The count a ledger row keeps is the length of the series the candidate holds.
+    series_length = {item["fingerprint"]: len(item["metrics"]["icSeries"])
+                     for item in result["candidates"]}
+    assert series_length, "no candidate to compare against"
+    for item in result["trials"]:
+        if item["fingerprint"] in series_length:
+            assert item["metrics"]["icObservations"] == series_length[item["fingerprint"]]
+
+
+def test_the_pipeline_runs_past_the_observation_gate_on_real_correlations():
+    """L3 is reached, and L4 rejects the fixture's candidates as duplicates, not as unverifiable.
+
+    Together those say the run really walked the ladder on a measurement. A run that stalled at
+    L2 would mean the cross-section never resolved; a run whose L4 rejected everything as
+    ``unverifiableRedundancy`` would mean the correlation study came back unreadable and the
+    de-duplication check never actually compared anything.
+    """
+    result, _ = _search()
+    assert any(item["stage"] == "L3" for item in result["trials"]), \
+        "every candidate stopped at or before the observation gate"
+    l4 = [item for item in result["trials"] if item["stage"] == "L4"]
+    assert l4, "no trial reached the redundancy gate"
+    assert {item["reason"] for item in l4} == {"factorMining.reject.duplicateBuiltin"}
+
+
+def test_a_run_with_no_deduplication_produces_candidates():
+    """The end-to-end pass path, with the de-duplication gate unable to fire at all.
+
+    This is the only configuration in which this fixture can produce a survivor: every
+    candidate here tracks ``reversal_5`` almost perfectly, so the default bar rejects all
+    twelve as duplicates -- a correct verdict, but one that would leave the search's pass path
+    untested.
+    """
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
+    assert result["candidates"], "no candidate cleared the ladder"
+    assert any(item["verdict"] == "pass" for item in result["trials"])
+    for key in ("rankIc", "icir", "averageTurnover", "foldIcSigns"):
+        assert key in result["candidates"][0]["metrics"], key
+
+
+def test_rejected_candidates_still_record_trials():
+    frames, members = _fixture()
+    engine = FactorMiningEngine(data_provider=_FakeProvider(frames, members))
+    result = engine.run(user_id=1, code="PORTFOLIO = {}",
+                        config=_config(thresholds=GateThresholds(min_abs_rank_ic=0.99)))
+    assert result["candidates"] == []
+    assert result["trials"] and all(item["verdict"] == "reject" for item in result["trials"])
+    assert result["trials"][0]["reason"].startswith("factorMining.reject.")
+
+
+def test_a_frozen_tail_that_cannot_be_seen_cannot_change_the_search():
+    """The search scores the search window, so the frozen tail cannot reach its metrics.
+
+    Both runs use one config -- same range, same split, same search window -- and differ only
+    in the bars after ``split.search_end``. Identical candidates and metrics mean the tail was
+    neither scored nor able to leak into scoring, which is what keeps the out-of-sample review
+    honest. Both candidate lists are asserted non-empty: comparing two empty lists would hold
+    no matter what the loop did.
+    """
+    first, _ = _search(thresholds=_NO_DEDUPLICATION)
+    second, _ = _run(*_fixture("frozen-tail-mutated"), thresholds=_NO_DEDUPLICATION)
+    assert first["trials"] and second["trials"], "the fixture must evaluate candidates"
+    assert first["candidates"] and second["candidates"], "no candidate survived to compare"
+    assert [item["fingerprint"] for item in first["candidates"]] == \
+           [item["fingerprint"] for item in second["candidates"]]
+    assert [item["metrics"]["rankIc"] for item in first["candidates"]] == \
+           [item["metrics"]["rankIc"] for item in second["candidates"]]
+    assert [item["metrics"]["averageTurnover"] for item in first["candidates"]] == \
+           [item["metrics"]["averageTurnover"] for item in second["candidates"]]
+
+
+def test_the_search_window_is_cut_from_the_panel_that_carries_warmup():
+    """A candidate is scored over the search window, not over the fetched warmup too.
+
+    ``PreparedPanel`` carries no split of its own and its frames start before the search
+    window, so the loop hands ``split_periods`` to the research engine on every call. Running
+    the research directly over that window must reproduce the trial's metrics exactly.
+    """
+    frames, members = _fixture()
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
+    trial = result["candidates"][0]
+    config = _config(thresholds=_NO_DEDUPLICATION)
+    panel = PreparedPanel(frames=frames, members=members, fields={}, snapshot_id="b" * 64,
+                          frequency="1d", warnings=[])
+    candidate_panel = _evaluator(frames, trial["expression"])
+    direct = _metrics_payload(
+        FactorMiningEngine(data_provider=_FakeProvider(frames, members))._research(
+            config, split_periods(config), panel, _resolved_members(members), candidate_panel),
+        config,
+    )
+    assert direct == trial["metrics"]
+    # The window really is narrower than the fetched panel: the warmup is not scored.
+    assert len(frames["USStock:A"]) > len(direct["icSeries"]) * config.holding_period
+
+
+def _evaluator(frames, expression):
+    from app.services.factor_mining.evaluator import ExpressionEvaluator
+
+    return ExpressionEvaluator(_field_panels(frames)).evaluate(expression)
+
+
+def test_metrics_carry_execution_assumptions():
+    result, _ = _search(commission=0.001, slippage=0.002)
+    assert result["summary"]["executionAssumptions"]["commission"] == 0.001
+    assert result["summary"]["executionAssumptions"]["slippage"] == 0.002
+
+
+def test_trials_repeat_the_costs_the_run_passed_in():
+    """The ledger's own execution assumptions, not the research engine's defaults."""
+    result, _ = _search(commission=0.001, slippage=0.002)
+    assert result["trials"]
+    for item in result["trials"]:
+        assert item["metrics"]["executionAssumptions"]["commission"] == 0.001
+        assert item["metrics"]["executionAssumptions"]["slippage"] == 0.002
+
+
+def test_trials_declare_the_measurement_they_are_reading():
+    """The engine's own execution assumptions have to survive into the ledger row.
+
+    They are spread under this run's costs rather than replaced by them, and they are the only
+    place a stored trial says what its numbers mean -- which point-in-time price the signal is
+    read from, which bar the trade is entered on, and which bar it exits on. A payload that
+    carried the costs alone would still pass every other assertion in this suite.
+    """
+    result, _ = _search()
+    assert result["trials"]
+    assumptions = result["trials"][0]["metrics"]["executionAssumptions"]
+    assert assumptions["signal"] == "close_point_in_time"
+    assert assumptions["entry"] == "next_bar_open"
+    assert assumptions["exit"] == "open_after_5_bars"
+    assert assumptions["commission"] == 0.0005
+    assert assumptions["slippage"] == 0.0005
+
+
+def test_run_is_reproducible_trial_sequence_including_order():
+    """Two independent expansions produce the same trial sequence, position by position.
+
+    Comparing fingerprints as sets, or sorted, cannot see an ordering difference -- which is
+    the half of determinism that matters, because the trial ledger's order is the expansion
+    order the budget truncated. The final assertion fails if the sequence is ever a constant.
+
+    The second run goes through ``_run`` rather than ``_search``: ``_search`` is memoized, so
+    asking it twice hands back one and the same record and every equality below would hold for
+    free. The identity assertion keeps that trap from coming back.
+    """
+    first, _ = _search(seed=11)
+    second, _ = _run(*_fixture(), seed=11)
+    assert first is not second, "a memoized second run would compare a record with itself"
+    first_trials = [(item["fingerprint"], item["stage"], item["verdict"], item["reason"])
+                    for item in first["trials"]]
+    second_trials = [(item["fingerprint"], item["stage"], item["verdict"], item["reason"])
+                     for item in second["trials"]]
+    assert first_trials == second_trials
+    assert len(set(first_trials)) > 1, "a single repeated trial would satisfy any equality"
+
+
+def test_run_is_reproducible_candidate_sequence_including_order():
+    """The candidate sequence, likewise over two records rather than one memoized record."""
+    first, _ = _search(seed=11, thresholds=_NO_DEDUPLICATION)
+    second, _ = _run(*_fixture(), seed=11, thresholds=_NO_DEDUPLICATION)
+    assert first is not second, "a memoized second run would compare a record with itself"
+    first_candidates = [item["fingerprint"] for item in first["candidates"]]
+    second_candidates = [item["fingerprint"] for item in second["candidates"]]
+    assert first_candidates == second_candidates
+    assert len(set(first_candidates)) > 1
+
+
+def test_trials_carry_the_ladder_verdict_shape():
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
+    assert result["candidates"], "a permissive fixture must clear the ladder"
+    assert len(result["trials"]) == 12
+    for item in result["trials"]:
+        assert set(item) == {"fingerprint", "stage", "verdict", "reason", "metrics"}
+        assert item["verdict"] in {"pass", "reject"}
+        assert item["stage"] in {"L1", "L2", "L3", "L4", "L5"}
+        assert (item["reason"] == "") == (item["verdict"] == "pass")
+        if item["verdict"] == "reject":
+            assert item["reason"].startswith("factorMining.reject.")
+
+
+def test_candidates_carry_the_search_records_shape():
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
+    assert result["candidates"]
+    for item in result["candidates"]:
+        assert set(item) == {"expression", "fingerprint", "origin", "template_id", "status",
+                             "reason", "metrics", "outOfSample"}
+        assert item["origin"] == "template"
+        assert item["template_id"]
+        assert item["status"] == "search"
+        assert item["reason"] == ""
+        assert item["outOfSample"] == {}
+        assert isinstance(item["expression"], dict)
+        assert item["fingerprint"]
+        for key in ("coverage", "icSeries", "rankIc", "icir", "averageTurnover", "stability",
+                    "foldIcSigns"):
+            assert key in item["metrics"], key
+
+
+def test_gates_get_fold_ic_signs_from_the_ic_series():
+    """L3's fold check reads ``foldIcSigns``; a run that omits it loses that check silently."""
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
+    signs = result["candidates"][0]["metrics"]["foldIcSigns"]
+    assert len(signs) == 4, "the IC series is cut into four folds"
+    assert all(sign in {-1.0, 0.0, 1.0} for sign in signs)
+
+
+def test_fold_signs_are_the_four_equal_folds_of_the_series():
+    series = [{"value": value} for value in (0.5, 0.5, -0.5, -0.5, 0.5, 0.5, 0.5, 0.5)]
+    assert _fold_ic_signs(series) == [1.0, -1.0, 1.0, 1.0]
+
+
+def test_fold_signs_of_an_absent_series_raise_rather_than_skip_the_check():
+    """An unreadable IC series must not leave L3 quietly missing its fold-consistency check."""
+    with pytest.raises(ValueError, match="factorMining.missingIcSeries"):
+        _fold_ic_signs(None)
+    with pytest.raises(ValueError, match="factorMining.missingIcSeries"):
+        _fold_ic_signs([])
+
+
+_MOMENTUM_5 = {"op": "ts_pct_change", "args": ["close"], "params": {"n": 5}}
+_NEGATED_MOMENTUM_5 = {"op": "neg", "args": [dict(_MOMENTUM_5)], "params": {}}
+
+
+def _candidate(expression):
+    from app.services.factor_mining.dsl import normalize_expression
+    from app.services.factor_mining.templates import CandidateSeed
+
+    return CandidateSeed(expression=expression,
+                         fingerprint=normalize_expression(expression).fingerprint,
+                         template_id="handmade", origin="template", params={"N": 1})
+
+
+def _redundancy_views(monkeypatch, expressions):
+    """The L4 mapping the loop derives for each expression, read off the surviving candidates.
+
+    Not the trials: a ledger row keeps only the metrics its gates read, and the correlation study
+    is not one of them -- the candidate is where the whole measurement lives.
+    """
+    result, _ = _run_with_seeds(monkeypatch, [_candidate(item) for item in expressions],
+                                thresholds=_NO_DEDUPLICATION)
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    return [engine._correlations(item["metrics"]) for item in result["candidates"]]
+
+
+def test_the_redundancy_mapping_refuses_a_study_that_is_not_this_candidates():
+    """The first study row must be the candidate's own, or nothing is mapped at all.
+
+    ``factor_research`` only lists a factor it could compare over enough overlapping
+    observations, so the candidate's own row can be missing while built-ins remain. Reading the
+    matrix by position would then hand L4 a built-in's correlations -- a candidate measured
+    against a pool one factor short, with nothing to say so. An empty mapping is the honest
+    answer: ``screen_redundancy`` rejects it as unverifiable.
+    """
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    shifted = {"factors": ["momentum_20", "reversal_5"], "matrix": [[1.0, 0.2], [0.2, 1.0]]}
+    assert engine._correlations({"factorCorrelation": shifted}) == {}
+
+    own = {"factors": ["expression", "reversal_5"], "matrix": [[1.0, 0.2], [0.2, 1.0]]}
+    assert engine._correlations({"factorCorrelation": own}) == {"reversal_5": 0.2}
+
+
+def test_the_redundancy_gate_measures_the_candidate_not_a_builtin(monkeypatch):
+    """Two candidates with opposite signals must get two opposite L4 mappings.
+
+    The fixture's prices are geometric curves, so every expression ranks the symbols the same
+    way and a candidate can only differ from another by sign -- which is exactly the difference
+    asserted here. When ``_factor_correlation`` regenerates the selected factor instead of
+    using the injected panel, both candidates come back with the built-in ``momentum_20``'s
+    correlations and this equality holds for any pair, which is what makes the gate decorative.
+    """
+    momentum, negated = _redundancy_views(monkeypatch, [_MOMENTUM_5, _NEGATED_MOMENTUM_5])
+    assert momentum and negated, "a gate with no measurement at all proves nothing"
+    assert momentum != negated
+    assert momentum["reversal_5"] == pytest.approx(-1.0, abs=1e-9)
+    assert negated["reversal_5"] == pytest.approx(1.0, abs=1e-9)
+
+
+def test_redundancy_gate_rejects_the_candidate_that_duplicates_a_builtin(monkeypatch):
+    """Of two candidates, only the built-in's duplicate is rejected -- and for that reason.
+
+    ``ts_pct_change(close, 5)`` is the exact reverse of the ``reversal_5`` built-in, so their
+    cross-sectional ranks agree at a correlation of 1.0 and the de-duplication gate must fire.
+    Its negation correlates at the same magnitude but the opposite sign, and the gate compares
+    magnitude, so it passes. Two candidates, two different verdicts, both from the same gate:
+    that is only possible if the gate is looking at each candidate's own values.
+    """
+    result, _ = _run_with_seeds(monkeypatch, [_candidate(_MOMENTUM_5), _candidate(_NEGATED_MOMENTUM_5)],
+                                thresholds=GateThresholds(
+                                    min_ic_observations=5, min_abs_rank_ic=0.0, min_icir=0.0,
+                                    min_fold_consistency=0.0, max_turnover=1.0, min_coverage=0.0,
+                                    max_builtin_correlation=1.1))
+    assert [item["verdict"] for item in result["trials"]] == ["pass", "pass"]
+
+    rejected, _ = _run_with_seeds(monkeypatch, [_candidate(_MOMENTUM_5)],
+                                  thresholds=GateThresholds(
+                                      min_ic_observations=5, min_abs_rank_ic=0.0, min_icir=0.0,
+                                      min_fold_consistency=0.0, max_turnover=1.0, min_coverage=0.0,
+                                      max_builtin_correlation=0.85))
+    assert rejected["trials"][0]["stage"] == "L4"
+    assert rejected["trials"][0]["reason"] == "factorMining.reject.duplicateBuiltin"
+
+
+def test_an_injected_panel_is_never_studied_under_a_builtin_name():
+    """A caller's factor id must not become the label of an injected panel.
+
+    ``_factor_correlation`` de-duplicates its name list before building the matrix, so a panel
+    handed in under ``momentum_20`` merges with that built-in's row: the comparison silently
+    loses the built-in and the candidate is measured against a pool one factor smaller. The
+    engine therefore labels every injected panel neutrally, whatever id the caller passed. This
+    is the mining path's own invariant -- it passes an empty id -- stated where it can break.
+    """
+    frames, members = _fixture()
+    result = FactorResearchEngine().run(
+        frames=frames, factor_panel=_evaluator(frames, _MOMENTUM_5), factor_id="momentum_20",
+        start_date=datetime(2024, 1, 1), end_date=datetime(2024, 6, 28), members=members)
+    assert result["factorId"] not in FactorResearchEngine._CORRELATION_FACTORS
+    assert result["factorCorrelation"]["factors"][0] == result["factorId"]
+
+
+def test_the_correlation_study_reads_the_injected_panel_not_a_lookalike():
+    """The L4 measurement must come from the panel handed in, not from one that ranks alike.
+
+    Correlation values cannot tell the injected panel apart from any positive monotone transform
+    of it: every cross-section ranks the same way, so every coefficient comes out equal. The
+    observation counts can. Blanking the first half of the search window leaves every value the
+    panel still carries exactly as it was, so a study that read the injected panel scores one
+    cross-section fewer per blanked date, while one that read any rank-equivalent panel scores
+    the same as before -- which is the failure this pins, without inferring it from the signs.
+    """
+    frames, members = _fixture()
+    split = split_periods(_config(thresholds=_NO_DEDUPLICATION))
+    sessions = pd.bdate_range(split.search_start, split.search_end)
+    cutoff = sessions[len(sessions) // 2]
+    whole_panel = _evaluator(frames, _MOMENTUM_5)
+    assert int((~whole_panel.loc[whole_panel.index < cutoff].isna()).sum().sum()) > 0, \
+        "the half about to be blanked must carry values for their loss to mean anything"
+
+    def study(panel):
+        return FactorResearchEngine().run(
+            frames=frames, factor_panel=panel, factor_id="", start_date=split.search_start,
+            end_date=split.search_end, members=members)
+
+    whole = study(whole_panel)
+    partial_panel = whole_panel.copy()
+    partial_panel.loc[partial_panel.index < cutoff] = float("nan")
+    partial = study(partial_panel)
+
+    # Same comparison pool, so the two counts below are like for like.
+    assert whole["factorCorrelation"]["factors"] == partial["factorCorrelation"]["factors"]
+    whole_observed = whole["factorCorrelation"]["observations"][0][0]
+    partial_observed = partial["factorCorrelation"]["observations"][0][0]
+    blanked = [item for item in whole["icSeries"]
+               if datetime.fromisoformat(item["time"]) < cutoff]
+    assert blanked, "the blanked half must have scored something before it was blanked"
+    assert whole_observed - partial_observed == len(blanked)
+
+
+def test_a_run_made_under_a_patched_expansion_is_never_memoized(monkeypatch):
+    """A patched expansion's run must not answer the template search's memoized key.
+
+    Writing it there leaves the wrong run behind for every later test that asks for the same
+    key -- which only shows up in a subset run, where no earlier test repopulated the entry
+    first. That is the shape of the false red this suite already had once, so the memo refuses
+    to store a run it cannot attribute to the real expansion.
+
+    This patches by hand rather than through ``_patched_expansion``: that helper's ``finally``
+    drops every entry its block added, which would hide the very write being asserted here.
+    """
+    monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: _seeds(1))
+    patched, _ = _search(thresholds=_NO_DEDUPLICATION)
+    assert len(patched["trials"]) == 1, "the patch must be in effect for this test to mean anything"
+
+    monkeypatch.undo()
+    unpatched, _ = _search(thresholds=_NO_DEDUPLICATION)
+    assert unpatched is not patched
+    assert len(unpatched["trials"]) == 12, "the template search's own run was overwritten"
+
+
+def test_members_without_a_key_are_reported_as_no_membership():
+    """Members the research engine cannot map to a symbol must not blank the cross-section.
+
+    ``_membership_panel`` matches on ``member["key"]``. A member that has a ``symbol`` but no
+    ``key`` is an entry that matches nothing, which reads as inactive on every date and turns
+    every candidate into an inconclusive rejection -- a worse failure than having no
+    membership information at all, because it is silent. So they are reported as the empty
+    sequence, which the research engine documents as "no membership restrictions".
+    """
+    assert _resolved_members([{"market": "USStock", "symbol": "A", "effectiveFrom": None}]) == ()
+    keyed = [{"key": "USStock:A", "market": "USStock", "symbol": "A"}]
+    assert _resolved_members(keyed) == keyed
+
+
+def test_the_search_does_not_write_into_the_shared_candidate_expansion():
+    """The expanded seeds are shared, so the loop must not touch their expression or params.
+
+    A template's base expression is the same object as its two smoothing variants' inner
+    argument, and ``params`` feeds the fingerprint -- writing a field into either would
+    silently rewrite siblings that share the object, and the run would keep going with a
+    different candidate set than the one it recorded. Comparing against a freshly expanded
+    copy catches both an added key and a changed value.
+    """
+    fresh = {seed.fingerprint: seed for seed in expand_candidates(
+        template_ids=None, budget=12, seed=3)}
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
+    assert result["candidates"]
+    for item in result["candidates"]:
+        expected = fresh[item["fingerprint"]]
+        assert item["expression"] == expected.expression
+        assert item["expression"].keys() == expected.expression.keys()
+        assert repr(item["expression"]) == repr(expected.expression)
+
+
+def test_the_point_in_time_universe_is_applied_per_date(monkeypatch):
+    """A member that joins the universe mid-window never appears in an earlier cross-section.
+
+    ``USStock:F`` carries a ``membership_periods`` starting in May. The research engine records
+    the symbols it grouped on every date, so the test reads that ledger directly: F is held
+    after it joins, and absent before -- which is what says the point-in-time universe is
+    actually being evaluated rather than waved through.
+    """
+    frames, members = _fixture()
+    with _patched_expansion(monkeypatch, _seeds(1)):
+        result, _ = _run(frames, members, thresholds=_NO_DEDUPLICATION)
+    groups = result["candidates"][0]["metrics"]["groupObservations"]
+    assert groups, "no cross-section was grouped"
+    joined = datetime(2024, 5, 1)
+    before = [item for item in groups if datetime.fromisoformat(item["time"]) < joined]
+    after = [item for item in groups if datetime.fromisoformat(item["time"]) >= joined]
+    assert before and after, "the window must span both sides of F's membership start"
+    assert not any("USStock:F" in item["members"] for item in before)
+    assert any("USStock:F" in item["members"] for item in after)
+    assert all(item["crossSectionSize"] == 5 for item in before)
+    assert any(item["crossSectionSize"] == 6 for item in after)
+
+
+def test_keyless_members_leave_the_search_running_rather_than_blanking_it(monkeypatch):
+    """The keyless branch observed end to end: the run still scores its candidates.
+
+    Passing those members through unchanged would give ``_membership_panel`` an entry matching
+    no symbol, so every date would have an empty cross-section and every candidate would die
+    at ``insufficientObservations``. The assertions below fail on that outcome, so the branch
+    is exercised rather than merely asserted in isolation.
+    """
+    frames, _ = _fixture()
+    keyless = [{"market": "USStock", "symbol": symbol, "effectiveFrom": None}
+               for symbol in ["A", "B", "C", "D", "E", "F"]]
+    with _patched_expansion(monkeypatch, _seeds(1)):
+        result, _ = _run(frames, keyless, thresholds=_NO_DEDUPLICATION)
+    assert [item["verdict"] for item in result["trials"]] == ["pass"]
+    assert result["trials"][0]["stage"] != "L1"
+    assert result["candidates"], "a keyless run must still produce candidates"
+
+
+def test_progress_is_reported_every_ten_candidates():
+    _, seen = _search()
+    assert seen == [{"stage": "search", "evaluated": 10, "total": 12}]
+
+
+def test_progress_reports_one_line_per_ten_candidates(monkeypatch):
+    """Eleven candidates is one full page plus one, so the second page is exercised."""
+    _, seen = _run_with_seeds(monkeypatch, _seeds(11))
+    assert seen == [{"stage": "search", "evaluated": 10, "total": 11}]
+
+
+# One case per way a candidate can die outside ``ExpressionError``. Each must become a
+# recorded ``factorMining.reject.invalid`` trial rather than an escape from ``run``. The
+# windowed and cross-sectional cases stand for all fourteen operators that take a panel and
+# receive a scalar: ``lag``, ``delta``, the eight ``ts_*`` windows, ``cs_rank``, ``cs_zscore``
+# and ``cs_demean`` each raise a bare ``AttributeError`` on a scalar operand.
+_DEGENERATE_EXPRESSIONS = {
+    "scalar division by zero": {"op": "div", "args": [
+        {"op": "const", "args": [], "params": {"value": 1}},
+        {"op": "const", "args": [], "params": {"value": 0}},
+    ], "params": {}},
+    "windowed operator on a scalar": {"op": "ts_mean", "args": [
+        {"op": "const", "args": [], "params": {"value": 1}},
+    ], "params": {"n": 3}},
+    "cross_sectional operator on a scalar": {"op": "cs_rank", "args": [
+        {"op": "const", "args": [], "params": {"value": 1}},
+    ], "params": {}},
+    "scalar in where's true branch": {"op": "where", "args": [
+        {"op": "gt", "args": [
+            {"op": "ts_mean", "args": ["close"], "params": {"n": 3}},
+            {"op": "const", "args": [], "params": {"value": 0}},
+        ], "params": {}},
+        {"op": "const", "args": [], "params": {"value": 1}},
+        "close",
+    ], "params": {}},
+}
+
+
+def _seed_for(expression):
+    from app.services.factor_mining.dsl import normalize_expression
+    from app.services.factor_mining.templates import CandidateSeed
+
+    return CandidateSeed(expression=expression,
+                         fingerprint=normalize_expression(expression).fingerprint,
+                         template_id="momentum", origin="template", params={"N": 1})
+
+
+@pytest.mark.parametrize("name", sorted(_DEGENERATE_EXPRESSIONS))
+def test_degenerate_candidate_expression_is_an_invalid_rejection(monkeypatch, name):
+    result, _ = _run_with_seeds(monkeypatch, [_seed_for(_DEGENERATE_EXPRESSIONS[name])])
+    assert [item["verdict"] for item in result["trials"]] == ["reject"]
+    assert result["trials"][0]["stage"] == "L1"
+    assert result["trials"][0]["reason"] == "factorMining.reject.invalid"
+    assert result["candidates"] == []
+
+
+def test_oversized_integer_constant_is_an_invalid_rejection(monkeypatch):
+    """A ``const`` whose ``float()`` overflows raises ``OverflowError``, not ``ExpressionError``.
+
+    The literal has to reach the operator layer to overflow: ``dsl._is_finite_number`` accepts
+    any integral ``value`` by design, and the conversion happens in ``operators._const``.
+    """
+    result, _ = _run_with_seeds(
+        monkeypatch, [_seed_for({"op": "const", "args": [], "params": {"value": 10 ** 400}})])
+    assert [item["verdict"] for item in result["trials"]] == ["reject"]
+    assert result["trials"][0]["reason"] == "factorMining.reject.invalid"
+    assert result["candidates"] == []
+
+
+def test_a_failing_candidate_does_not_stop_the_candidates_after_it(monkeypatch):
+    zero_division = {"op": "div", "args": [
+        {"op": "const", "args": [], "params": {"value": 1}},
+        {"op": "const", "args": [], "params": {"value": 0}},
+    ], "params": {}}
+    healthy = _seed_for({"op": "ts_pct_change", "args": ["close"], "params": {"n": 3}})
+    result, _ = _run_with_seeds(monkeypatch, [_seed_for(zero_division), healthy],
+                                thresholds=_NO_DEDUPLICATION)
+    assert [item["verdict"] for item in result["trials"]] == ["reject", "pass"]
+    assert result["trials"][0]["reason"] == "factorMining.reject.invalid"
+    assert result["trials"][1]["reason"] == ""
+
+
+def test_run_reports_the_config_split_and_summary():
+    result, _ = _search()
+    assert result["config"]["market"] == "USStock"
+    assert result["config"]["budget"] == 12
+    # The split's exact edges: the frozen tail starts the day after the last search session, so
+    # an off-by-one in either direction would move a bar from one window into the other.
+    assert result["split"] == {
+        "searchStart": "2024-01-01T00:00:00",
+        "searchEnd": "2024-07-31T00:00:00",
+        "freezeStart": "2024-08-01T00:00:00",
+        "freezeEnd": "2024-10-31T00:00:00",
+    }
+    # The config's dates leave in that same spelling. ``asdict`` keeps native datetimes, and the
+    # durable job store renders those with ``str()`` -- "2024-01-01 00:00:00", which a browser's
+    # ``new Date()`` reads as Invalid Date -- beside an ISO ``split`` in the same response.
+    assert result["config"]["start_date"] == "2024-01-01T00:00:00"
+    assert result["config"]["end_date"] == "2024-10-31T00:00:00"
+    assert result["summary"]["snapshotId"] == "b" * 64
+    assert result["summary"]["trials"] == len(result["trials"])
+    assert result["summary"]["candidates"] == len(result["candidates"])
+
+
+def test_the_research_engine_is_told_the_runs_own_frequency(monkeypatch):
+    """ICIR is annualized from the run's timeframe and markets, not from the engine's default.
+
+    ICIR = ``ic_mean / ic_std * sqrt(annualization / holding_period)``, so a weekly run left on
+    the engine's 252-bar default would report an ICIR about 2.2x its own and clear ``min_icir``
+    on a number measured in another unit. The crypto case is what says the markets travel with
+    it: a daily US-equity run's 252 is indistinguishable from the default.
+    """
+    calls: list[dict] = []
+
+    class _Recording(FactorResearchEngine):
+        def run(self, **kwargs):
+            calls.append(kwargs)
+            return super().run(**kwargs)
+
+    monkeypatch.setattr(engine_module, "FactorResearchEngine", _Recording)
+
+    _run(*_fixture(), timeframe="1w")
+    assert calls, "no evaluation reached the research engine"
+    assert {call["annualization_periods"] for call in calls} == {52.0}
+
+    crypto = [{**member, "market": "Crypto"} for member in _fixture()[1]]
+    calls.clear()
+    _run(_fixture()[0], crypto)
+    assert {call["annualization_periods"] for call in calls} == {365.25}

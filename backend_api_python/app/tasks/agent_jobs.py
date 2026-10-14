@@ -13,6 +13,7 @@ from app.celery_app import celery_app
 SUPPORTED_KINDS = frozenset(
     {
         "backtest",
+        "factor_mining",
         "strategy_evolution",
     }
 )
@@ -28,6 +29,10 @@ def _execute(kind: str, payload: dict, on_progress):
         from app.routes.agent_v1.backtests import _run_backtest
 
         return _run_backtest(request_payload, on_progress)
+    if kind == "factor_mining":
+        from app.services.factor_mining.service import run_mining_job
+
+        return run_mining_job(request_payload, on_progress)
     if kind == "strategy_evolution":
         from app.routes.strategy_evolution import _run_evolution_job
 

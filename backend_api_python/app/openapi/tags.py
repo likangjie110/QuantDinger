@@ -7,6 +7,7 @@ USERS = "Users"
 MARKET = "Market"
 UNIVERSE = "Universe"
 FACTOR = "Factor"
+FACTOR_MINING = "FactorMining"
 INDICATOR = "Indicator"
 BACKTEST = "Backtest"
 STRATEGY = "Strategy"
@@ -32,6 +33,7 @@ ALL_TAGS = [
     {"name": MARKET, "description": "Market data and watchlists (Public)"},
     {"name": UNIVERSE, "description": "Point-in-time strategy universes (Internal)"},
     {"name": FACTOR, "description": "Versioned factor catalog and research diagnostics (Internal)"},
+    {"name": FACTOR_MINING, "description": "Automated factor mining runs and candidate library (Internal)"},
     {"name": INDICATOR, "description": "Indicator IDE workspace (Public)"},
     {"name": BACKTEST, "description": "Unified V2 backtesting (Public)"},
     {"name": STRATEGY, "description": "Strategy runtime and bots (Internal)"},
