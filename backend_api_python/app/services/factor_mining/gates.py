@@ -75,13 +75,15 @@ def _threshold_value(value: Any, default: Any) -> Any:
     ``float(True)`` is 1.0, so a boolean ``min_coverage`` would demand perfect coverage. Both
     are rejected instead. An integral float is accepted (``30.0`` is an observation count), and
     a non-finite one is not: every comparison against NaN or infinity is False, which passes the
-    minimum it was meant to enforce.
+    minimum it was meant to enforce. A value too large to convert at all -- a 400-digit
+    integer -- overflows ``float()`` and is refused the same way, not allowed to escape as an
+    ``OverflowError`` the route would turn into a 500.
     """
     if isinstance(value, bool):
         raise ValueError("factorMining.thresholdsInvalid")
     try:
         number = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("factorMining.thresholdsInvalid") from exc
     if not math.isfinite(number):
         raise ValueError("factorMining.thresholdsInvalid")

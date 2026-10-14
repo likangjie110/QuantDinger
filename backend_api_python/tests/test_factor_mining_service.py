@@ -477,7 +477,7 @@ def test_unknown_market_is_rejected_by_key(market):
 
 
 @pytest.mark.parametrize("field", ["seed", "groups", "holdingPeriod"])
-@pytest.mark.parametrize("value", [[], "abc", {}], ids=["list", "text", "object"])
+@pytest.mark.parametrize("value", [[], "abc", {}, float("inf")], ids=["list", "text", "object", "infinity"])
 def test_an_unreadable_integer_field_is_refused_by_key(field, value):
     """``int([])`` is a ``TypeError`` and ``int("abc")`` a bare ``ValueError``.
 
@@ -488,11 +488,37 @@ def test_an_unreadable_integer_field_is_refused_by_key(field, value):
         FactorMiningService().estimate(_payload(**{field: value}))
 
 
-@pytest.mark.parametrize("value", [[], "abc"], ids=["list", "text"])
+@pytest.mark.parametrize("value", [[], "abc", float("inf")], ids=["list", "text", "infinity"])
 def test_an_unreadable_budget_keeps_its_own_key(value):
     """The generic key must not swallow the field that already owns a specific one."""
     with pytest.raises(ValueError, match="factorMining.budgetInvalid"):
         FactorMiningService().estimate(_payload(budget=value))
+
+
+def test_an_unreadable_source_id_is_not_a_positive_int():
+    """``int(inf)`` raises ``OverflowError``, which is not a ``ValueError``.
+
+    Left uncaught it escapes ``_positive_int`` and the closed-key path with it, so a nine-character
+    body would be answered with a 500 instead of the key that names the missing field. (A huge
+    *integer* does not belong here: ``int()`` on an existing ``int`` converts nothing, so only a
+    float reaching the integer domain overflows.)
+    """
+    with pytest.raises(ValueError, match="factorMining.sourceRequired"):
+        FactorMiningService().estimate(_payload(sourceId=float("inf")))
+
+
+@pytest.mark.parametrize("field,key", [("freezeRatio", "factorMining.freezeRatioInvalid"),
+                                       ("commission", "factorMining.invalidParameter"),
+                                       ("slippage", "factorMining.invalidParameter")])
+def test_an_overflowing_number_is_refused_by_the_fields_own_key(field, key):
+    """``float(10**400)`` overflows in three more readers on the payload path.
+
+    A JSON integer of 401 digits is legal input, so this is reachable with a short body; without
+    ``OverflowError`` in the handler each of these escapes as a 500 with a key that blames the
+    service rather than the request.
+    """
+    with pytest.raises(ValueError, match=key):
+        FactorMiningService().estimate(_payload(**{field: 10 ** 400}))
 
 
 @pytest.mark.parametrize("thresholds", [[1], "min_icir=0.4", 5], ids=["list", "text", "number"])

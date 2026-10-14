@@ -289,7 +289,7 @@ class FactorMiningService:
         raw_budget = request.get("budget")
         try:
             budget = DEFAULT_BUDGET if raw_budget is None else int(raw_budget)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("factorMining.budgetInvalid") from exc
         if budget < 1:
             raise ValueError("factorMining.budgetInvalid")
@@ -377,6 +377,6 @@ def _json(value: Any) -> Any:
 def _positive_int(value: Any) -> int | None:
     try:
         result = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return result if result > 0 else None

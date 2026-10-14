@@ -283,3 +283,14 @@ def test_gate_verdicts_and_thresholds_are_frozen():
         GateThresholds().min_coverage = 0.1
     with pytest.raises(FrozenInstanceError):
         screen_metrics(_metrics(), GateThresholds()).reason = "factorMining.reject.weakIc"
+
+
+@pytest.mark.parametrize("value", [10 ** 400, float("inf")], ids=["huge-int", "infinity"])
+def test_a_threshold_too_large_to_convert_is_refused_by_key(value):
+    """``float(10**400)`` overflows and ``inf`` fails the finite check, both by the same key.
+
+    Without ``OverflowError`` in the handler the first escapes as an ``OverflowError``, which the
+    route answers with a 500 rather than the key that names the malformed override.
+    """
+    with pytest.raises(ValueError, match="factorMining.thresholdsInvalid"):
+        GateThresholds.from_payload({"min_coverage": value})

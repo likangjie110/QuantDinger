@@ -137,8 +137,8 @@ class MiningConfig:
             template_ids=tuple(str(item) for item in payload.get("templateIds") or ()),
             groups=_payload_int(payload, "groups", 5),
             holding_period=_payload_int(payload, "holdingPeriod", 5),
-            commission=parse_rate(payload.get("commission"), default=default_commission),
-            slippage=parse_rate(payload.get("slippage"), default=default_slippage),
+            commission=_rate(payload.get("commission"), default_commission),
+            slippage=_rate(payload.get("slippage"), default_slippage),
             neutralize_industry=bool(payload.get("neutralizeIndustry", False)),
             thresholds=GateThresholds.from_payload(payload.get("thresholds")),
         )
@@ -733,13 +733,26 @@ def _fold_ic_signs(ic_series: Any) -> list[float]:
 
 
 
+def _rate(value: Any, default: float) -> float:
+    """Read a commission or slippage rate; one that cannot be read is refused by key.
+
+    ``parse_rate`` converts through ``float()``, so a 400-digit integer literal overflows
+    there instead of yielding a rate. That is the caller's input problem, not a 500.
+    """
+    try:
+        return parse_rate(value, default=default)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("factorMining.invalidParameter") from exc
+
+
 def _payload_int(payload: Mapping[str, Any], key: str, default: int) -> int:
     """Read an integer payload field; only an absent key falls back to the default.
 
     ``payload.get(key) or default`` would read an explicit 0 as absent, and a budget of 0 would
     then never reach the validator that owns the ``factorMining.budgetInvalid`` key. A value
     that cannot be read as an integer is refused by key rather than allowed to escape as a bare
-    ``TypeError`` or ``ValueError``: the route layer turns those into a 500, and its message is
+    ``TypeError``, ``ValueError`` or ``OverflowError`` (``1e400`` parses to infinity, and
+    ``int(inf)`` overflows): the route layer turns those into a 500, and its message is
     the internals of ``int()``, which is neither a closed key nor anything a client should read.
     """
     value = payload.get(key)
@@ -747,7 +760,7 @@ def _payload_int(payload: Mapping[str, Any], key: str, default: int) -> int:
         return default
     try:
         return int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("factorMining.invalidParameter") from exc
 
 
@@ -768,7 +781,7 @@ def _freeze_ratio(value: Any) -> float:
     """Read a freeze ratio. Outside ``(0, 0.5)`` the frozen tail stops being a minority."""
     try:
         ratio = DEFAULT_FREEZE_RATIO if value in (None, "") else float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("factorMining.freezeRatioInvalid") from exc
     if not 0.0 < ratio < 0.5:
         raise ValueError("factorMining.freezeRatioInvalid")
