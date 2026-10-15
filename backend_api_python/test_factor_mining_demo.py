@@ -4,7 +4,14 @@
 演示从提交作业到获取结果的完整流程，使用模拟数据避免依赖真实服务。
 """
 import json
+import sys
 from datetime import datetime, timedelta
+
+# This script prints status markers outside the GBK repertoire, and Windows hands a console the
+# active code page as stdout's encoding -- so the default run dies on the first one. Pin UTF-8,
+# which is what the terminal renders correctly anyway.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 def demo_factor_mining_workflow():
     """演示因子挖掘的完整工作流程"""

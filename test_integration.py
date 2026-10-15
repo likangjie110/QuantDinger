@@ -5,8 +5,14 @@
 
 import requests
 import json
+import sys
 import time
 from datetime import datetime, timedelta
+
+# Windows gives a console the active code page as stdout's encoding, and this script prints status
+# markers the GBK repertoire does not hold, so the default run dies on the first one. Pin UTF-8.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 # 配置
 BASE_URL = "http://localhost:5000"
