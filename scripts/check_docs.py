@@ -24,6 +24,14 @@ IGNORED_DIRECTORIES = {
     "data",
     "logs",
     "node_modules",
+    # Not this repository's documentation, so their links are not this repository's to resolve:
+    # ``.agents`` is a gitignored local tooling tree, and the two frontend directories hold a
+    # checkout of the frontend repository and its unpacked image. The frontend's own sources are
+    # maintained outside this repository, and its ``public/index.html`` is a webpack template
+    # whose ``<%= BASE_URL %>`` placeholders are not paths anything here could resolve.
+    ".agents",
+    "frontend-extracted",
+    "frontend-vue",
 }
 
 MARKDOWN_LINK_RE = re.compile(r"(!?)\[[^\]]*\]\(([^)]+)\)")
