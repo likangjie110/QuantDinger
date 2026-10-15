@@ -94,6 +94,7 @@ def _receipt(**overrides):
         "jobId": "job-9",
         "status": "queued",
         "progress": {},
+        "config": {"sourceId": 1, "market": "USStock"},
         "result": None,
         "error": None,
         "createdAt": None,
@@ -200,6 +201,23 @@ def test_job_list_clamps_the_page_size(app, service):
     )
     assert stub.calls["list_jobs"] == {"user_id": USER_ID, "limit": 50}
     assert [item["jobId"] for item in response.get_json()["data"]["items"]] == ["job-1", "job-2"]
+
+
+def test_a_listed_job_carries_the_config_it_was_opened_with(app, service):
+    """A listing withholds ``result``, so ``config`` is the only thing naming the job to a poller.
+
+    It is the market, window and budget a caller recognises their own submission by; a list of
+    bare job ids would make the poll loop unusable.
+    """
+    service(list_jobs=[_receipt(jobId="job-1",
+                                config={"market": "CNStock", "startDate": "2023-01-02",
+                                        "endDate": "2023-06-30", "budget": 50})])
+    response = _invoke(
+        app, mining_routes.list_factor_mining_jobs, path="/api/factor-mining/jobs",
+    )
+    assert response.get_json()["data"]["items"][0]["config"] == {
+        "market": "CNStock", "startDate": "2023-01-02", "endDate": "2023-06-30", "budget": 50,
+    }
 
 
 def test_job_detail_returns_404_when_the_service_reports_no_visible_job(app, service):

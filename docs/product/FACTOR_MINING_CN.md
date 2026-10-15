@@ -177,12 +177,18 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 **作业回执 / 作业对象**（同一套字段）：
 
 ```json
-{"jobId": "<uuid>", "status": "queued", "progress": {}, "result": null,
- "hasResult": false, "error": null, "createdAt": "2026-10-13T09:00:00+00:00",
- "startedAt": null, "finishedAt": null}
+{"jobId": "<uuid>", "status": "queued", "progress": {},
+ "config": {"sourceId": 12, "market": "USStock", "timeframe": "1D",
+            "startDate": "2023-01-01", "endDate": "2024-12-31", "budget": 50, "seed": 42},
+ "result": null, "hasResult": false, "error": null,
+ "createdAt": "2026-10-13T09:00:00+00:00", "startedAt": null, "finishedAt": null}
 ```
 
-**作业的列表视图与详情视图。** `/jobs` 每一项的 `result` 都是 `null`，`hasResult` 说明有没有可取的记录；运行记录（每个幸存候选的完整 metrics 加每条试验台账行）只由 `/jobs/<job_id>` 提供。一页二十份完整记录，对「只想找出刚跑完的那个」的轮询端来说是白拿的流量。`POST /run` 的回执用的是同一个信封，此时作业还没跑，所以 `hasResult` 是 `false`。
+**`config` 不随列表视图省略。** 它是本次请求里**实际出现**的那部分运行字段（第 7 节开头那份名单的子集），由作业表存下的 `request` 经白名单取出——那份 `request` 还带着作业存储自己的 `__userId` / `__billing` 通道，这些不回给调用者。之所以不能省：`result` 被省略时，`config` 就是轮询端唯一能认出「这个作业是哪个市场、哪段区间、多少预算」的东西。缺 `request` 的行读成空对象，不是错误——没有配置的作业仍然值得列出来。
+
+**`progress` 的形状**是 `{"stage": "search" | "review", "evaluated": <int>, "total": <int>}`；搜索段每 10 个候选上报一次，冻结段复核开始时会切到 `review`。作业尚未跑起来时是 `{}`。
+
+**作业的列表视图与详情视图。** `/jobs` 每一项的 `result` 都是 `null`，`hasResult` 说明有没有可取的记录；运行记录（每个幸存候选的完整 metrics 加每条试验台账行）只由 `/jobs/<job_id>` 提供。一页二十份完整记录，对「只想找出刚跑完的那个」的轮询端来说是白拿的流量。`POST /run` 的回执用的是同一个信封，此时作业还没跑，所以 `hasResult` 是 `false`。`config` 与 `progress` 两个视图都给。
 
 **`GET /jobs` 参数：** `limit`（1–50，缺省 20）。
 **`GET /candidates` 参数：** `runId`（整数）、`status`（`search` / `frozen` / `rejected`）、`market`、`limit`（1–200，缺省 50）、`offset`（≥ 0，缺省 0）。非法整数返回 400 + `factorMining.invalidQuery`。

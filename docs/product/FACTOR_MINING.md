@@ -263,16 +263,31 @@ Required: `sourceId` (positive integer), `market` (a known market key), and `sta
 **Job receipt / job object** (one field set for both):
 
 ```json
-{"jobId": "<uuid>", "status": "queued", "progress": {}, "result": null,
- "hasResult": false, "error": null, "createdAt": "2026-10-13T09:00:00+00:00",
- "startedAt": null, "finishedAt": null}
+{"jobId": "<uuid>", "status": "queued", "progress": {},
+ "config": {"sourceId": 12, "market": "USStock", "timeframe": "1D",
+            "startDate": "2023-01-01", "endDate": "2024-12-31", "budget": 50, "seed": 42},
+ "result": null, "hasResult": false, "error": null,
+ "createdAt": "2026-10-13T09:00:00+00:00", "startedAt": null, "finishedAt": null}
 ```
+
+**`config` is not withheld from the list view.** It is the subset of the run fields (the list at the
+top of section 7) that the request actually carried, read out of the job's stored `request` by an
+explicit whitelist -- that mapping also holds the job store's own `__userId` / `__billing` channel,
+and neither leaves. It cannot be dropped the way `result` is: with the result withheld, `config` is
+the only thing telling a poller which market, window and budget a listed job ran. A row with no
+stored request reads as an empty object rather than an error; a job without a config is still worth
+listing.
+
+**The shape of `progress`** is `{"stage": "search" | "review", "evaluated": <int>, "total": <int>}`.
+The search reports every ten candidates, and the stage switches to `review` when the frozen-segment
+pass starts. It is `{}` before the job has run.
 
 **List view versus detail view, for jobs.** `/jobs` answers every item with `result: null` and
 `hasResult` saying whether there is one; the run record -- every surviving candidate's full metrics
 and every trial's ledger row -- is served by `/jobs/<job_id>` alone. A page of twenty full records
 is more JSON than a client polling for "the one that finished" can use. `POST /run`'s receipt is
-the same envelope, and a queued job has no result yet, so `hasResult` is `false` there.
+the same envelope, and a queued job has no result yet, so `hasResult` is `false` there. `config` and
+`progress` are served by both views.
 
 **`GET /jobs` parameters:** `limit` (1-50, default 20).
 **`GET /candidates` parameters:** `runId` (integer), `status` (`search` / `frozen` / `rejected`),

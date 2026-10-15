@@ -162,6 +162,8 @@ def _factory(trace, engine):
 def _job_row(**overrides):
     row = {"job_id": "job-1", "kind": "factor_mining", "status": "succeeded",
            "result": {"summary": {"frozen": 1}}, "progress": {"phase": "succeeded"},
+           "request": {"sourceId": 7, "market": "USStock", "startDate": "2023-01-02",
+                       "endDate": "2023-06-30", "budget": 50, "__userId": 4},
            "error": None, "created_at": datetime(2026, 1, 1), "started_at": None,
            "finished_at": datetime(2026, 1, 1, 0, 5)}
     row.update(overrides)
@@ -230,8 +232,38 @@ def test_get_job_speaks_the_camel_case_envelope(monkeypatch):
     assert job["result"] == {"summary": {"frozen": 1}}
     assert job["hasResult"] is True
     assert job["createdAt"] == datetime(2026, 1, 1)
-    assert set(job) == {"jobId", "status", "progress", "result", "hasResult", "error",
+    assert set(job) == {"jobId", "status", "progress", "config", "result", "hasResult", "error",
                         "createdAt", "startedAt", "finishedAt"}
+
+
+def test_a_job_carries_the_config_its_caller_submitted(monkeypatch):
+    """The list view has no result, so this is what tells a poller which job it is looking at."""
+    monkeypatch.setattr(mining_service.agent_jobs, "get_job",
+                        lambda job_id, *, user_id: _job_row(job_id=job_id))
+    job = FactorMiningService().get_job("job-1", user_id=USER_ID)
+    assert job["config"] == {"sourceId": 7, "market": "USStock", "startDate": "2023-01-02",
+                             "endDate": "2023-06-30", "budget": 50}
+
+
+def test_the_job_config_never_echoes_the_job_stores_own_channel(monkeypatch):
+    """``request`` holds ``__userId`` and ``__billing``; neither may reach a response."""
+    monkeypatch.setattr(
+        mining_service.agent_jobs, "get_job",
+        lambda job_id, *, user_id: _job_row(job_id=job_id, request={
+            "sourceId": 7, "__userId": 4, "__billing": {"credits": 999},
+            "clientKey": "not a run field",
+        }),
+    )
+    job = FactorMiningService().get_job("job-1", user_id=USER_ID)
+    assert job["config"] == {"sourceId": 7}
+
+
+def test_a_job_without_a_stored_request_still_lists(monkeypatch):
+    """An older row reads as an empty config rather than an error: it is still worth listing."""
+    monkeypatch.setattr(mining_service.agent_jobs, "get_job",
+                        lambda job_id, *, user_id: _job_row(job_id=job_id, request=None))
+    job = FactorMiningService().get_job("job-1", user_id=USER_ID)
+    assert job["config"] == {}
 
 
 def test_get_job_hides_another_features_job(monkeypatch):

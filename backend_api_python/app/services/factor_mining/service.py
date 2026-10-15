@@ -66,6 +66,18 @@ _BLANK_AS_ABSENT = ("sourceId", "budget", "seed", "groups", "holdingPeriod")
 
 _KNOWN_MARKETS = frozenset(list_market_keys())
 
+# The run's configuration as a job carries it back to its caller. Read out of the stored request
+# by an explicit whitelist rather than echoed whole: that mapping also holds the job store's own
+# ``__``-prefixed channel (``__userId``, ``__billing``), which is not the caller's to read. It is
+# part of the job because the list view withholds ``result``, so without it a poller cannot tell
+# which market or window a listed job ran, and the keys that leave are the ones a caller
+# recognises their own submission by.
+_JOB_CONFIG_KEYS = (
+    "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio",
+    "budget", "seed", "templateIds", "groups", "holdingPeriod", "commission", "slippage",
+    "neutralizeIndustry", "thresholds",
+)
+
 
 class FactorMiningService:
     """Submit, poll, and cancel factor mining runs for one tenant.
@@ -352,6 +364,10 @@ def _public_job(
     hand a poller more JSON than it can use -- it lists jobs to find the one that finished, and
     the summary query carries neither. ``hasResult`` says whether there is one to fetch from
     ``GET /jobs/<id>``.
+
+    ``config`` is outside that split on purpose: it is small, and both views need it. A receipt
+    has not run yet and a listed row has no result, so for either of them it is the only thing
+    saying which market, window, or budget the job was opened with.
     """
     if not row:
         return None
@@ -360,6 +376,7 @@ def _public_job(
         "jobId": row.get("job_id"),
         "status": row.get("status"),
         "progress": _json(row.get("progress")) or {},
+        "config": _job_config(row),
         "result": result if include_result else None,
         "hasResult": bool(result),
         "error": row.get("error"),
@@ -367,6 +384,20 @@ def _public_job(
         "startedAt": row.get("started_at"),
         "finishedAt": row.get("finished_at"),
     }
+
+
+def _job_config(row: Mapping[str, Any]) -> dict[str, Any]:
+    """The keys a run config reads, taken from the job's stored request.
+
+    Whitelisted rather than echoed: the stored request is the payload the caller sent plus the
+    job store's own ``__userId``, and handing that back would leak the internal channel into a
+    public response. A row that carries no request -- an older row, or a stub in a test -- reads
+    as an empty config rather than an error, because a job is still worth listing without one.
+    """
+    request = _json(row.get("request"))
+    if not isinstance(request, Mapping):
+        return {}
+    return {key: request[key] for key in _JOB_CONFIG_KEYS if key in request}
 
 
 def _json(value: Any) -> Any:
