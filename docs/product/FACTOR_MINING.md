@@ -278,6 +278,12 @@ the only thing telling a poller which market, window and budget a listed job ran
 stored request reads as an empty object rather than an error; a job without a config is still worth
 listing.
 
+**`error` is one line.** A failed job's stored error is the exception plus a full traceback, but
+that stack names the worker's absolute paths and module layout, and the job store already writes it
+to the job's own log line -- so only the **first line** leaves here. A caller gets the reason it can
+act on (usually one of the `factorMining.*` keys above); the stack stays with the operator. A job
+that never failed keeps the `null` / `''` it was written with.
+
 **The shape of `progress`** is `{"stage": "search" | "review", "evaluated": <int>, "total": <int>}`.
 The search reports every ten candidates, and the stage switches to `review` when the frozen-segment
 pass starts. It is `{}` before the job has run.

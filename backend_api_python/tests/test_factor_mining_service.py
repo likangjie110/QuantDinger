@@ -284,6 +284,40 @@ def test_a_job_without_a_stored_request_still_lists(monkeypatch):
     assert job["config"] == {}
 
 
+def test_a_failed_job_reports_the_reason_without_the_stack(monkeypatch):
+    """The stored error is the exception plus ``traceback.format_exc()``; only the message leaves.
+
+    The stack names the worker's absolute paths and module layout, and the job store already logs
+    it on the job's own line -- so it is the operator's, not the API caller's. The message is what
+    a caller can act on, and it is the i18n key the view renders.
+    """
+    stored = (
+        "factorMining.sourceNotFound\n"
+        "Traceback (most recent call last):\n"
+        '  File "G:\\\\project\\\\QuantDinger\\\\backend_api_python\\\\app\\\\utils'
+        '\\\\agent_jobs.py", line 157, in _run\n'
+        "    result = runner(request_payload, _on_progress)\n"
+        "ValueError: factorMining.sourceNotFound"
+    )
+    monkeypatch.setattr(mining_service.agent_jobs, "get_job",
+                        lambda job_id, *, user_id: _job_row(job_id=job_id, error=stored))
+    job = FactorMiningService().get_job("job-1", user_id=USER_ID)
+    assert job["error"] == "factorMining.sourceNotFound"
+    assert "Traceback" not in job["error"]
+    assert "QuantDinger" not in job["error"]
+
+
+def test_a_job_that_never_failed_keeps_the_error_it_was_written_with(monkeypatch):
+    """A falsy column is returned as it stands, not normalised into a different falsy value."""
+    monkeypatch.setattr(mining_service.agent_jobs, "get_job",
+                        lambda job_id, *, user_id: _job_row(job_id=job_id, error=None))
+    assert FactorMiningService().get_job("job-1", user_id=USER_ID)["error"] is None
+
+    monkeypatch.setattr(mining_service.agent_jobs, "get_job",
+                        lambda job_id, *, user_id: _job_row(job_id=job_id, error=""))
+    assert FactorMiningService().get_job("job-1", user_id=USER_ID)["error"] == ""
+
+
 def test_get_job_hides_another_features_job(monkeypatch):
     monkeypatch.setattr(mining_service.agent_jobs, "get_job",
                         lambda job_id, *, user_id: _job_row(kind="strategy_evolution"))

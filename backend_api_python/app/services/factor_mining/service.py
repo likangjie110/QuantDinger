@@ -385,7 +385,7 @@ def _public_job(
         "config": _job_config(row),
         "result": result if include_result else None,
         "hasResult": bool(result),
-        "error": row.get("error"),
+        "error": _public_error(row.get("error")),
         "createdAt": row.get("created_at"),
         "startedAt": row.get("started_at"),
         "finishedAt": row.get("finished_at"),
@@ -404,6 +404,22 @@ def _job_config(row: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(request, Mapping):
         return {}
     return {key: request[key] for key in _JOB_CONFIG_KEYS if key in request}
+
+
+def _public_error(value: Any) -> Any:
+    """A job's failure, cut to the reason the caller can act on.
+
+    ``agent_jobs`` persists ``f"{exc}\\n{traceback.format_exc()[-2000:]}"``, so the stored column
+    carries a full stack -- and with it the worker's absolute paths and module layout -- to every
+    caller of this API. The message is the caller's; the stack is the operator's, and it is
+    already in the job store's own log line for that job. Only the first line leaves here.
+
+    A falsy value is returned unchanged rather than normalised, so a row that never failed keeps
+    reading as the ``None`` or ``''`` it was written with.
+    """
+    if not value:
+        return value
+    return str(value).splitlines()[0].strip()
 
 
 def _json(value: Any) -> Any:

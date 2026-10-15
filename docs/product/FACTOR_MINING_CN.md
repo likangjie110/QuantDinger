@@ -186,6 +186,8 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 **`config` 不随列表视图省略。** 它是本次请求里**实际出现**的那部分运行字段（第 7 节开头那份名单的子集），由作业表存下的 `request` 经白名单取出——那份 `request` 还带着作业存储自己的 `__userId` / `__billing` 通道，这些不回给调用者。之所以不能省：`result` 被省略时，`config` 就是轮询端唯一能认出「这个作业是哪个市场、哪段区间、多少预算」的东西。缺 `request` 的行读成空对象，不是错误——没有配置的作业仍然值得列出来。
 
+**`error` 只有一行。** 作业失败时作业表存下的是 `异常信息 + 完整 traceback`，但栈里带着 worker 的绝对路径与模块结构，而作业存储已经把它写进该作业自己的日志行——所以只有**首行**离开这里。调用方拿到的是能据以行动的原因（通常就是上文某个 `factorMining.*` 键），栈留给运维。未失败的作业保持写入时的 `null` / `''`。
+
 **`progress` 的形状**是 `{"stage": "search" | "review", "evaluated": <int>, "total": <int>}`；搜索段每 10 个候选上报一次，冻结段复核开始时会切到 `review`。作业尚未跑起来时是 `{}`。
 
 **作业的列表视图与详情视图。** `/jobs` 每一项的 `result` 都是 `null`，`hasResult` 说明有没有可取的记录；运行记录（每个幸存候选的完整 metrics 加每条试验台账行）只由 `/jobs/<job_id>` 提供。一页二十份完整记录，对「只想找出刚跑完的那个」的轮询端来说是白拿的流量。`POST /run` 的回执用的是同一个信封，此时作业还没跑，所以 `hasResult` 是 `false`。`config` 与 `progress` 两个视图都给。
