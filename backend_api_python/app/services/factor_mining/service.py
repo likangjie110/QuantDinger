@@ -138,14 +138,20 @@ class FactorMiningService:
         self._config(request_payload)
         if agent_jobs.count_active_jobs(user_id=int(user_id), kind=JOB_KIND):
             raise ValueError("factorMining.concurrentLimit")
+        stored = {**request_payload, "__userId": int(user_id)}
         receipt = agent_jobs.submit_job(
             user_id=int(user_id),
             agent_token_id=None,
             kind=JOB_KIND,
-            request_payload={**request_payload, "__userId": int(user_id)},
+            request_payload=stored,
             runner=self._run_mining_job,
         )
-        return _public_job(receipt)
+        # The job store's receipt names the job and nothing else -- it carries no ``request`` -- so
+        # the config the caller just submitted is attached here. A receipt that cannot say what was
+        # accepted is not a receipt, and the caller would otherwise have to poll the job to learn
+        # whether their own market and window were the ones queued. ``_job_config`` still reads it
+        # through the whitelist, so ``__userId`` does not travel with it.
+        return _public_job({**receipt, "request": stored})
 
     def get_job(self, job_id: str, *, user_id: int) -> dict[str, Any] | None:
         """One of the caller's mining jobs; another tenant's or another feature's job is not found."""

@@ -196,6 +196,24 @@ def test_submit_rejects_second_concurrent_job(monkeypatch):
         FactorMiningService().submit(user_id=4, payload=_payload())
 
 
+def test_the_receipt_says_what_was_accepted(monkeypatch):
+    """The job store's receipt names the job only, so the config is attached at this boundary.
+
+    Without it a caller cannot tell from the 202 alone whether their own market and window were
+    the ones queued, and the field would read as an empty object on every receipt while the same
+    job read back by id shows the config -- the same job answering twice.
+    """
+    monkeypatch.setattr(mining_service.agent_jobs, "count_active_jobs", lambda **_: 0)
+    monkeypatch.setattr(mining_service.agent_jobs, "submit_job",
+                        lambda **_: {"job_id": "job-1", "status": "queued"})
+
+    receipt = FactorMiningService().submit(user_id=4, payload=_payload())
+
+    assert receipt["config"] == _payload()
+    # The injected tenant scope is the job store's own channel and never leaves through it.
+    assert "__userId" not in receipt["config"]
+
+
 def test_submit_validates_before_it_opens_a_job(monkeypatch):
     """A rejected payload must not leave a queued row behind, so nothing may reach ``submit_job``."""
     monkeypatch.setattr(mining_service.agent_jobs, "submit_job",
