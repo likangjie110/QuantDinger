@@ -463,7 +463,19 @@ def _finish_job(job_id: str, status: str, *, result: Any = None,
 
 
 def get_job(job_id: str, *, user_id: int) -> Optional[dict]:
-    """Tenant-scoped job lookup."""
+    """Tenant-scoped job lookup.
+
+    The failure reason leaves as one line. ``_set_failure`` stores
+    ``f"{exc}\\n{traceback.format_exc()[-2000:]}"``, so the column carries a full stack -- and
+    with it the worker's absolute paths and module layout -- to whatever serves the row to a
+    caller. The message is what a caller can act on; the stack is the operator's, and it is
+    already on the job's own log line ("agent_job <id> kind=<kind> failed").
+
+    Sanitising here rather than at each caller keeps the guarantee with the record's owner: every
+    job kind reads through this function, and a reader cannot tell whether the row it holds was
+    written before this rule existed. ``list_jobs`` selects its columns without ``error``, so
+    this is the only place a stored stack could leave.
+    """
     with get_db_connection() as db:
         cur = db.cursor()
         cur.execute(
@@ -477,9 +489,22 @@ def get_job(job_id: str, *, user_id: int) -> Optional[dict]:
         )
         row = cur.fetchone()
         cur.close()
-    if row and "__billing" in _request_dict(row):
-        row["billing"] = _request_dict(row)["__billing"]
+    if row:
+        if "__billing" in _request_dict(row):
+            row["billing"] = _request_dict(row)["__billing"]
+        row["error"] = _public_error(row.get("error"))
     return row
+
+
+def _public_error(value: Any) -> Any:
+    """The failure's first line, or the falsy value it was written with.
+
+    A falsy column is returned unchanged rather than normalised, so a job that never failed keeps
+    reading as the ``None`` / ``''`` it was stored with.
+    """
+    if not value:
+        return value
+    return str(value).splitlines()[0].strip()
 
 
 def get_job_for_worker(job_id: str) -> Optional[dict]:

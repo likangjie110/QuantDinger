@@ -280,9 +280,11 @@ listing.
 
 **`error` is one line.** A failed job's stored error is the exception plus a full traceback, but
 that stack names the worker's absolute paths and module layout, and the job store already writes it
-to the job's own log line -- so only the **first line** leaves here. A caller gets the reason it can
-act on (usually one of the `factorMining.*` keys above); the stack stays with the operator. A job
-that never failed keeps the `null` / `''` it was written with.
+to the job's own log line -- so only the **first line** leaves. The guarantee is the job store's
+(`agent_jobs.get_job`) and holds for **every job kind** -- backtest and strategy evolution
+included -- rather than being special to this feature. A caller gets the reason it can act on
+(usually one of the `factorMining.*` keys above); the stack stays with the operator. A job that
+never failed keeps the `null` / `''` it was written with.
 
 **The shape of `progress`** is `{"stage": "search" | "review", "evaluated": <int>, "total": <int>}`.
 The search reports every ten candidates, and the stage switches to `review` when the frozen-segment

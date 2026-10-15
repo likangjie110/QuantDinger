@@ -47,7 +47,7 @@
           "status":      { "type": "string", "enum": ["queued","running","succeeded","failed","cancelled"] },
           "request":     { "type": "object" },
           "result":      { "type": "object" },
-          "error":       { "type": "string" },
+          "error":       { "type": "string", "description": "The failure reason, as one line. The stored value is the exception plus a full traceback, and that stack -- worker absolute paths, module layout -- is written to the job's own log line instead of being served." },
           "created_at":  { "type": "string", "format": "date-time" },
           "started_at":  { "type": "string", "format": "date-time" },
           "finished_at": { "type": "string", "format": "date-time" }
