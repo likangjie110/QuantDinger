@@ -196,7 +196,7 @@ const loadCandidates = async () => {
     })
 
     const data = await factorMiningApi.getCandidates(params)
-    candidates.value = data || []
+    candidates.value = data?.items || []
     // 注意：后端返回的是数组，没有 total，这里简化处理
     total.value = data?.length || 0
   } catch (error) {

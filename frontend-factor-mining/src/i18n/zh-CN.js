@@ -66,6 +66,7 @@ export default {
       viewDetail: '查看详情',
       cancel: '取消',
       refresh: '刷新',
+      seeDetail: '见详情',
       noJobs: '暂无作业记录'
     },
 
@@ -106,6 +107,7 @@ export default {
       rejectReason: '淘汰原因',
       createdAt: '创建时间',
       updatedAt: '更新时间',
+      actions: '操作',
       viewDetail: '查看详情',
       noCandidates: '暂无候选记录',
       loadMore: '加载更多'
@@ -123,11 +125,10 @@ export default {
       averageTurnover: '平均换手率',
       icObservations: 'IC 观测数',
       foldIcSigns: '分折符号',
-      stability: '稳定性',
+      // 值为 {firstHalfIc, secondHalfIc}：前半段与后半段的 IC。
+      stability: '前后半 IC',
       factorCorrelation: '因子相关度',
-      oosRankIc: '样本外 Rank IC',
-      deflatedSharpe: '通缩夏普',
-      deflatedSharpeProbability: 'DSR 概率'
+      oosRankIc: '样本外 Rank IC'
     },
 
     // DSL 词表

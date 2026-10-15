@@ -21,7 +21,11 @@
           </template>
         </el-table-column>
 
-        <el-table-column prop="market" :label="t('factorMining.jobs.market')" width="100" />
+        <el-table-column :label="t('factorMining.jobs.market')" width="100">
+          <template #default="{ row }">
+            {{ row.config?.market || '-' }}
+          </template>
+        </el-table-column>
 
         <el-table-column :label="t('factorMining.jobs.dateRange')" width="220">
           <template #default="{ row }">
@@ -37,12 +41,11 @@
                 :status="row.progress.stage === 'review' ? 'success' : ''"
               />
               <div style="font-size: 12px; color: #909399; margin-top: 4px">
-                {{ row.progress.stage }}: {{ row.progress.current }} / {{ row.progress.total }}
+                {{ row.progress.stage }}: {{ row.progress.evaluated }} / {{ row.progress.total }}
               </div>
             </div>
-            <span v-else-if="row.status === 'succeeded'">
-              {{ row.result?.summary?.trials || 0 }} 试验 /
-              {{ row.result?.summary?.frozen || 0 }} 冻结通过
+            <span v-else-if="row.status === 'succeeded' && row.hasResult">
+              {{ t('factorMining.jobs.seeDetail') }}
             </span>
             <span v-else>-</span>
           </template>
@@ -109,8 +112,9 @@ let pollTimer = null
 const loadJobs = async () => {
   loading.value = true
   try {
+    // The endpoint answers { items: [...] }, not a bare array.
     const data = await factorMiningApi.getJobs(50)
-    jobs.value = data || []
+    jobs.value = data?.items || []
   } catch (error) {
     ElMessage.error(t(`factorMining.errors.${error.message}`) || error.message)
   } finally {
@@ -130,8 +134,8 @@ const getStatusType = (status) => {
 }
 
 const formatDateRange = (row) => {
-  if (!row.request) return '-'
-  const { startDate, endDate } = row.request
+  // The list view withholds `result`, so the window it ran comes from `config`.
+  const { startDate, endDate } = row.config || {}
   if (!startDate || !endDate) return '-'
   return `${startDate} ~ ${endDate}`
 }
@@ -143,7 +147,7 @@ const formatDateTime = (datetime) => {
 
 const calculateProgress = (progress) => {
   if (!progress || !progress.total) return 0
-  return Math.round((progress.current / progress.total) * 100)
+  return Math.round((progress.evaluated / progress.total) * 100)
 }
 
 const viewDetail = (job) => {

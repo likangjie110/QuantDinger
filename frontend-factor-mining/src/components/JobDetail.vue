@@ -20,24 +20,24 @@
       </el-descriptions-item>
     </el-descriptions>
 
-    <el-descriptions v-if="job?.request" :title="t('factorMining.jobDetail.config')" :column="2" border style="margin-top: 20px">
+    <el-descriptions v-if="job?.config" :title="t('factorMining.jobDetail.config')" :column="2" border style="margin-top: 20px">
       <el-descriptions-item :label="t('factorMining.submit.sourceId')">
-        {{ job.request.sourceId }}
+        {{ job.config.sourceId }}
       </el-descriptions-item>
       <el-descriptions-item :label="t('factorMining.submit.market')">
-        {{ job.request.market }}
+        {{ job.config.market }}
       </el-descriptions-item>
       <el-descriptions-item :label="t('factorMining.submit.timeframe')">
-        {{ job.request.timeframe }}
+        {{ job.config.timeframe }}
       </el-descriptions-item>
       <el-descriptions-item :label="t('factorMining.jobs.dateRange')">
-        {{ job.request.startDate }} ~ {{ job.request.endDate }}
+        {{ job.config.startDate }} ~ {{ job.config.endDate }}
       </el-descriptions-item>
       <el-descriptions-item :label="t('factorMining.submit.budget')">
-        {{ job.request.budget }}
+        {{ job.config.budget }}
       </el-descriptions-item>
       <el-descriptions-item :label="t('factorMining.submit.seed')">
-        {{ job.request.seed }}
+        {{ job.config.seed }}
       </el-descriptions-item>
     </el-descriptions>
 

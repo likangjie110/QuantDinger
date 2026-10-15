@@ -53,10 +53,11 @@
           {{ formatPercent(candidate.metrics.averageTurnover) }}
         </el-descriptions-item>
         <el-descriptions-item :label="t('factorMining.candidateDetail.icObservations')">
-          {{ candidate.metrics.icObservations }}
+          {{ (candidate.metrics.icSeries || []).length }}
         </el-descriptions-item>
-        <el-descriptions-item :label="t('factorMining.candidateDetail.stability')" v-if="candidate.metrics.stability">
-          前后半: {{ candidate.metrics.stability.halves ? '✓' : '✗' }}
+        <el-descriptions-item :label="t('factorMining.candidateDetail.stability')">
+          {{ formatNumber(candidate.metrics.stability?.firstHalfIc) }} /
+          {{ formatNumber(candidate.metrics.stability?.secondHalfIc) }}
         </el-descriptions-item>
       </el-descriptions>
     </el-card>
@@ -70,8 +71,8 @@
         <el-descriptions-item :label="t('factorMining.candidateDetail.oosRankIc')">
           {{ formatNumber(candidate.outOfSample.rankIc) }}
         </el-descriptions-item>
-        <el-descriptions-item :label="t('factorMining.candidateDetail.deflatedSharpeProbability')">
-          {{ formatPercent(candidate.outOfSample.deflatedSharpeProbability) }}
+        <el-descriptions-item :label="t('factorMining.candidateDetail.icir')">
+          {{ formatNumber(candidate.outOfSample.icir) }}
         </el-descriptions-item>
       </el-descriptions>
     </el-card>
