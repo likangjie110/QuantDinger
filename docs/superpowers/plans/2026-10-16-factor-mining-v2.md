@@ -177,8 +177,9 @@ def test_search_consumes_a_generator_source():
 def test_every_scored_individual_cleared_l1_first():
     # 任何进入评分的个体都先过 dsl.normalize_expression，非法个体只能记为无效试验
 def test_every_emitted_individual_gets_a_trial_row():
-    # 进化模式下 qd_factor_trials 行数 = 引擎实际收到的产出条数，且 ≤ budget
-    # （源头被拒、以及按指纹去重跳过的子代都不是产出，不入台账）
+    # 引擎收到的每一条产出都写了一行 qd_factor_trials
+    # （源头被拒、以及按指纹去重跳过的子代不是产出，不入台账）
+    # 行数 = len(seeds) + 进化产出，因此**可以超过 budget**（R10）
 def test_run_is_byte_identical_for_the_same_seed():
     # 同 seed 两次 run 的 trials 序列与顺序逐字节相同（含进化模式）
 def test_smoothed_template_seven_leaves_room_for_crossover():
