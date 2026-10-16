@@ -254,6 +254,14 @@ def _tiny_cohort():
     ]
 
 
+def _adjacent_cohort():
+    """Seeds that sit one window step from each other, so a rewrite of one lands back on another."""
+    def windowed(window):
+        return {"op": "ts_pct_change", "args": ["close"], "params": {"n": window}}
+
+    return [_seed(windowed(window)) for window in range(4, 11)]
+
+
 def _shorter_wins(expression):
     """A deterministic stand-in for the injected metric: the smaller tree scores higher."""
     return -float(normalize_expression(expression).node_count)
@@ -339,6 +347,40 @@ def test_a_duplicate_expression_is_never_produced_twice(monkeypatch):
     assert fingerprints, "the run produced nothing, so it cannot have repeated anything"
     assert len(set(fingerprints)) == len(fingerprints), "the stream handed out one expression twice"
     assert len(produced) > len(rows), "no draw repeated an expression, so nothing was skipped"
+
+
+def test_a_child_that_equals_a_seed_is_not_produced(monkeypatch):
+    """The run already carries its seeds, so a child that lands back on one is not a new candidate.
+
+    The seeds are windows one step apart, and only they score: the population therefore keeps
+    rewriting its own seeds, which turns a collision from a lucky accident into the routine the
+    spy counts. The assertion is about which fingerprints come back, not about how many, so a
+    change of pace in the search cannot soften it.
+    """
+    cohort = _adjacent_cohort()
+    seeded = {member.fingerprint for member in cohort}
+
+    def keeps_the_family(expression):
+        return 1.0 if normalize_expression(expression).fingerprint in seeded else 0.0
+
+    collisions = []
+
+    def counted(operator):
+        def spy(*arguments):
+            child = operator(*arguments)
+            if isinstance(child, dict) and normalize_expression(child).fingerprint in seeded:
+                collisions.append(child)
+            return child
+        return spy
+
+    for name in ("mutate", "crossover"):
+        monkeypatch.setattr(evolution, name, counted(getattr(evolution, name)))
+
+    rows = _evolve(cohort, budget=120, seed=47, generations=1000, fitness=keeps_the_family)
+    assert rows, "the run produced nothing, so it never had the chance to repeat a seed"
+    assert collisions, "no rewrite landed back on a seed, so the seeds' own fingerprints were never tested"
+    assert not seeded.intersection(row.fingerprint for row in rows), (
+        "a child that repeated a seed was handed to the caller as a new candidate")
 
 
 def test_a_bare_field_child_is_never_produced(monkeypatch):
