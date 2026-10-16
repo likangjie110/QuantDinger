@@ -658,7 +658,7 @@ git commit -m "docs: 同步因子挖掘 v2 的字段、阶梯、契约与键清�
 ## 手工验收（需要真实数据源与 DB，不在单测范围）
 
 1. 枚举模式跑一次 USStock 日线作业，候选列表与顺序 **与升级前逐字节相同**（确定性未被破坏）。
-2. 进化模式跑同一配置，`qd_factor_trials` 行数等于 `budget`，`origin` 列出现 `"evolution"`。
+2. 进化模式跑同一配置，`qd_factor_trials` 行数 = **初代模板候选数 + 进化产出数**（R10 之后初代也入台账，因此**大于 `budget`**；实测 budget=200 → 262 行 / 189 candidates），`origin` 列同时出现 `"template"` 与 `"evolution"`。
 3. 同 seed 重跑进化作业，`trials` 序列逐字节相同。
 4. 已有 `frozen` 候选的 `expression_hash` 在升级前后不变（查库比对）。
 5. 池非空时新候选的 `poolIncrement` 有残差 IC 与池规模；池为空时不淘汰任何候选。
