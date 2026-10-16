@@ -107,10 +107,17 @@ def _series(market: str, key: str, field: str, *, start: datetime, end: datetime
     objects themselves, and a caller standing in for a source by patching the name it is spelled
     under would go on reaching the network instead -- which is a test that hangs on a timeout
     rather than a test that fails.
+
+    One branch per field, and an unknown field is refused rather than routed somewhere. A
+    catch-all branch would answer a field added to :data:`_SOURCE_FIELDS` later with the wrong
+    venue's numbers -- a plausible wrong value instead of a missing one, which is the one
+    failure mode no coverage gate can see.
     """
     if field == "funding_rate":
         return fetch_funding_history(market, key, start=start, end=end)
-    return fetch_open_interest_history(market, key, start=start, end=end)
+    if field == "open_interest":
+        return fetch_open_interest_history(market, key, start=start, end=end)
+    raise KeyError(field)
 
 
 def _values(series: pd.Series, index: pd.Index) -> np.ndarray:

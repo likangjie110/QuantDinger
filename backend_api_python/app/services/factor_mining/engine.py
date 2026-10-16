@@ -1618,10 +1618,13 @@ def _field_panels(
 
     A symbol whose frame does not carry a field keeps a NaN column instead of dropping out of
     that field's cross-section, so a candidate reading it stays comparable across symbols. The
-    field list is the run's own (``fields_for(market)``): a field the run may name has to be in
-    the mapping as a column of nothing when nothing filled it, because a field missing from the
-    mapping altogether is answered as "no such field" -- the one reading that is wrong. What the
-    gap means is the coverage gate's call, not this function's.
+    field list is the run's own (``fields_for(market)``), and the mapping carries all of it:
+    the evaluator pins every expression to this mapping's index and columns, and a pooled
+    candidate is rebuilt against the same mapping, so a field the run may name is a panel every
+    reader agrees on the shape of. Admitting a field is not this function's business -- that is
+    ``fields_for``'s, read by the validator before anything is evaluated, and a field the
+    mapping lacks is *evaluated* as a column of NaN rather than refused. What the gap means is
+    the coverage gate's call.
     """
     index = pd.Index(sorted(set().union(*(frame.index for frame in frames.values()))))
     columns = list(frames)

@@ -15,11 +15,15 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import pytest
-import requests
 
 from app.services.factor_mining import engine as engine_module
 from app.services.factor_mining import market_fields
-from app.services.factor_mining.dsl import PRICE_VOLUME_FIELDS, fields_for
+from app.services.factor_mining.dsl import (
+    PRICE_VOLUME_FIELDS,
+    ExpressionError,
+    fields_for,
+    normalize_expression,
+)
 from app.services.factor_mining.engine import (
     FactorMiningEngine,
     MiningDataProvider,
@@ -27,6 +31,7 @@ from app.services.factor_mining.engine import (
     _field_panels,
     split_periods,
 )
+from app.services.factor_mining.evaluator import ExpressionEvaluator
 from app.services.strategy_v2.snapshot import canonical_frame_bytes
 from tests.test_factor_mining_data import _SOURCE, _FakeBacktestService
 from tests.test_factor_mining_engine import (
@@ -37,22 +42,6 @@ from tests.test_factor_mining_engine import (
 
 
 # --- fixtures: a perpetual universe, its bars, and the two sources it reads -------------------
-
-@pytest.fixture(autouse=True)
-def _no_network(monkeypatch):
-    """A test in this module that reaches a socket fails here rather than at a venue.
-
-    The sources are injected per test, so this can only fire when an injection failed to take
-    effect -- a name the module does not really read per call, say. The failure it converts is a
-    real one: a unit test that spends the venue's rate limit and comes back with a 451 and no
-    data, so a broken seam reads as a data bug with no network anywhere in sight.
-    """
-    def blocked(*_args, **_kwargs):
-        raise AssertionError("these tests inject their sources; nothing here may open a connection")
-
-    monkeypatch.setattr(requests, "get", blocked)
-    monkeypatch.setattr(requests, "request", blocked)
-
 
 # Two key shapes, both of them real: ``@binance:swap`` names a venue and a product, ``@swap``
 # names the product alone -- the spelling this repository builds when a member records no
@@ -321,6 +310,31 @@ def test_a_symbol_without_derivatives_keeps_a_nan_column(monkeypatch):
     assert panel.fields["open_interest"].max().max() == pytest.approx(_OI_USD)
 
 
+def test_a_reached_venue_cannot_be_swallowed_into_an_empty_column(monkeypatch):
+    """The shared no-network guard raises something the sources' own handling cannot swallow.
+
+    Nothing is stubbed here, so this call reaches the real source and the request stops at the
+    guard (``tests/conftest.py``) instead of at a venue. What must happen is the loud outcome: a
+    guard raising an ordinary ``Exception`` would be answered by the sources' own failure
+    handling -- an empty series, an all-NaN column -- and this call would *return* a panel,
+    which is exactly how this module's first version queried Binance without anyone noticing.
+    The type is the pin, so it is asserted rather than the message.
+    """
+    index = pd.date_range("2024-01-01", periods=3, freq="D")
+    with pytest.raises(BaseException) as caught:
+        market_fields.enrich_frames(
+            {_BTC: _bars(index, 0.001)}, market="Crypto",
+            start=datetime(2024, 1, 1), end=datetime(2024, 1, 3),
+        )
+    assert not isinstance(caught.value, Exception), "the sources swallow this class into NaN"
+    # The guard is a property of the suite, not of this call: an injected source still runs.
+    _patch_histories(monkeypatch, _FakeHistories())
+    assert market_fields.enrich_frames(
+        {_BTC: _bars(index, 0.001)}, market="Crypto",
+        start=datetime(2024, 1, 1), end=datetime(2024, 1, 3),
+    )[_BTC]["funding_rate"].notna().all()
+
+
 def test_the_sources_are_asked_with_the_members_own_key_and_the_windows_own_range(monkeypatch):
     """Both key shapes reach the source unparsed, over the bar window and nothing wider.
 
@@ -371,6 +385,39 @@ def test_a_source_that_over_returns_cannot_reach_the_search_panel(monkeypatch):
     assert first.snapshot_id == second.snapshot_id
     assert first.fields["funding_rate"].equals(second.fields["funding_rate"])
     assert first.fields["open_interest"].equals(second.fields["open_interest"])
+
+
+def test_a_field_is_routed_to_its_own_source_and_an_unknown_one_is_refused(monkeypatch):
+    """The advertised fields and the dispatcher answer for the same two fields, and for nothing else.
+
+    A catch-all branch would answer a third field with the second one's venue endpoint -- a
+    plausible wrong number rather than a missing one, which is the failure mode no coverage gate
+    can see -- so the refusal is pinned beside the routing.
+    """
+    routed: list[str] = []
+
+    def funding(_market, _key, *, start, end):
+        routed.append("funding_rate")
+        return pd.Series([0.01], index=pd.DatetimeIndex([start]))
+
+    def interest(_market, _key, *, start, end):
+        routed.append("open_interest")
+        return pd.Series([_OI_USD], index=pd.DatetimeIndex([start]))
+
+    monkeypatch.setattr(market_fields, "fetch_funding_history", funding)
+    monkeypatch.setattr(market_fields, "fetch_open_interest_history", interest)
+
+    assert market_fields.derivative_fields("Crypto") == ("funding_rate", "open_interest")
+    for field in market_fields.derivative_fields("Crypto"):
+        assert isinstance(
+            market_fields._series("Crypto", _BTC, field,
+                                  start=datetime(2024, 1, 1), end=datetime(2024, 1, 2)),
+            pd.Series,
+        )
+    assert routed == ["funding_rate", "open_interest"]
+    with pytest.raises(KeyError):
+        market_fields._series("Crypto", _BTC, "term_structure",
+                              start=datetime(2024, 1, 1), end=datetime(2024, 1, 2))
 
 
 def test_a_market_without_derivative_fields_asks_the_sources_nothing(monkeypatch):
@@ -502,11 +549,14 @@ def test_a_derivative_candidate_without_coverage_is_rejected_at_l2(monkeypatch):
 # --- the panel's own assembly, without a provider ---------------------------------------------
 
 def test_field_panels_keep_a_missing_field_as_an_empty_column():
-    """``_field_panels`` is handed the field set to carry, and fills what no frame holds with NaN.
+    """``_field_panels`` carries the field set it is handed, one shape for every reader.
 
     The panel is pinned to one index and one column order whatever the fields are, which is what
     lets a candidate be aligned to ``fields["close"]`` and what keeps a symbol from dropping out
-    of a derivative cross-section because its own frame has no such column.
+    of a derivative cross-section because its own frame has no such column. What the mapping is
+    *not* is the field set's enforcement: a field it lacks is evaluated as a column of NaN, and
+    refusing a field is ``fields_for``'s job at validation time -- both asserted here, because
+    the mapping carrying the whole set is a decision about panel shape, not about admission.
     """
     index = pd.date_range("2024-01-01", periods=3, freq="D")
     frames = {
@@ -520,3 +570,9 @@ def test_field_panels_keep_a_missing_field_as_an_empty_column():
         assert list(panel.columns) == [_BTC, _SOL], field
     assert panels["funding_rate"][_SOL].isna().all()
     assert panels["open_interest"][_BTC].isna().all()
+
+    price_only = {name: panels[name] for name in PRICE_VOLUME_FIELDS}
+    evaluated = ExpressionEvaluator(price_only, allowed_fields=fields_for("Crypto"))
+    assert evaluated.evaluate("open_interest").isna().all().all(), "a missing field evaluates empty"
+    with pytest.raises(ExpressionError):
+        normalize_expression("open_interest", allowed_fields=PRICE_VOLUME_FIELDS)
