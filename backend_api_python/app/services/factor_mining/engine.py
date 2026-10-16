@@ -910,11 +910,13 @@ class FactorMiningEngine:
         comparison set's own, so a pooled member arrives carrying ``POOL_NAMESPACE`` and the gate
         below partitions on that prefix. A name the study could not measure is absent from the
         study, and ``comparison`` is where it is recovered: every name that was *asked about* is
-        put in the mapping, an unmeasured one as a NaN. That presence is the whole point -- the
-        gate tells "never asked about" from "asked about and unmeasurable" by the name being
-        there, and fails closed on the second. A zero invented here would instead read as a
-        measurement that cleared a duplicate, and dropping the name would read as a pool that
-        never held it. A caller passing no ``comparison`` (a unit test of this method, or the
+        put in the mapping, an unmeasured one as a NaN -- including the pool members that could
+        not be rebuilt at all, which the assembly reports as skips rather than comparison names
+        and which travel here under the name the member would have had. That presence is the
+        whole point -- the gate tells "never asked about" from "asked about and unmeasurable" by
+        the name being there, and fails closed on the second. A zero invented here would instead
+        read as a measurement that cleared a duplicate, and dropping the name would read as a pool
+        that never held it. A caller passing no ``comparison`` (a unit test of this method, or the
         proxies the study falls back to) gets exactly what the study reported.
 
         The selected factor is named ``"expression"``, and the guard against reading the row
@@ -932,10 +934,17 @@ class FactorMiningEngine:
             name: value
             for name, value in zip(names[1:], matrix[0][1:])
         }
-        for name in comparison.names() if comparison is not None else ():
-            measured.setdefault(name, float("nan"))
+        if comparison is not None:
+            # A member the pool could not rebuild is a skip, not a comparison name, so ``names()``
+            # does not carry it -- the assembly drops a row with no fingerprint for the same
+            # reason it is dropped here: it has no name to be asked about under.
+            skipped = [
+                f"{POOL_NAMESPACE}{str(item.get('fingerprint') or '')[:POOL_NAME_LENGTH]}"
+                for item in comparison.skipped if item.get("fingerprint")
+            ]
+            for name in (*comparison.names(), *skipped):
+                measured.setdefault(name, float("nan"))
         return measured
-
     def _progress(self, evaluated: int, total: int) -> None:
         """Report every ``PROGRESS_EVERY``th candidate, so a long run is not a black box."""
         if evaluated % PROGRESS_EVERY == 0:

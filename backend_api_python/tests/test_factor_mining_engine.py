@@ -829,6 +829,36 @@ def test_a_pool_members_twin_is_rejected_under_the_pool_key():
     assert result["trials"][0]["reason"] == "factorMining.reject.duplicateInPool"
 
 
+def test_a_pool_member_that_never_rebuilt_rejects_the_candidate():
+    """A member the pool could not rebuild is asked about too, and it is not a clearance.
+
+    ``pool_panels`` hands back a member whose stored expression no longer evaluates as a skip
+    rather than a panel, and the assembly keeps it out of the comparison names -- so the only way
+    the gate hears about it at all is the skip list, carried as the pool name the member would
+    have had and no reading. The comparison set here is a real assembly over a pool of one
+    unreadable member, the shape a stored pool takes after an operator set moves on: with the
+    skip dropped, the run compares against a set one member short of the pool, reports nothing,
+    and accepts candidates the pool may already hold.
+    """
+    from app.services.factor_mining.pool import PoolMember
+
+    frames, members = _fixture()
+    unreadable = [PoolMember(candidate_id=7, fingerprint="a" * 64,
+                             expression={"op": "nope", "args": [], "params": {}})]
+    provider = _FakeProvider(frames, members)
+    provider.comparison = _assembly(frames, members, pool_loader=_recording_pool(unreadable, []),
+                                    factor_limit=0, pool_limit=5)
+    assert provider.comparison.pool == () and provider.comparison.factors == ()
+    assert [item["fingerprint"] for item in provider.comparison.skipped] == ["a" * 64]
+
+    result = FactorMiningEngine(data_provider=provider).run(
+        user_id=1, code="PORTFOLIO = {}", config=_config(),
+    )
+
+    assert result["trials"][0]["stage"] == "L4"
+    assert result["trials"][0]["reason"] == "factorMining.reject.unverifiableRedundancy"
+
+
 def test_a_pool_member_that_could_not_be_measured_rejects_the_candidate():
     """A member the study could not compare still reaches the gate -- as no evidence.
 
