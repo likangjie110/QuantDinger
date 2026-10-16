@@ -154,9 +154,9 @@ git commit -m "feat: 因子挖掘新增确定性种群循环与精英保留"
 ### 任务 3：引擎接入、warmup 上界与深度预算
 
 **文件：**
-- 修改：`backend_api_python/app/services/factor_mining/engine.py:310-354`（`run` 的候选来源）、`:819-839`（`_warmup_bars`）、`docs` 无
+- 修改：`backend_api_python/app/services/factor_mining/engine.py:310-354`（`run` 的候选来源）、`:819-839`（`_warmup_bars`）
 - 修改：`backend_api_python/app/services/factor_mining/dsl.py:20`（`MAX_DEPTH`）
-- 修改：`backend_api_python/app/services/factor_mining/templates.py:108`（模板 7 削平）
+- **不得修改**：`backend_api_python/app/services/factor_mining/templates.py`
 - 测试：`backend_api_python/tests/test_factor_mining_engine.py`、`tests/test_factor_mining_dsl.py`、`tests/test_factor_mining_templates.py`
 
 - [ ] **步骤 1：编写失败的测试**
@@ -188,7 +188,11 @@ def test_smoothed_template_seven_leaves_room_for_crossover():
 
 - [ ] **步骤 3：实现三处改动**
 
-`dsl.py:20` 的 `MAX_DEPTH` 由 6 改为 8（**不递增 `DSL_VERSION`**：这是校验策略变更，表达式语义未变，指纹必须保持稳定）。`templates.py` 的 `conditional_filter` 骨架削平一层，使加平滑变体后深度 ≤ 6，交叉时有余量。`engine.py` 的候选来源改为接受 `Iterable[CandidateSeed]`：枚举模式下由 `expand_candidates` 提供（行为不变），进化模式下由 `evolution.evolve` 提供，进度总量在进化模式下按 `budget` 上报。`engine` 向 `evolve` 注入 `fitness` 回调（取该个体已算出的 L2/L3 指标，默认 `icir`），进化模块本身不碰数据、不算指标。`_warmup_bars` 改为恒定返回 `dsl.MAX_LOOKBACK`——进化无法预知最长 lookback，取上限是唯一保持正确性的选择，代价是每次 run 多取 504 根 bar。
+`dsl.py:20` 的 `MAX_DEPTH` 由 6 改为 8（**不递增 `DSL_VERSION`**：这是校验策略变更，表达式语义未变，指纹必须保持稳定）。
+
+**不要削平模板 7。** 单靠 `MAX_DEPTH` 改 8 就已经给了它余量：`conditional_filter` 的骨架深度是 5（`where`→`gt`→`ts_rank`→`ts_mean`→`volume`），加一层平滑变体后是 6，距新上界 8 恰好 **2 层**，满足 `test_smoothed_template_seven_leaves_room_for_crossover` 的「至少 2 层余量」。改模板骨架会改掉 `expand_candidates` 的枚举输出，直接违反本计划的人工验收第 1 条（枚举模式候选列表与顺序与升级前逐字节相同）——那一条是 v1 确定性契约的回归门。该测试因此退化为**回归守卫**：它守的是「模板 7 的余量存在」，不是「模板 7 被改写」。
+
+`engine.py` 的候选来源改为接受 `Iterable[CandidateSeed]`：枚举模式下由 `expand_candidates` 提供（行为不变），进化模式下由 `evolution.evolve` 提供，进度总量在进化模式下按 `budget` 上报。`engine` 向 `evolve` 注入 `fitness` 回调（取该个体已算出的 L2/L3 指标，默认 `icir`），进化模块本身不碰数据、不算指标。`_warmup_bars` 改为恒定返回 `dsl.MAX_LOOKBACK`——进化无法预知最长 lookback，取上限是唯一保持正确性的选择，代价是每次 run 多取 504 根 bar。
 
 - [ ] **步骤 4：运行测试验证通过**
 
