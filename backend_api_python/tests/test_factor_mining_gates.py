@@ -213,21 +213,47 @@ def test_the_two_correlation_thresholds_are_independently_overridable():
 
 
 def test_pool_redundancy_stays_fail_closed_on_all_nan():
-    """Nothing finite anywhere is still rejected as unverifiable, whichever section it came from.
+    """A section that was asked about and measured nothing is rejected as unverifiable.
 
-    A pool member the engine could not measure is not a member the candidate cleared -- the rule
-    the built-in section has always had, unchanged by the split. It is one rule for the whole
-    comparison, not one per section: a NaN in either section while the other was measured is a
-    comparison that ran, and its readings decide. Requiring each section to carry evidence of its
-    own would fail closed on every run whose pool was empty or unmeasurable, which is a rejection
-    the pool never asked for.
+    A pool member the engine could not measure is not a member the candidate cleared; ``NaN`` is
+    how an unmeasured name travels, so the section is present in the mapping and holds nothing
+    finite -- the one state L4 refuses to judge. That rule is per section rather than for the
+    comparison as a whole: a built-in section that measured fine and came back clear says nothing
+    about the pool member nobody could rebuild, and the ladder's only redundancy checkpoint is not
+    cleared by a comparison that half ran.
     """
     assert screen_redundancy({"pool:aaaaaaaa": float("nan")}, GateThresholds()).reason == (
         "factorMining.reject.unverifiableRedundancy")
     assert screen_redundancy({"pool:aaaaaaaa": float("inf"), "pool:bbbbbbbb": None}, GateThresholds()).reason == (
         "factorMining.reject.unverifiableRedundancy")
-    assert screen_redundancy({"momentum_20": float("nan"), "pool:aaaaaaaa": 0.1}, GateThresholds()).passed is True
-    assert screen_redundancy({"pool:aaaaaaaa": float("nan"), "momentum_20": 0.1}, GateThresholds()).passed is True
+    assert screen_redundancy({"momentum_20": 0.1, "pool:aaaaaaaa": float("nan")}, GateThresholds()).reason == (
+        "factorMining.reject.unverifiableRedundancy")
+    assert screen_redundancy({"momentum_20": float("nan"), "pool:aaaaaaaa": 0.1}, GateThresholds()).reason == (
+        "factorMining.reject.unverifiableRedundancy")
+    # An unmeasured member beside a measured one is just a skipped pair, and the section the
+    # candidate was actually compared against decides on its own.
+    assert screen_redundancy({"pool:aaaaaaaa": float("nan"), "pool:bbbbbbbb": 0.3}, GateThresholds()).passed is True
+    assert screen_redundancy({"pool:aaaaaaaa": float("nan"), "pool:bbbbbbbb": 0.9}, GateThresholds()).reason == (
+        "factorMining.reject.duplicateInPool")
+
+
+def test_a_comparison_section_that_was_never_asked_about_is_not_required():
+    """Only the sections present in the mapping have to carry evidence.
+
+    A run outside the pool -- nothing frozen yet, or nothing in it rebuildable over this window --
+    asks about no pool member at all, and a gate that demanded a pool reading would reject every
+    candidate such a run ever produces. Only the section that appears is answerable. An empty
+    mapping is a different state again: the study could not be read, nothing was compared, and
+    that stays unverifiable rather than becoming a pass.
+    """
+    assert screen_redundancy({"momentum_20": 0.3}, GateThresholds()).passed is True
+    assert screen_redundancy({"pool:aaaaaaaa": 0.3}, GateThresholds()).passed is True
+    # A pool bar below everything is still not a bar the absent pool section can fail.
+    assert screen_redundancy({"momentum_20": 0.3}, GateThresholds(max_pool_correlation=0.1)).passed is True
+    assert screen_redundancy({}, GateThresholds()).reason == "factorMining.reject.unverifiableRedundancy"
+    assert screen_redundancy({}, GateThresholds(max_builtin_correlation=0.0,
+                                                max_pool_correlation=0.0)).reason == (
+        "factorMining.reject.unverifiableRedundancy")
 
 
 def test_screen_out_of_sample_rejects_thin_out_of_sample_ic():

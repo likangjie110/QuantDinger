@@ -616,6 +616,20 @@ def _recording_pool(members, calls):
     return loader
 
 
+def _unrelated_panel(frames):
+    """A comparison panel that is measured but unrelated to the fixture's candidates.
+
+    The fixture's prices are exact geometric curves, so every candidate ranks the six symbols in
+    symbol order. A panel holding one fixed cross-section outside that order is a real
+    cross-sectional measurement the de-duplication gate does not fire on, which is what a test
+    needs when a rejection must be attributable to the pool half rather than to the built-in one.
+    """
+    panel = _evaluator(frames, _MOMENTUM_5)
+    for column, value in zip(panel.columns, [3.0, 6.0, 1.0, 5.0, 2.0, 4.0]):
+        panel[column] = value
+    return panel
+
+
 def _computable_factor_ids(frames):
     """Registry ids a panel carrying these columns can measure, derived outside the module.
 
@@ -787,6 +801,59 @@ def test_the_pool_section_follows_the_order_the_pool_loader_returned():
 
     assert assembled.pool == ("pool:ffffffff", "pool:aaaaaaaa", "pool:bbbbbbbb")
     assert set(assembled.panels) == set(assembled.pool)
+
+
+def test_a_pool_members_twin_is_rejected_under_the_pool_key():
+    """The pool half reaches the ledger: a candidate duplicating a frozen member says so.
+
+    The injected built-in is measured and clear, so the only reading above its bar is the pooled
+    one -- and the row that records the rejection names the pool, not the registry. This is the
+    seam the second threshold exists for: the same candidate measured against the registry alone
+    would have passed, and a ledger that called this a built-in duplicate would send a reader
+    looking for a factor that is not there.
+    """
+    frames, members = _fixture()
+    provider = _FakeProvider(frames, members)
+    provider.comparison = ComparisonSet(
+        factors=("rsi",),
+        pool=("pool:deadbeef",),
+        panels={"rsi": _unrelated_panel(frames),
+                "pool:deadbeef": _evaluator(frames, _NEGATED_MOMENTUM_5)},
+    )
+
+    result = FactorMiningEngine(data_provider=provider).run(
+        user_id=1, code="PORTFOLIO = {}", config=_config(),
+    )
+
+    assert result["trials"][0]["stage"] == "L4"
+    assert result["trials"][0]["reason"] == "factorMining.reject.duplicateInPool"
+
+
+def test_a_pool_member_that_could_not_be_measured_rejects_the_candidate():
+    """A member the study could not compare still reaches the gate -- as no evidence.
+
+    The member was asked about and is absent from the study, which looks exactly like a pool that
+    never held it unless the engine carries the name back with a NaN. Without that the gate sees
+    a comparison set that was fully measured and clears a candidate whose own library holds a
+    member nothing could be measured against -- the skipped member read as a distinction it never
+    earned. The built-in section here measured cleanly, which is the point: one section's reading
+    does not stand in for the other's.
+    """
+    frames, members = _fixture()
+    provider = _FakeProvider(frames, members)
+    provider.comparison = ComparisonSet(
+        factors=("rsi",),
+        pool=("pool:deadbeef",),
+        panels={"rsi": _unrelated_panel(frames),
+                "pool:deadbeef": _evaluator(frames, _MOMENTUM_5) * float("nan")},
+    )
+
+    result = FactorMiningEngine(data_provider=provider).run(
+        user_id=1, code="PORTFOLIO = {}", config=_config(),
+    )
+
+    assert result["trials"][0]["stage"] == "L4"
+    assert result["trials"][0]["reason"] == "factorMining.reject.unverifiableRedundancy"
 
 
 def test_the_candidate_is_compared_against_registry_factors():

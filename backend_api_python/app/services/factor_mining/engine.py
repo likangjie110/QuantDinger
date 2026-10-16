@@ -772,7 +772,7 @@ class FactorMiningEngine:
         for screen, payload in (
             (screen_metrics, metrics),
             (screen_stability, metrics),
-            (screen_redundancy, self._correlations(metrics)),
+            (screen_redundancy, self._correlations(metrics, comparison)),
         ):
             verdict = screen(payload, config.thresholds)
             if not verdict.passed:
@@ -901,31 +901,40 @@ class FactorMiningEngine:
             comparison_panels=comparison.panels or None,
         )
 
-    def _correlations(self, metrics: Mapping[str, Any]) -> dict[str, float]:
-        """The candidate's measured correlation against each built-in factor that was scored.
+    def _correlations(self, metrics: Mapping[str, Any],
+                      comparison: ComparisonSet | None = None) -> dict[str, float]:
+        """The candidate's correlation against every factor it was compared against.
 
         Read out of the correlation study the research engine already ran, which puts the
-        selected factor first and every built-in that had enough overlapping observations after
-        it. A built-in the study could not measure is absent rather than zero: ``screen_
-        redundancy`` filters to finite values itself, and a zero this method invented would read
-        as a measurement that cleared a duplicate. An unreadable study yields an empty mapping,
-        which the gate rejects as unverifiable -- the gate owns that decision, not this method.
+        selected factor first and every factor it could compare after it. The names are the
+        comparison set's own, so a pooled member arrives carrying ``POOL_NAMESPACE`` and the gate
+        below partitions on that prefix. A name the study could not measure is absent from the
+        study, and ``comparison`` is where it is recovered: every name that was *asked about* is
+        put in the mapping, an unmeasured one as a NaN. That presence is the whole point -- the
+        gate tells "never asked about" from "asked about and unmeasurable" by the name being
+        there, and fails closed on the second. A zero invented here would instead read as a
+        measurement that cleared a duplicate, and dropping the name would read as a pool that
+        never held it. A caller passing no ``comparison`` (a unit test of this method, or the
+        proxies the study falls back to) gets exactly what the study reported.
 
         The selected factor is named ``"expression"``, and the guard against reading the row
         below it as the candidate's own is deliberate: the study only lists a factor it could
-        compare, so the candidate's row can be missing while the matrix still holds built-ins.
-        Trimming the names list by position would then measure the candidate against a built-in's
-        correlations -- one factor short, and silently.
+        compare, so the candidate's row can be missing while the matrix still holds comparison
+        factors. Trimming the names list by position would then measure the candidate against
+        another factor's correlations -- one factor short, and silently.
         """
         block = metrics.get("factorCorrelation") or {}
         names = list(block.get("factors") or ())
         matrix = list(block.get("matrix") or ())
         if not names or not matrix or names[0] != "expression":
             return {}
-        return {
+        measured = {
             name: value
             for name, value in zip(names[1:], matrix[0][1:])
         }
+        for name in comparison.names() if comparison is not None else ():
+            measured.setdefault(name, float("nan"))
+        return measured
 
     def _progress(self, evaluated: int, total: int) -> None:
         """Report every ``PROGRESS_EVERY``th candidate, so a long run is not a black box."""

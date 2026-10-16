@@ -215,25 +215,29 @@ def screen_redundancy(correlations: Mapping[str, float], thresholds: GateThresho
     different places. Built-ins are judged first, so a candidate that duplicates both is reported
     as the built-in duplicate it also is.
 
-    Only finite correlations count as evidence. A NaN pair is one the engine could not compare --
-    the fundamental factors carry no data on a price-volume run -- and skipping it is not the same
-    as clearing the candidate. So the fail-closed rule covers the comparison as a whole: when
-    nothing finite was measured in either section the gate cannot run at all, and an unrun
-    de-duplication check rejects rather than waves a candidate past the ladder's only redundancy
-    checkpoint. A section that yielded nothing finite while the other did is not a rejection of
-    its own -- an empty pool, or one whose members could not be rebuilt, is a comparison that still
-    ran, and rejecting on it would fail every run made outside the pool.
+    Only finite correlations count as evidence, and the rule is per section. A NaN pair is one the
+    engine could not compare -- a fundamental factor carrying no data on a price-volume run, or a
+    pooled member whose expression no longer rebuilds -- and skipping it is not the same as
+    clearing the candidate. So a section that appears in the mapping and holds nothing finite is
+    one the gate cannot judge, and L4 rejects as unverifiable rather than waving a candidate past
+    the ladder's only redundancy checkpoint: "the pool was compared and cleared" is a claim only
+    the readings can support. A section whose names are absent was never asked about -- a run with
+    no frozen pool, or one that reached no registry factor -- and demands nothing, or every run
+    outside the pool would fail closed. A mapping with nothing in it is neither state: nothing was
+    compared at all, and that is unverifiable too.
     """
-    builtin: list[float] = []
-    pooled: list[float] = []
+    # Keyed by whether the name is pool-namespaced. A key exists once a name of that section was
+    # asked about, measurable or not, which is the difference this gate turns on.
+    readings: dict[bool, list[float]] = {}
     for name, value in correlations.items():
+        section = readings.setdefault(str(name).startswith(POOL_NAMESPACE), [])
         reading = _finite(value)
-        if reading is None:
-            continue
-        section = pooled if str(name).startswith(POOL_NAMESPACE) else builtin
-        section.append(abs(reading))
-    if not builtin and not pooled:
+        if reading is not None:
+            section.append(abs(reading))
+    if not readings or any(not section for section in readings.values()):
         return _failed("L4", "factorMining.reject.unverifiableRedundancy")
+    builtin = readings.get(False)
+    pooled = readings.get(True)
     if builtin and max(builtin) >= thresholds.max_builtin_correlation:
         return _failed("L4", "factorMining.reject.duplicateBuiltin")
     if pooled and max(pooled) >= thresholds.max_pool_correlation:
