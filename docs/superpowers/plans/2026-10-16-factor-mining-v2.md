@@ -4,7 +4,7 @@
 
 **目标：** 把因子挖掘从「模板展开的确定性枚举」升级为「在既有 DSL 与门槛体系内做受约束的组合搜索」，并让搜索结果可被判定为是否带来增量信息：表达式树进化/交叉搜索、候选间数值去重（含补齐 spec 承诺的内置因子比较集合）、因子池协同价值评估、四个跨市场数据字段。
 
-**架构：** v1 的候选统一表示（JSON 表达式树 + `dsl.py` 指纹）保持不变，进化搜索只是**同一表示的另一种生成器**——产出的每个个体照旧过 L1 合法性校验、照旧逐级淘汰、照旧写 `qd_factor_trials`。因此新增的是生成器与两个评估维度，不是新的评估管线。候选间去重与池增量共用同一条新能力（从存储的表达式重算因子面板），因此合为一个工作流。跨市场字段走 `dsl.py` 字段白名单 + `fundamental_data.enrich_panel` 这条既有的面板扩展口，白名单仍由 L1 强制。作业、存储、HTTP 契约沿用 v1，只做增量字段，**不新增端点、不新增进程角色、不新增 job kind**。
+**架构：** v1 的候选统一表示（JSON 表达式树 + `dsl.py` 指纹）保持不变，进化搜索只是 **同一表示的另一种生成器**——产出的每个个体照旧过 L1 合法性校验、照旧逐级淘汰、照旧写 `qd_factor_trials`。因此新增的是生成器与两个评估维度，不是新的评估管线。候选间去重与池增量共用同一条新能力（从存储的表达式重算因子面板），因此合为一个工作流。跨市场字段走 `dsl.py` 字段白名单 + `fundamental_data.enrich_panel` 这条既有的面板扩展口，白名单仍由 L1 强制。作业、存储、HTTP 契约沿用 v1，只做增量字段，**不新增端点、不新增进程角色、不新增 job kind**。
 
 **技术栈：** Python 3.11、Flask、pandas、PostgreSQL（psycopg 风格 `get_db_connection`）、Celery（经 `agent_jobs`）、pytest。
 
@@ -22,9 +22,9 @@
 - 保留工作区已有未提交改动：只追加、不回滚、不覆盖无关文件（开工前先看一次 `git status`，不要假定它和本计划写作时一致）。
 - 每个任务结束前：`python -m py_compile <改动文件>` 通过 + 该任务的测试通过。
 - **确定性是 v1 的既有验收，v2 不得放宽**（`engine.py:292-299` 模块 docstring 的契约）：同 `(templates, budget, seed, 搜索模式)` → 字节级相同的候选列表与顺序。进化搜索的随机性只能来自 `random.Random(seed)` 实例，集合遍历一律排序后再迭代。
-- **`qd_factor_candidates.expression_hash` 在本次升级中必须保持稳定**：改变 `MAX_DEPTH` 是**校验策略**变更，不是表达式语义变更，因此**不递增 `DSL_VERSION`**（`dsl.py:19`）——递增会让候选库全部指纹失效、旧候选被当成新表达式重复入库。这条是本次升级里唯一容易误判的取舍，任务 3 必须用测试钉住「同一表达式升级前后指纹相同」。
+- **`qd_factor_candidates.expression_hash` 在本次升级中必须保持稳定**：改变 `MAX_DEPTH` 是 **校验策略** 变更，不是表达式语义变更，因此 **不递增 `DSL_VERSION`**（`dsl.py:19`）——递增会让候选库全部指纹失效、旧候选被当成新表达式重复入库。这条是本次升级里唯一容易误判的取舍，任务 3 必须用测试钉住「同一表达式升级前后指纹相同」。
 - **字段白名单只进「实际拥有且时间口径可靠」的字段**（规格 §6.2）：跨市场字段在能证明点时可用性之前不得进白名单。
-- **试验台账是选择偏差校正的分母**（规格 §10.5）：进化搜索**产出的每一个个体**（无论最终通过哪一级门槛）都必须写 `qd_factor_trials`——个体数量上升不是改为抽样留痕的理由。**在源头被拒的子代（非法树、裸字段）与按指纹去重跳过的子代不算产出**：它们从未被评估，不入台账。这与 v1 一致：`expand_candidates` 也是先按指纹去重才返回候选。
+- **试验台账是选择偏差校正的分母**（规格 §10.5）：进化搜索 **产出的每一个个体**（无论最终通过哪一级门槛）都必须写 `qd_factor_trials`——个体数量上升不是改为抽样留痕的理由。**在源头被拒的子代（非法树、裸字段）与按指纹去重跳过的子代不算产出**：它们从未被评估，不入台账。这与 v1 一致：`expand_candidates` 也是先按指纹去重才返回候选。
 - **候选池的边界口径固定为 `(user_id, market, timeframe)`**：因子值是截面信号，跨市场与跨周期不可比，只有同市场同周期内的候选才构成「要不要再来一个」的选择集。
 
 ## 审查重点（Review Focus）
@@ -163,11 +163,15 @@ git commit -m "feat: 因子挖掘新增确定性种群循环与精英保留"
 
 ```python
 def test_the_fingerprint_is_unchanged_by_the_raised_depth_bound():
-    # 同一表达式在 MAX_DEPTH=6 与 8 下 normalize_expression 的 fingerprint 相同
+    # 同一表达式在 MAX_DEPTH = 6 与 8 下 normalize_expression 的 fingerprint 相同
 def test_max_depth_bound_accepts_eight_and_rejects_nine():
-    # 深度 8 的树通过；深度 9 抛 factorMining.reject.invalid:tooDeep
-def test_warmup_uses_the_dsl_lookback_budget():
-    # 无论候选来自枚举还是进化，warmup 恒为 MAX_LOOKBACK，不再由预扫决定
+    # 深度 8 的树通过；深度 9 抛 factorMining.reject.invalid: tooDeep
+def test_evolution_warmup_uses_the_dsl_lookback_budget():
+    # 进化模式的 warmup 恒为 MAX_LOOKBACK —— 交叉可把任意窗口嫁到任意路径，上限是唯一正确的界
+def test_enumeration_warmup_is_unchanged_from_v1():
+    # 枚举模式的抓取区间与升级前逐字节相同（退回"恒定取上限"就红）
+def test_the_template_seeds_are_evaluated_in_evolution_mode():
+    # 进化模式下初代模板候选照常进 trials 台账（去掉 chain 就红）
 def test_search_consumes_a_generator_source():
     # run 接受可迭代的候选来源，边产出边评估，进度总量为预算而非预先长度
 def test_every_scored_individual_cleared_l1_first():
@@ -190,9 +194,13 @@ def test_smoothed_template_seven_leaves_room_for_crossover():
 
 `dsl.py:20` 的 `MAX_DEPTH` 由 6 改为 8（**不递增 `DSL_VERSION`**：这是校验策略变更，表达式语义未变，指纹必须保持稳定）。
 
-**不要削平模板 7。** 单靠 `MAX_DEPTH` 改 8 就已经给了它余量：`conditional_filter` 的骨架深度是 5（`where`→`gt`→`ts_rank`→`ts_mean`→`volume`），加一层平滑变体后是 6，距新上界 8 恰好 **2 层**，满足 `test_smoothed_template_seven_leaves_room_for_crossover` 的「至少 2 层余量」。改模板骨架会改掉 `expand_candidates` 的枚举输出，直接违反本计划的人工验收第 1 条（枚举模式候选列表与顺序与升级前逐字节相同）——那一条是 v1 确定性契约的回归门。该测试因此退化为**回归守卫**：它守的是「模板 7 的余量存在」，不是「模板 7 被改写」。
+**不要削平模板 7。** 单靠 `MAX_DEPTH` 改 8 就已经给了它余量：`conditional_filter` 的骨架深度是 5（`where` → `gt` → `ts_rank` → `ts_mean` → `volume`），加一层平滑变体后是 6，距新上界 8 恰好 **2 层**，满足 `test_smoothed_template_seven_leaves_room_for_crossover` 的「至少 2 层余量」。改模板骨架会改掉 `expand_candidates` 的枚举输出，直接违反本计划的人工验收第 1 条（枚举模式候选列表与顺序与升级前逐字节相同）——那一条是 v1 确定性契约的回归门。该测试因此退化为 **回归守卫**：它守的是「模板 7 的余量存在」，不是「模板 7 被改写」。
 
-`engine.py` 的候选来源改为接受 `Iterable[CandidateSeed]`：枚举模式下由 `expand_candidates` 提供（行为不变），进化模式下由 `evolution.evolve` 提供，进度总量在进化模式下按 `budget` 上报。`engine` 向 `evolve` 注入 `fitness` 回调（取该个体已算出的 L2/L3 指标，默认 `icir`），进化模块本身不碰数据、不算指标。`_warmup_bars` 改为恒定返回 `dsl.MAX_LOOKBACK`——进化无法预知最长 lookback，取上限是唯一保持正确性的选择，代价是每次 run 多取 504 根 bar。
+`engine.py` 的候选来源改为接受 `Iterable[CandidateSeed]`：枚举模式下由 `expand_candidates` 提供（行为不变），进化模式下由 **`itertools.chain(seeds, evolve(seeds, ...))`** 提供。**初代模板候选必须照常被评估并写台账**——模板库是这个模块唯一的金融假设来源（规格 §7），把它们只当繁殖材料等于整批丢掉有假设支撑的候选；而且 R6 里「初代已各占一行台账」这个理由只有初代被评估时才成立。`evolve` 是惰性生成器，引擎消费到它时初代已全部评完，因此**第 0 代有适应度**，精英保留不会在第 0 代退化。进度总量在进化模式下是 `len(seeds) + budget`（上限口径，提前收尾时实际更少）。
+
+`engine` 向 `evolve` 注入 `fitness` 回调（取该个体已算出的 L2/L3 指标，默认 `icir`），进化模块本身不碰数据、不算指标。
+
+`_warmup_bars` 改为**按搜索模式区分**：**枚举模式沿用改动前的算法**（候选全部来自模板，最长 lookback 可以精确算出，行为与升级前逐字节一致），**进化模式才返回 `dsl.MAX_LOOKBACK`**。恒定取上限会无条件放大枚举模式的抓取区间（A 股日线 1 年区间：284 天 → 953 天，会被 1095 天策略拒绝），那是 v1 回归而不是可接受的代价。
 
 - [ ] **步骤 4：运行测试验证通过**
 
@@ -218,10 +226,10 @@ git commit -m "feat: 因子挖掘搜索接受进化候选来源，深度预算�
 def test_search_mode_defaults_to_enumeration():
     # 不传搜索模式时行为与 v1 完全一致（候选列表逐字节相同）
 def test_evolution_mode_requires_a_population_size():
-    # searchMode="evolution" 而不给种群参数 → factorMining.invalidParameter
+    # searchMode = "evolution" 而不给种群参数 → factorMining.invalidParameter
 ```
 
-`/estimate` 的两键契约**不新增测试**：v1 既有断言已在守着它，本任务只需保持它绿——那条断言就是不把 `mode` 塞进返回体的护栏。
+`/estimate` 的两键契约 **不新增测试**：v1 既有断言已在守着它，本任务只需保持它绿——那条断言就是不把 `mode` 塞进返回体的护栏。
 
 - [ ] **步骤 2：运行测试验证失败**
 
@@ -400,7 +408,7 @@ def test_an_empty_pool_short_circuits_to_no_measurement():
 
 （第二个形参即任务 5 `pool.pool_panels()` 的返回值；此处改名以免与函数同名。）
 
-对候选因子在每个截面上向池内因子做横截面回归，取残差再与原收益求 Spearman IC（口径同 `factor_research.py:142`：先 rank 再 pearson）。判据：`abs(residual_ic) >= min_abs_rank_ic`（默认沿用 L2 的 0.02）**且**与原始 `rankIc` 同号才判为有增量。只用 IS 与 validation 段，**冻结段不参与**——增量是搜索期判据，不是样本外证据。
+对候选因子在每个截面上向池内因子做横截面回归，取残差再与原收益求 Spearman IC（口径同 `factor_research.py:142`：先 rank 再 pearson）。判据：`abs(residual_ic) >= min_abs_rank_ic`（默认沿用 L2 的 0.02）**且** 与原始 `rankIc` 同号才判为有增量。只用 IS 与 validation 段，**冻结段不参与**——增量是搜索期判据，不是样本外证据。
 
 - [ ] **步骤 4：运行测试验证通过**
 
@@ -469,7 +477,7 @@ git commit -m "feat: 冻结评审新增 L6 池增量阶段"
 
 ```python
 def test_normalize_rejects_an_unknown_field_by_key():
-    # 白名单外的字段仍以 factorMining.reject.invalid:unknownField 拒绝
+    # 白名单外的字段仍以 factorMining.reject.invalid: unknownField 拒绝
 def test_a_derivatives_field_is_accepted_after_the_field_set_is_threaded_through():
     # 显式传入含 funding_rate 的字段集后，依赖它的表达式通过 L1 校验
 def test_a_derivatives_field_is_rejected_when_the_market_has_none():
@@ -572,7 +580,7 @@ def test_the_shared_strategy_v2_fingerprint_is_untouched():
 
 `market_fields.py` 按 `fundamental_data.enrich_panel`（`:71`）的既有模式装配：按 `(market, symbol)` 取序列、按可知时点排序去重、`reindex(dates, method="ffill")`。接入点在 `engine._prepare_window` 的 `fetch_frames` 之后。
 
-**指纹必须覆盖新字段，但不能改共享函数。** `engine._data_digest`（`engine.py:888`）调用的是 `strategy_v2/snapshot.py:58` 的 `canonical_frame_bytes`，它只哈希 `SNAPSHOT_COLUMNS`（`snapshot.py:15`，五个价量列）——加列不会改变 `snapshot_id`，会让两次数据不同的运行共享指纹。但那个函数是 **Strategy V2 自己的数据版本原语**，改它会把回测与研究的既有数据版本一起改掉，属于全局约束禁止的跨模块行为变更。正确做法：在 `factor_mining` 内部自建一个**本地**摘要函数，对新增列按排序后的列名逐列折进摘要，`canonical_frame_bytes` 的输出与语义原样不动。
+**指纹必须覆盖新字段，但不能改共享函数。** `engine._data_digest`（`engine.py:888`）调用的是 `strategy_v2/snapshot.py:58` 的 `canonical_frame_bytes`，它只哈希 `SNAPSHOT_COLUMNS`（`snapshot.py:15`，五个价量列）——加列不会改变 `snapshot_id`，会让两次数据不同的运行共享指纹。但那个函数是 **Strategy V2 自己的数据版本原语**，改它会把回测与研究的既有数据版本一起改掉，属于全局约束禁止的跨模块行为变更。正确做法：在 `factor_mining` 内部自建一个 **本地** 摘要函数，对新增列按排序后的列名逐列折进摘要，`canonical_frame_bytes` 的输出与语义原样不动。
 
 日历口径按市场取交易日，修掉 v1 遗留的 `pd.bdate_range` 假设（Crypto 冻结段比例因此从约 21% 的日历日回到 30% 的交易日）。
 
@@ -595,7 +603,7 @@ git commit -m "feat: 跨市场字段按可知时点装配并纳入数据指纹"
 
 - [ ] **步骤 1：不写代码，先落字段语义与验收口径**
 
-本任务**不实现**，原因是前置条件不成立：全仓对 `term_structure` / `roll_cost` 零代码（grep 无命中），且需要**期货多合约行情**这一条当前不存在的数据面——现有 `app/data_sources/futures.py` 只有单合约 ticker/kline。计划只固定两件事：
+本任务 **不实现**，原因是前置条件不成立：全仓对 `term_structure` / `roll_cost` 零代码（grep 无命中），且需要 **期货多合约行情** 这一条当前不存在的数据面——现有 `app/data_sources/futures.py` 只有单合约 ticker/kline。计划只固定两件事：
 
 - **字段语义**：`term_structure` = 近月与远月年化价差；`roll_cost` = 按既定换月规则的主力合约切换成本。两者都必须能回答「哪个时点可知」。
 - **验收口径**：与前四项字段相同——进白名单前必须证明点时可用性，否则 L1 拒绝依赖它的候选。
@@ -649,12 +657,12 @@ git commit -m "docs: 同步因子挖掘 v2 的字段、阶梯、契约与键清�
 
 ## 手工验收（需要真实数据源与 DB，不在单测范围）
 
-1. 枚举模式跑一次 USStock 日线作业，候选列表与顺序**与升级前逐字节相同**（确定性未被破坏）。
+1. 枚举模式跑一次 USStock 日线作业，候选列表与顺序 **与升级前逐字节相同**（确定性未被破坏）。
 2. 进化模式跑同一配置，`qd_factor_trials` 行数等于 `budget`，`origin` 列出现 `"evolution"`。
 3. 同 seed 重跑进化作业，`trials` 序列逐字节相同。
 4. 已有 `frozen` 候选的 `expression_hash` 在升级前后不变（查库比对）。
 5. 池非空时新候选的 `poolIncrement` 有残差 IC 与池规模；池为空时不淘汰任何候选。
-6. Crypto 配置下冻结段占比为约 30% 的**交易日**（升级前约 21% 的日历日）。
+6. Crypto 配置下冻结段占比为约 30% 的 **交易日**（升级前约 21% 的日历日）。
 
 ---
 
