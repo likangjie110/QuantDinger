@@ -343,14 +343,14 @@ def test_list_candidates_scopes_to_the_user_and_the_requested_filters(monkeypatc
     cursor = _record(monkeypatch)
 
     rows = FactorMiningRepository().list_candidates(
-        user_id=4, run_id=9, status="frozen", market="USStock", limit=5, offset=10,
+        user_id=4, run_id=9, status="frozen", market="USStock", timeframe="1d", limit=5, offset=10,
     )
 
     sql, params = cursor.statements[0]
     assert rows == []
     assert "user_id = ?" in sql and "run_id = ?" in sql
-    assert "status = ?" in sql and "market = ?" in sql
-    assert params == (4, 9, "frozen", "USStock", 5, 10)
+    assert "status = ?" in sql and "market = ?" in sql and "timeframe = ?" in sql
+    assert params == (4, 9, "frozen", "USStock", "1d", 5, 10)
 
 
 def test_single_row_reads_scope_by_user(monkeypatch):
