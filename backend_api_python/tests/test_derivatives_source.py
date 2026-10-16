@@ -231,7 +231,7 @@ _OI_EXPECTED = {
 }
 
 
-@pytest.mark.parametrize("venue", ["binance", "gate", "okx"])
+@pytest.mark.parametrize("venue", ["binance", "gate"])
 def test_open_interest_history_is_returned_as_a_level_series(recorded, monkeypatch, venue):
     """The open interest *level* per bucket, so a change rate stays something a factor derives.
 
@@ -240,7 +240,7 @@ def test_open_interest_history_is_returned_as_a_level_series(recorded, monkeypat
 
     Gate's page cap is lowered to the three rows the recordings answer at: the loop is a walk over
     ``to``, so its page width changes how many requests a window takes, not what the series holds.
-    Binance and OKX answer this window within one page at their real caps, as recorded.
+    Binance answers this window within one page at its real cap, as recorded.
     """
     if venue == "gate":
         monkeypatch.setattr(derivatives, _OI_PAGE[venue], 3)
@@ -259,6 +259,25 @@ def test_open_interest_history_is_returned_as_a_level_series(recorded, monkeypat
 
     expected_limit = 3 if venue == "gate" else _OI_PAGE_WIDTH[venue]
     assert [params["limit"] for _url, params in recorded.calls] == [expected_limit] * len(recorded.calls)
+
+
+def test_okx_open_interest_is_not_served(recorded):
+    """A venue whose rows could not be verified answers nothing, rather than a plausible number.
+
+    ``_okx_interest_rows`` reads the row's USD notional by *column position*, and OKX is
+    unreachable from the recording host, so a wrong order would answer with a plausible number of
+    the wrong kind on a field every Crypto panel carries -- a full column no coverage gate can
+    question. Unlisted, the pair costs the column instead: an empty series and no request made,
+    which is what L2's coverage bar is there to price. ``funding`` from the same venue is served
+    and unaffected; this test exists so that re-listing the pair has to be a deliberate act.
+    """
+    series = derivatives.fetch_open_interest_history(
+        "Crypto", _SYMBOL["okx"], start=_OI_START, end=_OI_END
+    )
+
+    assert series.empty
+    assert isinstance(series.index, pd.DatetimeIndex)
+    assert recorded.calls == []
 
 
 def test_gate_open_interest_is_published_at_the_end_of_the_bucket_it_measured(recorded, monkeypatch):

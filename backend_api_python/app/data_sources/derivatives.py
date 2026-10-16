@@ -27,9 +27,10 @@ point-in-time, so what an index means is part of the contract:
   with the observation it holds, so its rows publish at their own stamp; Gate stamps a bucket's
   *last* observation at the bucket's *start* (a 1d row stamped 10-09 repeats the open interest the
   1h series reports at 10-09 23:00, and its ``last_funding_rate`` repeats the 10-10 00:00
-  settlement), so its rows are published one bucket later. OKX's stamp semantics are unverified,
-  and an unverified stamp takes the same one-bucket delay: publishing late can only cost freshness,
-  never correctness.
+  settlement), so its rows are published one bucket later. OKX's open interest is not served at all:
+  neither its row shape nor its stamp semantics could be read off a live response from this host,
+  and a positional parse that is wrong answers a plausible number of the wrong kind -- worse than a
+  missing column.
 """
 
 from __future__ import annotations
@@ -128,9 +129,10 @@ def fetch_open_interest_history(market: str, symbol: str, *, start: datetime, en
     """Open interest **levels** for one perpetual, in USD notional, one value per daily bucket.
 
     A level, not a change: a change rate is something a factor derives, and a source that
-    pre-computed one would make that choice for every candidate. The three venues report the same
-    quantity (``open_interest_usd``, ``sumOpenInterestValue``, ``oiUsd``) even though the contract
-    counts behind it differ, and it is *not* in the base asset's units.
+    pre-computed one would make that choice for every candidate. The served venues report the same
+    quantity (``open_interest_usd``, ``sumOpenInterestValue``) even though the contract counts
+    behind it differ, and it is *not* in the base asset's units. OKX reports the same kind of number
+    under ``oiUsd``, and is not served: see the note on ``_FETCHERS``.
 
     The index is the instant the observation became known (tz-naive UTC): where a venue prints a
     bucket's last observation at the bucket's *start*, the row is published one bucket later, so no
@@ -493,7 +495,11 @@ def _okx_funding(instrument: str, lower: pd.Timestamp, upper: pd.Timestamp) -> l
 
 
 def _okx_open_interest(instrument: str, lower: pd.Timestamp, upper: pd.Timestamp) -> list[tuple[int, float]]:
-    """Daily USD notional, paged backwards on the exclusive ``end``, published a bucket later."""
+    """Daily USD notional, paged backwards on the exclusive ``end``, published a bucket later.
+
+    Deliberately not listed in ``_FETCHERS`` -- see the note there -- and kept whole so that
+    re-listing the pair is one line once a live response has settled the parser below.
+    """
     rows: list[tuple[int, float]] = []
     cursor = _millis(upper) + 1
     try:
@@ -525,10 +531,11 @@ def _okx_interest_rows(payload: object) -> list[tuple[int, float]]:
     UNVERIFIED, and the one thing here that would fail *silently*: OKX is unreachable from this
     host, so the column order comes from the endpoint's documented shape and ccxt's live-verified
     client rather than from a recorded body. A wrong order yields a plausible number of the wrong
-    kind, which no coverage gate can catch. The verification owed is a networked smoke call that
-    asserts the magnitude, not merely that the series is non-empty: the value must read as USD
-    notional (``> 1e6``, and the same order as ``oi`` x price). If OKX answers mapping rows instead
-    of lists, read the fields by name here rather than by position.
+    kind, which no coverage gate can catch -- which is why this pair is not listed in ``_FETCHERS``
+    and why the magnitude is the first thing a verifier has to settle, not merely a non-empty
+    series. Once a networked call has made that assertion (the value must read as USD notional,
+    ``> 1e6``, and the same order as ``oi`` x price), list the pair and delete this paragraph. If
+    OKX answers mapping rows instead of lists, read the fields by name here rather than by position.
     """
     items = payload.get("data") if isinstance(payload, dict) else payload
     rows = []
@@ -546,11 +553,18 @@ def _okx_interest_rows(payload: object) -> list[tuple[int, float]]:
 _Fetcher = Callable[[str, pd.Timestamp, pd.Timestamp], list[tuple[int, float]]]
 # One table, so "which venues does this field know" has one answer and an unlisted pair is an empty
 # series rather than an exception raised from a dispatch branch nobody reads.
+#
+# OKX's open interest is deliberately unlisted, and ``_okx_open_interest`` stays here as the shape a
+# verifier would re-list. Its rows were never read off a live response -- OKX is unreachable from
+# the recording host -- and the parser reads them by column position, so a wrong order answers with
+# a plausible number of the wrong kind, on a field ``fields_for`` hands to every Crypto run and a
+# bar a factor reads. No coverage gate can catch a column that is full and wrong; an unlisted pair
+# answers an empty series, which costs the column and is what L2's coverage bar is for. Re-list the
+# pair only once a networked call has asserted the magnitude ``_okx_interest_rows`` documents.
 _FETCHERS: dict[tuple[str, str], _Fetcher] = {
     ("binance", "funding"): _binance_funding,
     ("binance", "open_interest"): _binance_open_interest,
     ("gate", "funding"): _gate_funding,
     ("gate", "open_interest"): _gate_open_interest,
     ("okx", "funding"): _okx_funding,
-    ("okx", "open_interest"): _okx_open_interest,
 }
