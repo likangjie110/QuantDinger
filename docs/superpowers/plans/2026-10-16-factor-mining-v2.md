@@ -24,7 +24,7 @@
 - **确定性是 v1 的既有验收，v2 不得放宽**（`engine.py:292-299` 模块 docstring 的契约）：同 `(templates, budget, seed, 搜索模式)` → 字节级相同的候选列表与顺序。进化搜索的随机性只能来自 `random.Random(seed)` 实例，集合遍历一律排序后再迭代。
 - **`qd_factor_candidates.expression_hash` 在本次升级中必须保持稳定**：改变 `MAX_DEPTH` 是**校验策略**变更，不是表达式语义变更，因此**不递增 `DSL_VERSION`**（`dsl.py:19`）——递增会让候选库全部指纹失效、旧候选被当成新表达式重复入库。这条是本次升级里唯一容易误判的取舍，任务 3 必须用测试钉住「同一表达式升级前后指纹相同」。
 - **字段白名单只进「实际拥有且时间口径可靠」的字段**（规格 §6.2）：跨市场字段在能证明点时可用性之前不得进白名单。
-- **试验台账是选择偏差校正的分母**（规格 §10.5）：进化搜索产生的每一个被评估的个体，含中途淘汰与非法个体，都必须写 `qd_factor_trials`。个体数量上升不是改为抽样留痕的理由。
+- **试验台账是选择偏差校正的分母**（规格 §10.5）：进化搜索**产出的每一个个体**（无论最终通过哪一级门槛）都必须写 `qd_factor_trials`——个体数量上升不是改为抽样留痕的理由。**在源头被拒的子代（非法树、裸字段）与按指纹去重跳过的子代不算产出**：它们从未被评估，不入台账。这与 v1 一致：`expand_candidates` 也是先按指纹去重才返回候选。
 - **候选池的边界口径固定为 `(user_id, market, timeframe)`**：因子值是截面信号，跨市场与跨周期不可比，只有同市场同周期内的候选才构成「要不要再来一个」的选择集。
 
 ## 审查重点（Review Focus）
@@ -32,7 +32,7 @@
 规格隐含、但最可能伤到使用者的输入/条件，按可能性排序。每行都已在对应任务里安排了钉住它的测试。
 
 1. **进化搜索重新引入前视偏差**：交叉/变异合成的新表达式绕开模板的既有保证（窗口被改成 0 或负数、窗口和越过 `MAX_LOOKBACK`）→ 因子值虚高且不可复现。钉住：任务 1 `test_mutation_never_emits_a_nonpositive_window` + 任务 3 `test_every_scored_individual_cleared_l1_first`。
-2. **试验台账漏记**：个体数上升后只记幸存者 → DSR 分母偏小、一切指标虚高。钉住：任务 3 `test_every_evolved_individual_gets_a_trial_row` + 任务 2 `test_rejected_children_are_counted_not_silently_dropped`。
+2. **试验台账漏记**：个体数上升后只记幸存者 → DSR 分母偏小、一切指标虚高。钉住：任务 3 `test_every_emitted_individual_gets_a_trial_row`（产出多少写多少）+ 任务 2 `test_rejected_children_are_counted_not_silently_dropped`（源头被拒的子代仍消耗预算，不会让搜索空转）。
 3. **指纹漂移**：本次改了校验上界，若误递增 `DSL_VERSION`，候选库既有行的 `expression_hash` 全部失效、旧候选被重复入库。钉住：任务 3 `test_the_fingerprint_is_unchanged_by_the_raised_depth_bound`（同一表达式在改动前后指纹逐字节相同）。
 4. **候选间数值去重口径错**：把本质不同的因子判为重复（误杀），或放行同一因子的仿射变换（漏杀）→ 候选库要么变窄要么被近亲灌满。钉住：任务 7 `test_numeric_dedup_rejects_an_affine_rescaled_twin` + `test_numeric_dedup_keeps_a_distinct_factor_with_low_correlation`。
 5. **协同价值评估读到冻结段**：用冻结段数据评估「加进池子后有无增量」→ 冻结段隔离被击穿，样本外证据失效。钉住：任务 8 `test_pool_gain_is_measured_without_the_freeze_segment`。
@@ -172,8 +172,9 @@ def test_search_consumes_a_generator_source():
     # run 接受可迭代的候选来源，边产出边评估，进度总量为预算而非预先长度
 def test_every_scored_individual_cleared_l1_first():
     # 任何进入评分的个体都先过 dsl.normalize_expression，非法个体只能记为无效试验
-def test_every_evolved_individual_gets_a_trial_row():
-    # 进化模式下 qd_factor_trials 行数等于 budget，被拒个体同样入账（DSR 分母）
+def test_every_emitted_individual_gets_a_trial_row():
+    # 进化模式下 qd_factor_trials 行数 = 引擎实际收到的产出条数，且 ≤ budget
+    # （源头被拒、以及按指纹去重跳过的子代都不是产出，不入台账）
 def test_run_is_byte_identical_for_the_same_seed():
     # 同 seed 两次 run 的 trials 序列与顺序逐字节相同（含进化模式）
 def test_smoothed_template_seven_leaves_room_for_crossover():
