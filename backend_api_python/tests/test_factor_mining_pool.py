@@ -18,7 +18,7 @@ from contextlib import contextmanager
 import pandas as pd
 import pytest
 
-from app.services.factor_mining import pool, storage
+from app.services.factor_mining import engine, pool, storage
 from app.services.factor_mining.dsl import normalize_expression
 from app.services.factor_mining.engine import _field_panels
 from app.services.factor_mining.evaluator import ExpressionEvaluator
@@ -276,3 +276,15 @@ def test_an_empty_library_reads_as_an_empty_pool(monkeypatch):
 
     assert members == []
     assert pool.pool_panels(members, _field_panels(_frames())) == ({}, [])
+
+
+def test_the_pool_and_the_engine_report_a_member_the_same_way():
+    """The two spellings of the invalid-expression reason must stay one key.
+
+    They are written in two modules on purpose -- the engine imports the pool once the pool
+    feeds its correlations, so importing the engine's constant here would close the cycle -- and
+    that is exactly why the equality needs pinning instead of reviewing: the pool's ``skipped``
+    rows and the engine's rejected trials land in columns a reader compares, and a rename on
+    either side would file the same failure under two different reasons with no test to notice.
+    """
+    assert pool.INVALID_EXPRESSION_REASON == engine.INVALID_EXPRESSION_REASON

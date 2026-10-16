@@ -29,6 +29,45 @@ class FactorResearchEngine:
         field = cls._FUNDAMENTAL_FIELDS.get(str(factor_id or "").strip().lower())
         return {field} if field else set()
 
+    @classmethod
+    def research_window(
+        cls,
+        *,
+        frames: Mapping[str, pd.DataFrame],
+        start_date: Any,
+        end_date: Any,
+        holding_period: int = 5,
+    ) -> tuple[dict[str, pd.DataFrame], list[pd.Timestamp]]:
+        """The frames a study over this window reads, and the cross-sections it measures.
+
+        Public because a caller that has to prepare something *per research date* must build it
+        on the very index the study reads. The mining engine is such a caller: it computes every
+        built-in factor's point-in-time values, and the registry only answers for one frame at a
+        time, so its panels are indexed by exactly these dates. An injected panel aligned to a
+        differently normalized index would come back empty, and the comparison would be missing
+        without a word.
+
+        Both halves come from the same normalization and the same slicing rule ``run`` uses, so
+        there is one time semantics rather than two. The prepared frames keep the window's
+        warmup, because that is what a value *on* the first research date is computed from.
+        """
+        end = cls._timestamp(end_date)
+        prepared = cls._prepare_frames(frames, end)
+        close = cls._panel(prepared, "close")
+        return prepared, cls._research_dates(
+            close.index, cls._timestamp(start_date), end, max(1, int(holding_period or 1)),
+        )
+
+    @staticmethod
+    def _research_dates(
+        index: pd.Index,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        step: int,
+    ) -> list[pd.Timestamp]:
+        """Window dates of a panel, one cross-section every ``step`` bars."""
+        return list(index[(index >= start) & (index <= end)][::step])
+
     def run(
         self,
         *,
@@ -44,11 +83,20 @@ class FactorResearchEngine:
         members: Sequence[Mapping[str, Any]] | None = None,
         annualization_periods: float = 252.0,
         factor_panel: pd.DataFrame | None = None,
+        comparison_factors: Sequence[str] | None = None,
+        comparison_panels: Mapping[str, pd.DataFrame] | None = None,
     ) -> dict[str, Any]:
         """Run one factor's cross-sectional research. ``factor_panel`` overrides the built-in
         factor named by ``factor_id``, which factor mining uses to score a DSL expression --
         a candidate that is not one of the built-ins has no id, so ``factor_id`` may be empty
-        there. Every other branch is unchanged."""
+        there. Every other branch is unchanged.
+
+        ``comparison_factors`` is the set the de-duplication study correlates the factor against,
+        and ``comparison_panels`` supplies the values for the names this engine cannot build
+        itself. ``None`` -- the default, and what every caller predating the parameter gets --
+        keeps the six built-in proxies, byte for byte. See ``_factor_correlation`` for how the
+        two modes differ and what an injected set costs.
+        """
         requested_groups = max(2, min(10, int(groups or 5)))
         holding_period = max(1, int(holding_period or 5))
         # A caller that injects its own panel studies that panel, not a built-in. The name it
@@ -70,8 +118,7 @@ class FactorResearchEngine:
             raise ValueError("strategyV2.factorResearchNoData")
 
         membership = self._membership_panel(members or (), close.index, close.columns)
-        research_index = close.index[(close.index >= start) & (close.index <= end)]
-        research_dates = list(research_index[::holding_period])
+        research_dates = self._research_dates(close.index, start, end, holding_period)
         if not research_dates:
             raise ValueError("strategyV2.factorResearchInsufficientObservations")
 
@@ -275,6 +322,8 @@ class FactorResearchEngine:
                 research_dates,
                 factor_name,
                 selected_panel=factor_panel,
+                comparison_factors=comparison_factors,
+                comparison_panels=comparison_panels,
             ),
             "stability": {
                 "firstHalfIc": float(first_half.mean()) if not first_half.empty else 0.0,
@@ -459,19 +508,43 @@ class FactorResearchEngine:
         research_dates: Sequence[pd.Timestamp],
         selected_factor: str,
         selected_panel: pd.DataFrame | None = None,
+        comparison_factors: Sequence[str] | None = None,
+        comparison_panels: Mapping[str, pd.DataFrame] | None = None,
     ) -> dict[str, Any]:
-        """Correlate the studied factor against the built-in pool, one cross-section at a time.
+        """Correlate the studied factor against a comparison set, one cross-section at a time.
 
         ``selected_panel`` is the studied factor's own values, for a caller whose factor is not
         a built-in: without it the selected name is looked up as a built-in like any other, and
         a caller that injected its own panel would silently get the built-in's correlations --
         a matrix that is identical for every candidate, which de-duplicates nothing.
+
+        ``comparison_factors`` is the set to measure against, replacing the six built-in proxies
+        this engine falls back to when the caller names none. ``comparison_panels`` supplies the
+        values of the names this engine cannot rebuild from the bars -- a caller that measured
+        them itself, against the same dates and universe. A name with neither a panel nor a
+        built-in shape of its own is dropped by the observation filter below, exactly like a
+        built-in with no data.
+
+        The two modes differ in one more way, deliberately. The default pool is the small closed
+        set this block has always reported as a full symmetric matrix, and the factor-research
+        response carries that whole. An injected set fills **the studied factor's row alone**,
+        because it is the candidate's comparison set and not a peer group to cross-correlate.
+        That row is what the de-duplication gate reads, and it is what keeps an injected set
+        affordable: the mining search hands in the whole registry plus its candidate pool, and
+        the quadratic work of measuring every comparison factor against every other -- along with
+        storing it in every candidate's record -- is work nothing reads. The unmeasured cells
+        stay zero in the matrix and zero observations in the observation matrix, which is this
+        block's way of saying "not measured" rather than inventing a value for them.
         """
-        names = list(dict.fromkeys((selected_factor, *self._CORRELATION_FACTORS)))
+        names = list(dict.fromkeys((selected_factor, *(
+            self._CORRELATION_FACTORS if comparison_factors is None else comparison_factors
+        ))))
         panels: dict[str, pd.DataFrame] = {}
         for name in names:
             if selected_panel is not None and name == selected_factor:
                 panel = selected_panel
+            elif comparison_panels is not None and name in comparison_panels:
+                panel = comparison_panels[name]
             else:
                 panel = self._factor_panel(frames, name, close)
             visible = panel.reindex(index=research_dates)
@@ -481,12 +554,11 @@ class FactorResearchEngine:
         if not names:
             return {"factors": [], "matrix": [], "observations": []}
 
-        values: list[list[float]] = []
-        observations: list[list[int]] = []
-        for row_name in names:
-            value_row: list[float] = []
-            observation_row: list[int] = []
-            for column_name in names:
+        row_names = names if comparison_factors is None else names[:1]
+        values = [[0.0] * len(names) for _ in names]
+        observations = [[0] * len(names) for _ in names]
+        for row_index, row_name in enumerate(row_names):
+            for column_index, column_name in enumerate(names):
                 correlations: list[float] = []
                 for timestamp in research_dates:
                     active = membership.loc[timestamp]
@@ -506,10 +578,10 @@ class FactorResearchEngine:
                     )
                     if not pd.isna(correlation):
                         correlations.append(float(correlation))
-                value_row.append(sum(correlations) / len(correlations) if correlations else 0.0)
-                observation_row.append(len(correlations))
-            values.append(value_row)
-            observations.append(observation_row)
+                values[row_index][column_index] = (
+                    sum(correlations) / len(correlations) if correlations else 0.0
+                )
+                observations[row_index][column_index] = len(correlations)
         return {"factors": names, "matrix": values, "observations": observations}
 
     @staticmethod

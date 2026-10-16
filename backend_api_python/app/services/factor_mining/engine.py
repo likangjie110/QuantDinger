@@ -52,7 +52,7 @@ import math
 import re
 import statistics
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -78,12 +78,18 @@ from app.services.factor_mining.gates import (
     screen_redundancy,
     screen_stability,
 )
+from app.services.factor_mining.pool import (
+    DEFAULT_POOL_LIMIT,
+    load_pool,
+    pool_panels,
+)
 from app.services.factor_mining.templates import (
     DEFAULT_BUDGET,
     MAX_BUDGET,
     CandidateSeed,
     expand_candidates,
 )
+from app.services.factors import compute_factor, list_factors
 from app.services.strategy_v2.contract import StrategyV2ContractError, compile_strategy_v2
 from app.services.strategy_v2.factor_research import FactorResearchEngine
 from app.services.strategy_v2.frequencies import periods_per_year
@@ -99,6 +105,24 @@ DEFAULT_FREEZE_RATIO = 0.3
 DEFAULT_SEED = 42
 PROGRESS_EVERY = 10
 INVALID_EXPRESSION_REASON = "factorMining.reject.invalid"
+
+# The comparison set a search feeds the de-duplication gate, and the two caps that bound its
+# cost. Both bounds are explicit because both are paid for: every name costs one point-in-time
+# panel rebuilt once per run -- the registry answers for one frame at a time, so a panel of
+# values is one call per symbol and cross-section -- and one cross-sectional Spearman per
+# candidate. The built-in cap is the registry's own size, which is what the L4 contract promises
+# the comparison covers.
+DEFAULT_BUILTIN_COMPARISON_LIMIT = 61
+
+# A pooled candidate is namespaced, because a fingerprint is not a name a reader can tell apart
+# from a registry factor id, and the gate reading the two sections is going to treat them
+# differently.
+# shortcut: two members whose fingerprints share an 8-character prefix would merge into one
+# comparison column, which the study's name de-duplication would then do silently. At the pool's
+# cap of 20 that is a one-in-45-million draw; widen the prefix if the cap ever grows past a few
+# hundred.
+POOL_NAMESPACE = "pool:"
+POOL_NAME_LENGTH = 8
 
 SEARCH_MODE_ENUMERATION = "enumeration"
 SEARCH_MODE_EVOLUTION = "evolution"
@@ -216,6 +240,149 @@ class PreparedPanel:
     warnings: list[str]
 
 
+@dataclass(frozen=True)
+class ComparisonSet:
+    """What one panel's candidates are measured against, and what could not be measured.
+
+    ``factors`` are the registry's own factor ids in registry order and ``pool`` are the
+    caller's frozen candidates, namespaced. ``panels`` carries the point-in-time values for
+    both: they are built once per run, because the research engine would otherwise rebuild
+    every one of them -- the pool's expressions and every registry factor -- for every
+    candidate it scores. ``skipped`` is what the pool could not rebuild, reported rather than
+    dropped, since a comparison set one member short looks exactly like a pool that never had
+    that member.
+    """
+
+    factors: tuple[str, ...] = ()
+    pool: tuple[str, ...] = ()
+    panels: Mapping[str, pd.DataFrame] = field(default_factory=dict)
+    skipped: tuple[Mapping[str, str], ...] = ()
+
+    def names(self) -> tuple[str, ...]:
+        """Every name this set compares against, built-ins first."""
+        return (*self.factors, *self.pool)
+
+    def report(self) -> dict[str, Any]:
+        """The set as a stored run writes it down, so a reader can tell what was compared."""
+        return {
+            "builtin": list(self.factors),
+            "pool": list(self.pool),
+            "skipped": [dict(item) for item in self.skipped],
+        }
+
+
+def _computable_factor_ids(frames: Mapping[str, pd.DataFrame]) -> list[str]:
+    """The registry factor ids this panel can measure, in the registry's deterministic order.
+
+    "Can measure" is the registry's own contract rather than a curated list: every factor
+    declares the fields it reads, and a panel that does not carry one of them has nothing to
+    compute it from -- a price-volume panel carries no fundamentals, so the fundamental factors
+    are absent from the comparison instead of present as a column of NaNs. The order is
+    ``list_factors``'s, which is sorted: the correlation matrix's columns follow it, and a set
+    iterated in hash order would move them from run to run.
+    """
+    available: set[str] = set()
+    for frame in frames.values():
+        available.update(str(column) for column in frame.columns)
+    return [
+        str(item["factor_id"])
+        for item in list_factors()
+        if set(item.get("required_fields") or ()) <= available
+    ]
+
+
+def _point_in_time_panels(
+    frames: Mapping[str, pd.DataFrame],
+    dates: Sequence[pd.Timestamp],
+    factor_ids: Sequence[str],
+) -> dict[str, pd.DataFrame]:
+    """One panel per registry factor: its value at each cross-section, from the bars up to it.
+
+    The registry computes a factor for a frame -- the value at that frame's last bar -- so a
+    panel of values is one call per symbol and date, and each call is handed only the bars at or
+    before its own date. That is the point of doing it here: a comparison value correlated with a
+    candidate has to be knowable on the date it is measured, or the de-duplication gate would
+    decide with the future. It is also why the caller caps the set: the work is symbols x dates
+    x factors, once per run rather than once per candidate.
+
+    ``frames`` are the research window's own prepared frames -- sorted, one timezone, cut at the
+    window's end -- because a panel built against a differently normalized index would be empty
+    on every date and would drop out of the study without a word.
+
+    A call that raises leaves that cell of the panel missing, never a reason to end the run: the
+    registry refuses a factor whose frame is too short, and a comparison factor measured over too
+    few observations drops out of the study by itself.
+    """
+    index = pd.Index(dates)
+    panels: dict[str, pd.DataFrame] = {}
+    for factor_id in factor_ids:
+        columns: dict[str, pd.Series] = {}
+        for symbol, frame in frames.items():
+            values = []
+            for timestamp in dates:
+                try:
+                    values.append(compute_factor(factor_id, frame.loc[:timestamp]))
+                except Exception:
+                    values.append(float("nan"))
+            columns[str(symbol)] = pd.Series(values, index=index, dtype=float)
+        panels[factor_id] = pd.DataFrame(columns, index=index)
+    return panels
+
+
+def _comparison_set(
+    *,
+    panel: PreparedPanel,
+    config: MiningConfig,
+    user_id: int,
+    start_date: datetime,
+    end_date: datetime,
+    pool_loader: Callable[..., list],
+    factor_limit: int = DEFAULT_BUILTIN_COMPARISON_LIMIT,
+    pool_limit: int = DEFAULT_POOL_LIMIT,
+) -> ComparisonSet:
+    """The comparison set one panel and one window are measured against, assembled once.
+
+    Two sources. The registry's factors, filtered to the ones this panel's fields can measure and
+    capped, measured point-in-time at the study's own cross-sections -- over the study's own
+    prepared frames, so an injected panel is aligned to the index the candidate is scored on.
+    And the caller's frozen pool, rebuilt from the stored expressions against this panel's field
+    panels: the same fields the candidates themselves are scored on, which is what makes a member
+    comparable at all.
+
+    ``pool_loader`` is injected rather than called at this level so a run can be exercised
+    without a candidate table; the provider passes the real one, which reads the caller's own
+    pooled candidates.
+    """
+    frames, dates = FactorResearchEngine.research_window(
+        frames=panel.frames,
+        start_date=start_date,
+        end_date=end_date,
+        holding_period=config.holding_period,
+    )
+    factor_ids = _computable_factor_ids(frames)[:max(0, int(factor_limit))]
+    panels = _point_in_time_panels(frames, dates, factor_ids)
+    members = pool_loader(
+        user_id, config.market, config.timeframe, limit=max(0, int(pool_limit)),
+    )
+    rebuilt, skipped = pool_panels(members, panel.fields)
+    pooled: list[str] = []
+    for member in members:
+        member_panel = rebuilt.get(member.fingerprint)
+        # A row with no fingerprint has no name to carry and no way to be reported as skipped;
+        # every insert writes that column, so this drops only a hand-edited row.
+        if not member.fingerprint or member_panel is None:
+            continue
+        name = f"{POOL_NAMESPACE}{member.fingerprint[:POOL_NAME_LENGTH]}"
+        pooled.append(name)
+        panels[name] = member_panel
+    return ComparisonSet(
+        factors=tuple(factor_ids),
+        pool=tuple(pooled),
+        panels=panels,
+        skipped=tuple(skipped),
+    )
+
+
 def split_periods(config: MiningConfig) -> PeriodSplit:
     """Cut ``config``'s range by traded sessions: the last ``freeze_ratio`` of them freeze.
 
@@ -244,8 +411,45 @@ class MiningDataProvider:
         self,
         *,
         backtest_service: StrategyV2BacktestService | None = None,
+        pool_loader: Callable[..., list] = load_pool,
+        comparison_factor_limit: int = DEFAULT_BUILTIN_COMPARISON_LIMIT,
+        pool_limit: int = DEFAULT_POOL_LIMIT,
     ) -> None:
         self._backtest_service = backtest_service or StrategyV2BacktestService()
+        self._pool_loader = pool_loader
+        self._comparison_factor_limit = comparison_factor_limit
+        self._pool_limit = pool_limit
+
+    def comparison_set(
+        self,
+        *,
+        panel: PreparedPanel,
+        config: MiningConfig,
+        user_id: int,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> ComparisonSet:
+        """What the candidates of ``panel`` are compared against over one window.
+
+        The window is the caller's because the two panels of a run measure different stretches
+        of the same universe: the search compares against what was knowable inside the search
+        window, and the frozen review against what was knowable inside the frozen tail. Both
+        are built here rather than in one of them, so the two records cannot end up comparing
+        against panels prepared under different rules.
+
+        The pool's own caps are the provider's; ``pool_loader`` reads the caller's candidates,
+        which is the one call in here that reaches a store.
+        """
+        return _comparison_set(
+            panel=panel,
+            config=config,
+            user_id=user_id,
+            start_date=start_date,
+            end_date=end_date,
+            pool_loader=self._pool_loader,
+            factor_limit=self._comparison_factor_limit,
+            pool_limit=self._pool_limit,
+        )
 
     def prepare(
         self,
@@ -408,6 +612,12 @@ class FactorMiningEngine:
             user_id=user_id, code=code, config=config, search_mode=search_mode,
         )
         split = split_periods(config)
+        # Assembled once for the whole search, not once per candidate: every comparison panel is
+        # a point-in-time rebuild, and the pool's members are re-evaluated expressions.
+        comparison = self._data_provider.comparison_set(
+            panel=panel, config=config, user_id=user_id,
+            start_date=split.search_start, end_date=split.search_end,
+        )
         # The provider owns the field panels: they are pinned to one shared index and column
         # order, which is what keeps a candidate's dates and symbols aligned with
         # ``fields["close"]``. Recomputing them here would silently paper over a provider that
@@ -438,7 +648,7 @@ class FactorMiningEngine:
         candidates: list[dict[str, Any]] = []
         for evaluated, seed in enumerate(source, start=1):
             verdict, metrics = self._evaluate(
-                seed.expression, evaluator, config, split, panel, members,
+                seed.expression, evaluator, config, split, panel, members, comparison,
             )
             value = metrics.get(FITNESS_METRIC)
             if isinstance(value, float) and math.isfinite(value):
@@ -467,7 +677,7 @@ class FactorMiningEngine:
             "split": self._split_payload(split),
             "trials": trials,
             "candidates": candidates,
-            "summary": self._summary(config, panel, trials, candidates),
+            "summary": self._summary(config, panel, trials, candidates, comparison),
         }
 
     def review_frozen(
@@ -508,6 +718,12 @@ class FactorMiningEngine:
             user_id=user_id, code=code, config=config, search_mode=search_mode,
         )
         split = split_periods(config)
+        # The tail's own comparison set: the same rule as the search's, over the window this
+        # panel covers, so a survivor's frozen measurement is priced like its in-sample one.
+        comparison = self._data_provider.comparison_set(
+            panel=panel, config=config, user_id=user_id,
+            start_date=split.freeze_start, end_date=split.freeze_end,
+        )
         # Same contract as the search: the provider owns the field panels, and the review reads
         # them rather than rebuilding anything it was handed.
         evaluator = ExpressionEvaluator(panel.fields)
@@ -516,7 +732,8 @@ class FactorMiningEngine:
         for evaluated, survivor in enumerate(survivors, start=1):
             self._report({"stage": "review", "evaluated": evaluated, "total": len(survivors)})
             reviewed.append(
-                self._review(survivor, evaluator, config, split, panel, members, trials_count)
+                self._review(survivor, evaluator, config, split, panel, members, trials_count,
+                             comparison)
             )
         return reviewed
 
@@ -528,6 +745,7 @@ class FactorMiningEngine:
         split: PeriodSplit,
         panel: PreparedPanel,
         members: Sequence[Mapping[str, Any]],
+        comparison: ComparisonSet,
     ) -> tuple[GateVerdict, dict[str, Any]]:
         """Score one candidate down the L1-L4 ladder: a verdict and the metrics behind it.
 
@@ -545,7 +763,7 @@ class FactorMiningEngine:
             normalize_expression(expression)
             candidate_panel = evaluator.evaluate(expression)
             metrics = _metrics_payload(
-                self._research(config, split, panel, members, candidate_panel), config,
+                self._research(config, split, panel, members, candidate_panel, comparison), config,
             )
         except Exception:
             # v1 has no per-candidate error budget: an unreadable candidate is rejected, and
@@ -570,6 +788,7 @@ class FactorMiningEngine:
         panel: PreparedPanel,
         members: Sequence[Mapping[str, Any]],
         trials_count: int,
+        comparison: ComparisonSet,
     ) -> dict[str, Any]:
         """L5 on one survivor: the frozen metrics, then the sign and selection-bias gates.
 
@@ -588,7 +807,7 @@ class FactorMiningEngine:
             out_of_sample = _metrics_payload(
                 self._research_window(
                     config, panel, members, candidate_panel,
-                    split.freeze_start, split.freeze_end,
+                    split.freeze_start, split.freeze_end, comparison,
                 ),
                 config,
             )
@@ -620,10 +839,12 @@ class FactorMiningEngine:
         panel: PreparedPanel,
         members: Sequence[Mapping[str, Any]],
         candidate_panel: pd.DataFrame,
+        comparison: ComparisonSet,
     ) -> dict[str, Any]:
         """Score the candidate panel over the search window."""
         return self._research_window(
             config, panel, members, candidate_panel, split.search_start, split.search_end,
+            comparison,
         )
 
     def _research_window(
@@ -634,6 +855,7 @@ class FactorMiningEngine:
         candidate_panel: pd.DataFrame,
         start_date: datetime,
         end_date: datetime,
+        comparison: ComparisonSet,
     ) -> dict[str, Any]:
         """Score the candidate panel over one window of the panel's frames.
 
@@ -652,6 +874,13 @@ class FactorMiningEngine:
         the engine's 252-bar default in place would inflate a weekly run's ICIR by about 2.2x and
         quietly relax ``min_icir`` by the same factor -- a bar in one unit and a measurement in
         another is exactly the incomparability reusing this engine is meant to prevent.
+
+        The comparison set travels with the panel as an injected one. An assembled set that came
+        back empty is handed over as ``None`` instead, which is the research engine's "use the
+        built-in proxies": an empty mapping would leave the de-duplication gate with no finite
+        measurement at all, and its fail-closed rule would reject every candidate of the run --
+        a search with nothing pooled and no measurable registry factor would then never find
+        anything.
         """
         return FactorResearchEngine().run(
             frames=panel.frames,
@@ -668,6 +897,8 @@ class FactorMiningEngine:
             annualization_periods=periods_per_year(
                 config.timeframe, {str(member.get("market") or "") for member in members},
             ),
+            comparison_factors=comparison.names() or None,
+            comparison_panels=comparison.panels or None,
         )
 
     def _correlations(self, metrics: Mapping[str, Any]) -> dict[str, float]:
@@ -736,18 +967,23 @@ class FactorMiningEngine:
         panel: PreparedPanel,
         trials: Sequence[Mapping[str, Any]],
         candidates: Sequence[Mapping[str, Any]],
+        comparison: ComparisonSet,
     ) -> dict[str, Any]:
         """Run totals plus the snapshot the search read and the costs it priced in.
 
         The counts are what a frozen run is audited against, and the execution assumptions
         repeat what was actually passed to the research engine rather than the engine's own
-        defaults, so a stored run explains its own numbers.
+        defaults, so a stored run explains its own numbers. ``comparisonFactors`` is what the
+        candidates were measured against: the names the run asked for, next to the names each
+        candidate's own metrics report as measured. Reading only the latter cannot tell a factor
+        that came back unrelated from one that was never measured.
         """
         return {
             "snapshotId": panel.snapshot_id,
             "warnings": list(panel.warnings),
             "trials": len(trials),
             "candidates": len(candidates),
+            "comparisonFactors": comparison.report(),
             # Zero here, and only here: the search cannot know how many survivors hold up out of
             # sample. The review runs after this record is persisted, so the caller that owns the
             # run writes the count back from the statuses it gets from ``review_frozen``.

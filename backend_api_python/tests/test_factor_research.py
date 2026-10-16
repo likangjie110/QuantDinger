@@ -4,6 +4,144 @@ import pytest
 from app.services.strategy_v2.factor_research import FactorResearchEngine
 
 
+def _comparable_frames(periods=90, symbols=("A", "B", "C", "D", "E", "F")):
+    """Frames whose symbols rank the same way on every date, so correlations are known.
+
+    Every price is an exact geometric curve, so any trend or reversal reading of ``close``
+    orders the six symbols identically and the built-in proxies correlate with each other at
+    plus or minus one -- which is what lets a test assert a name's presence or absence without
+    inventing a tolerance for it.
+    """
+    index = pd.date_range("2025-01-01", periods=periods, freq="B")
+    frames = {}
+    for offset, symbol in enumerate(symbols):
+        prices = [100 + offset * 3 + day * (0.1 + offset * 0.02) for day in range(periods)]
+        frames[f"USStock:{symbol}"] = pd.DataFrame({
+            "open": prices,
+            "high": [value * 1.01 for value in prices],
+            "low": [value * 0.99 for value in prices],
+            "close": prices,
+            "volume": [100000.0] * periods,
+            "industry": ["Tech" if offset < 3 else "Finance"] * periods,
+        }, index=index)
+    return frames, index
+
+
+def test_the_correlation_study_accepts_an_injected_comparison_set():
+    """An injected set is the whole comparison set: the class constant is not consulted.
+
+    The study is asked to measure a candidate against what the caller named -- the mining
+    search's registry factors and candidate pool -- so the proxies it happens not to have
+    injected must be absent, not quietly added back beside them.
+    """
+    frames, index = _comparable_frames()
+
+    result = FactorResearchEngine().run(
+        frames=frames,
+        factor_id="momentum_20",
+        start_date=index[0],
+        end_date=index[-1],
+        groups=3,
+        holding_period=5,
+        comparison_factors=("volatility_20", "reversal_5"),
+    )
+
+    names = result["factorCorrelation"]["factors"]
+    assert names == ["momentum_20", "volatility_20", "reversal_5"]
+    assert "value" not in names and "size" not in names
+
+
+def test_the_default_comparison_set_is_unchanged():
+    """Without an injection the six built-in proxies are compared, as a full matrix.
+
+    Both halves are load bearing. The names are the contract every existing caller reads; the
+    square matrix is what the research page renders, and an injected set deliberately fills
+    the candidate's row alone, so a default that lost its other rows would be a silent break.
+    """
+    frames, index = _comparable_frames()
+
+    result = FactorResearchEngine().run(
+        frames=frames,
+        factor_id="momentum_20",
+        start_date=index[0],
+        end_date=index[-1],
+        groups=3,
+        holding_period=5,
+    )
+
+    block = result["factorCorrelation"]
+    assert block["factors"][0] == "momentum_20"
+    assert set(block["factors"][1:]) <= set(FactorResearchEngine._CORRELATION_FACTORS)
+    assert {"volatility_20", "reversal_5"} <= set(block["factors"])
+    size = len(block["factors"])
+    assert len(block["matrix"]) == size and len(block["observations"]) == size
+    assert all(len(row) == size for row in block["matrix"])
+    assert block["matrix"][0][1] == pytest.approx(block["matrix"][1][0])
+
+
+def test_an_injected_comparison_set_fills_only_the_candidates_row():
+    """An injected set is the candidate's comparison set, not a peer group.
+
+    Only the candidate's row is measured, and the observation matrix says the rest was never
+    measured rather than reporting a zero for it. That is what bounds the mining search's cost:
+    the registry and the pool are tens of factors, and every candidate would otherwise pay for
+    a quadratic number of cross-sectional Spearman runs whose other rows nobody reads.
+    """
+    frames, index = _comparable_frames()
+
+    result = FactorResearchEngine().run(
+        frames=frames,
+        factor_id="momentum_20",
+        start_date=index[0],
+        end_date=index[-1],
+        groups=3,
+        holding_period=5,
+        comparison_factors=("volatility_20", "reversal_5"),
+    )
+
+    block = result["factorCorrelation"]
+    assert block["observations"][0][0] > 0
+    assert block["observations"][0][1] > 0
+    assert block["observations"][1][0] == 0
+    assert block["matrix"][1][0] == 0.0
+
+
+def test_an_injected_panel_is_measured_against_an_injected_name():
+    """A caller's own panel and a caller's own comparison set travel together.
+
+    The mining search hands in the candidate's panel under the neutral ``expression`` name and
+    the comparison factors beside it. If the injected panels were only consulted for the
+    selected factor, every comparison name would be regenerated as a built-in -- for a registry
+    id that is not a built-in at all, the panel would come back empty and the name would drop
+    out of the study without a word.
+    """
+    frames, index = _comparable_frames()
+    engine = FactorResearchEngine()
+    _, dates = engine.research_window(frames=frames, start_date=index[0], end_date=index[-1],
+                                      holding_period=5)
+    candidate = pd.DataFrame(
+        {symbol: [float(offset) + day for day in range(len(dates))]
+         for offset, symbol in enumerate(sorted(frames))},
+        index=dates,
+    )
+
+    result = engine.run(
+        frames=frames,
+        factor_id="",
+        factor_panel=candidate,
+        start_date=index[0],
+        end_date=index[-1],
+        groups=3,
+        holding_period=5,
+        comparison_factors=("rsi", "pool:01234567"),
+        comparison_panels={"rsi": candidate * -1.0, "pool:01234567": candidate},
+    )
+
+    assert result["factorCorrelation"]["factors"] == ["expression", "rsi", "pool:01234567"]
+    assert result["factorCorrelation"]["matrix"][0][1] == pytest.approx(-1.0, abs=1e-9)
+    assert result["factorCorrelation"]["matrix"][0][2] == pytest.approx(1.0, abs=1e-9)
+
+
 def test_factor_research_returns_ic_groups_costs_and_stability():
     index = pd.date_range("2025-01-01", periods=90, freq="B")
     frames = {}

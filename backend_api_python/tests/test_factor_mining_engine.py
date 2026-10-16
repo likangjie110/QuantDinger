@@ -26,11 +26,16 @@ import pandas as pd
 import pytest
 
 from app.services.factor_mining import engine as engine_module
+from app.services.factor_mining import pool
 from app.services.factor_mining.dsl import MAX_LOOKBACK
 from app.services.factor_mining.engine import (
+    DEFAULT_BUILTIN_COMPARISON_LIMIT,
+    ComparisonSet,
     FactorMiningEngine,
     MiningConfig,
+    MiningDataProvider,
     PreparedPanel,
+    _comparison_set,
     _field_panels,
     _fold_ic_signs,
     _metrics_payload,
@@ -57,6 +62,10 @@ class _FakeProvider:
         self.panel = PreparedPanel(frames=frames, members=members, fields=_field_panels(frames),
                                    snapshot_id="b" * 64, frequency="1d", warnings=[])
         self.search_modes: list[str | None] = []
+        # What this run compares its candidates against. Empty by default: the fake stands in
+        # for a provider that found no registry factor and no pooled candidate to measure, which
+        # is a real run shape and the one every pre-existing test in this module was written for.
+        self.comparison = ComparisonSet()
 
     def prepare(self, *, user_id, code, config, search_mode=None):
         self.search_modes.append(search_mode)
@@ -67,6 +76,9 @@ class _FakeProvider:
         # serves it for both, so a test that needs a disagreeing tail hands in different frames.
         self.search_modes.append(search_mode)
         return self.panel
+
+    def comparison_set(self, *, panel, config, user_id, start_date, end_date):
+        return self.comparison
 
 
 def _frames_and_members(periods=200):
@@ -315,7 +327,8 @@ def test_the_search_window_is_cut_from_the_panel_that_carries_warmup():
     candidate_panel = _evaluator(frames, trial["expression"])
     direct = _metrics_payload(
         FactorMiningEngine(data_provider=_FakeProvider(frames, members))._research(
-            config, split_periods(config), panel, _resolved_members(members), candidate_panel),
+            config, split_periods(config), panel, _resolved_members(members), candidate_panel,
+            ComparisonSet()),
         config,
     )
     assert direct == trial["metrics"]
@@ -583,6 +596,266 @@ def test_the_correlation_study_reads_the_injected_panel_not_a_lookalike():
                if datetime.fromisoformat(item["time"]) < cutoff]
     assert blanked, "the blanked half must have scored something before it was blanked"
     assert whole_observed - partial_observed == len(blanked)
+
+
+# --- what a candidate is compared against: the registry's factors plus the caller's pool ---
+
+_POOL_MEMBER = {"op": "ts_pct_change", "args": ["close"], "params": {"n": 10}}
+
+
+def _empty_pool(user_id, market, timeframe, **kwargs):
+    return []
+
+
+def _recording_pool(members, calls):
+    def loader(user_id, market, timeframe, **kwargs):
+        calls.append((user_id, market, timeframe, kwargs))
+        return list(members)
+
+    return loader
+
+
+def _computable_factor_ids(frames):
+    """Registry ids a panel carrying these columns can measure, derived outside the module.
+
+    Mirrors the registry's own ``required_fields`` contract rather than a hand-kept list: the
+    fixture's panels carry price and volume only, so every technical factor is measurable and
+    no fundamental one is.
+    """
+    from app.services.factors import list_factors
+
+    columns = set().union(*(set(frame.columns) for frame in frames.values()))
+    return [item["factor_id"] for item in list_factors()
+            if set(item["required_fields"]) <= columns]
+
+
+def _assembly(frames, members, *, pool_loader, factor_limit=DEFAULT_BUILTIN_COMPARISON_LIMIT,
+              pool_limit=pool.DEFAULT_POOL_LIMIT, config=None):
+    """The comparison set one run assembles for the fixture's search panel."""
+    config = config or _config()
+    split = split_periods(config)
+    return _comparison_set(
+        panel=_FakeProvider(frames, members).panel, config=config, user_id=1,
+        start_date=split.search_start, end_date=split.search_end,
+        pool_loader=pool_loader, factor_limit=factor_limit, pool_limit=pool_limit,
+    )
+
+
+def test_the_comparison_set_defaults_bound_the_registry_and_the_pool():
+    """The two caps are the run's cost bound, and they are the sizes they claim to be.
+
+    Every measured name costs one point-in-time panel rebuilt once per run and one
+    cross-sectional Spearman per candidate, so the caps are what keeps a run's cost proportional
+    to something a caller chose. The registry's cap is its own size: a smaller number would
+    silently drop factors from the comparison, and a bigger one would only ever be slack.
+    """
+    assert DEFAULT_BUILTIN_COMPARISON_LIMIT == 61
+    assert pool.DEFAULT_POOL_LIMIT == 20
+
+
+def test_the_comparison_set_covers_the_registry_factors_the_panel_can_measure():
+    """Built-in coverage comes from the registry, filtered by the fields the panel carries.
+
+    That filter is what "computable" means here: the registry computes each factor from a
+    frame's fields, so a factor whose fields the panel does not carry has no point-in-time
+    values to correlate with, and listing it would only report a comparison that never ran.
+    """
+    frames, members = _frames_and_members(periods=80)
+
+    assembled = _assembly(frames, members, pool_loader=_empty_pool)
+
+    assert {"rsi", "macd", "atr"} <= set(assembled.factors)
+    assert "earnings_yield" not in assembled.factors
+    assert set(assembled.factors) <= set(_computable_factor_ids(frames))
+    assert set(assembled.panels) == set(assembled.factors)
+    for name in ("rsi", "macd"):
+        assert int(assembled.panels[name].notna().sum().sum()) >= 3
+
+
+def test_the_registry_comparison_panel_is_point_in_time():
+    """Each value is computed from the bars up to its own date, never from the whole window.
+
+    Correlating a candidate against a factor whose values were computed from data the candidate
+    never saw would decide L4 with the future. Rewriting the last bars leaves every earlier
+    value untouched -- and moves the later ones, which is what keeps the first half from being
+    vacuously equal to a panel that is a constant.
+    """
+    frames, members = _frames_and_members(periods=80)
+    name = _computable_factor_ids(frames)[0]
+
+    before = _assembly(frames, members, pool_loader=_empty_pool, factor_limit=1)
+    assert before.factors == (name,)
+    mutated = {key: frame.copy() for key, frame in frames.items()}
+    for frame in mutated.values():
+        frame.iloc[-20:] = frame.iloc[-20:] * 3.0
+    after = _assembly(mutated, members, pool_loader=_empty_pool, factor_limit=1)
+
+    panel = before.panels[name]
+    assert len(panel) > 8, "the window must reach past the bars the mutation touches"
+    pd.testing.assert_frame_equal(panel.iloc[:3], after.panels[name].iloc[:3])
+    assert not panel.iloc[-3:].equals(after.panels[name].iloc[-3:])
+
+
+def test_the_registry_panel_is_built_on_the_studys_own_index():
+    """A comparison panel must be aligned with the candidate's, whatever the frames arrived as.
+
+    The study normalizes the frames it reads, so a panel built from the raw ones would carry a
+    different index: every date lookup would miss, the panel would be empty on every date, and
+    the factor would drop out of the study without a word -- a de-duplication gate running
+    against one comparison factor fewer, and reporting nothing about it.
+    """
+    frames, members = _frames_and_members(periods=80)
+    localized = {key: frame.set_axis(frame.index.tz_localize("UTC"))
+                 for key, frame in frames.items()}
+
+    assembled = _assembly(localized, members, pool_loader=_empty_pool, factor_limit=1)
+
+    panel = assembled.panels[assembled.factors[0]]
+    assert int(panel.notna().sum().sum()) >= 3
+    assert panel.index.equals(pd.Index(_assembly(frames, members, pool_loader=_empty_pool,
+                                                factor_limit=1).panels[assembled.factors[0]].index))
+
+
+def test_the_comparison_set_is_capped_in_registry_order():
+    """The cap truncates the tail of a deterministic order, so a run's comparison set repeats.
+
+    An unstable order would not only move the truncation point between runs: the correlation
+    matrix's columns would follow it, so two runs over the same panel would report the same
+    candidate against a differently ordered set of factors.
+    """
+    frames, members = _frames_and_members(periods=80)
+
+    limited = _assembly(frames, members, pool_loader=_empty_pool, factor_limit=2)
+
+    assert limited.factors == tuple(_computable_factor_ids(frames)[:2])
+    assert set(limited.panels) == set(limited.factors)
+
+
+def test_pool_members_are_namespaced_and_their_skips_are_reported():
+    """The pool half of the comparison set: scoped, prefixed, capped, and never silently short.
+
+    A pooled candidate is a fingerprint, which is not a name a reader can tell apart from a
+    registry factor id, so every member is namespaced. A member whose stored expression no
+    longer evaluates is handed back as a skip rather than dropped: a comparison set that is one
+    member shorter than the pool looks exactly like a pool that never had it.
+    """
+    from app.services.factor_mining.pool import PoolMember
+
+    frames, members = _frames_and_members(periods=80)
+    calls: list[tuple] = []
+    pooled = [
+        PoolMember(candidate_id=7, fingerprint="a" * 64, expression=_POOL_MEMBER),
+        PoolMember(candidate_id=8, fingerprint="b" * 64,
+                   expression={"op": "nope", "args": [], "params": {}}),
+    ]
+
+    assembled = _assembly(frames, members, pool_loader=_recording_pool(pooled, calls),
+                          factor_limit=0, pool_limit=5)
+
+    assert calls == [(1, "USStock", "1d", {"limit": 5})]
+    assert assembled.factors == ()
+    assert assembled.pool == ("pool:aaaaaaaa",)
+    assert set(assembled.panels) == {"pool:aaaaaaaa"}
+    assert assembled.skipped == (
+        {"fingerprint": "b" * 64, "reason": "factorMining.reject.invalid"},
+    )
+
+
+def test_the_search_compares_a_candidate_against_the_registry_factors():
+    """A mined candidate is measured against registry factors, not only the six proxies.
+
+    The set the engine assembled is what the study used: the names it reports participating are
+    exactly the assembled ones, and the proxies are absent rather than quietly re-added -- an
+    injected set replaces the default pool instead of joining it.
+    """
+    frames, members = _frames_and_members(periods=80)
+    provider = _FakeProvider(frames, members)
+    config = _config(thresholds=_NO_DEDUPLICATION)
+    split = split_periods(config)
+    provider.comparison = _comparison_set(
+        panel=provider.panel, config=config, user_id=1,
+        start_date=split.search_start, end_date=split.search_end,
+        pool_loader=_empty_pool, factor_limit=3,
+    )
+
+    result = FactorMiningEngine(data_provider=provider).run(
+        user_id=1, code="PORTFOLIO = {}", config=config,
+    )
+
+    assert result["candidates"], "a comparison set with no measurement would reject everything"
+    names = result["candidates"][0]["metrics"]["factorCorrelation"]["factors"]
+    assert set(provider.comparison.factors) <= set(names)
+    assert "reversal_5" not in names
+    assert result["summary"]["comparisonFactors"]["builtin"] == list(provider.comparison.factors)
+
+
+def test_the_provider_hands_its_own_caps_to_the_comparison_set():
+    """The caps and the pool reader are the provider's, so a caller can bound the cost of a run.
+
+    The comparison set is assembled by the provider because it is panel-shaped data, and its two
+    bounds are the provider's own settings -- a run's cost is symbols x dates x comparison
+    factors, and a deployment that finds that too much has to be able to lower it without
+    touching the search. Nothing here reaches the panel's own fetcher: only the pool loader is
+    called, which is why a provider built without a backtest service is enough.
+    """
+    frames, members = _frames_and_members(periods=80)
+    calls: list[tuple] = []
+    provider = MiningDataProvider(pool_loader=_recording_pool([], calls),
+                                  comparison_factor_limit=2, pool_limit=3)
+    config = _config()
+    split = split_periods(config)
+
+    assembled = provider.comparison_set(
+        panel=_FakeProvider(frames, members).panel, config=config, user_id=9,
+        start_date=split.search_start, end_date=split.search_end,
+    )
+
+    assert assembled.factors == tuple(_computable_factor_ids(frames)[:2])
+    assert calls == [(9, "USStock", "1d", {"limit": 3})]
+
+
+def test_the_run_reports_the_names_it_compared_and_those_it_could_not():
+    """What a stored run compared against is readable afterwards, skips included.
+
+    The candidate's own metrics carry the names that were really measured; the run's summary
+    carries what was asked for, which is the pair a reader needs to tell "measured as unrelated"
+    from "never measured" -- the distinction the de-duplication gate refuses to blur.
+    """
+    provider = _FakeProvider(*_fixture())
+    provider.comparison = ComparisonSet(
+        factors=("rsi",),
+        pool=("pool:deadbeef",),
+        panels={
+            "rsi": _evaluator(_fixture()[0], _MOMENTUM_5),
+            "pool:deadbeef": _evaluator(_fixture()[0], _NEGATED_MOMENTUM_5),
+        },
+        skipped=({"fingerprint": "f" * 64, "reason": "factorMining.reject.invalid"},),
+    )
+    engine = FactorMiningEngine(data_provider=provider)
+
+    result = engine.run(user_id=1, code="PORTFOLIO = {}",
+                        config=_config(thresholds=_NO_DEDUPLICATION))
+
+    assert result["summary"]["comparisonFactors"] == {
+        "builtin": ["rsi"],
+        "pool": ["pool:deadbeef"],
+        "skipped": [{"fingerprint": "f" * 64, "reason": "factorMining.reject.invalid"}],
+    }
+    names = result["candidates"][0]["metrics"]["factorCorrelation"]["factors"]
+    assert names == ["expression", "rsi", "pool:deadbeef"]
+
+
+def test_an_empty_comparison_set_keeps_the_builtin_proxies():
+    """Nothing assembled is not the same as comparing against nothing.
+
+    An empty set handed to the study as an empty mapping would leave the de-duplication gate
+    with no finite measurement at all, and its fail-closed rule would reject every candidate of
+    the run -- a search with no pool and no registry hit would find nothing, ever.
+    """
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
+
+    names = result["candidates"][0]["metrics"]["factorCorrelation"]["factors"]
+    assert "reversal_5" in names
 
 
 def test_a_run_made_under_a_patched_expansion_is_never_memoized(monkeypatch):
