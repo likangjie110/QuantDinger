@@ -173,8 +173,8 @@ def test_prepare_panel_rejects_a_usable_universe_smaller_than_three():
 
 def test_prepare_panel_rejects_a_window_beyond_the_market_data_policy():
     # Non-US daily data is capped at 1095 days. Four years leave a ~3.1-year search window after
-    # the 30% freeze, and the warmup's 953 calendar days push the fetch to about 1305 days -- over
-    # the cap, so the run is rejected before any bar is requested.
+    # the 30% freeze, and even the enumeration warmup's 284 days push the fetch to 1305 days --
+    # over the cap, so the run is rejected before any bar is requested.
     service = _AShareService()
     with pytest.raises(BacktestRangeLimitError):
         _provider(service).prepare(
@@ -183,34 +183,54 @@ def test_prepare_panel_rejects_a_window_beyond_the_market_data_policy():
     assert service.fetch_calls == []
 
 
-def test_the_fetch_starts_at_the_dsl_ceiling_before_the_search_window():
-    """The warmup is the DSL's own ceiling, converted to calendar days by the shared helper.
+def test_enumeration_warmup_is_unchanged_from_v1():
+    """Enumeration's warmup and its fetch are the ones v1 computed, to the day.
 
-    It no longer depends on the candidates a run happens to expand: an evolved individual's
-    longest lookback is unknown until it is bred, so the ceiling is what the panel must carry.
+    Every candidate enumeration produces comes from a template, so the run can measure them
+    before it fetches -- the same template selection, budget and seed the search loop expands --
+    and ask for exactly what they need. The ceiling would spend 3.5x the provider history for
+    that and, where a policy caps the fetched range, get the run rejected instead of searched
+    shorter: a reversal-only A-share run used to look back 76 days and fit inside the 1095-day
+    CNStock policy, and it still does.
     """
-    service = _FakeBacktestService()
-    config = _config()
-    _provider(service).prepare(user_id=1, code=_SOURCE, config=config)
-    assert _warmup_bars() == MAX_LOOKBACK, "the warmup is the ceiling, not the candidates' longest"
-    warmup_days = backtest_warmup_calendar_days("1d", _warmup_bars())
-    _, fetch_start, _ = service.fetch_calls[0]
-    assert warmup_days == 953
-    assert (split_periods(config).search_start - fetch_start).days == warmup_days
+    short = _config(template_ids=("reversal",))
+    # reversal's longest path is 20 bars plus a 5-bar smoothing variant, so the floor binds
+    assert _warmup_bars(short, "enumeration") == 40
+    assert backtest_warmup_calendar_days("1d", _warmup_bars(short, "enumeration")) == 76
+    # every template: 145 bars longest plus the 5-bar margin, against the 504 the ceiling cost
+    assert _warmup_bars(_config(), "enumeration") == 150
+    assert backtest_warmup_calendar_days("1d", _warmup_bars(_config(), "enumeration")) == 284
 
-
-def test_a_narrow_candidate_selection_no_longer_shrinks_the_fetch():
-    """Restricting the templates does not shrink the window: the ceiling is fetched regardless.
-
-    A reversal-only run used to look back 76 days and fit inside the 1095-day CNStock policy;
-    under the ceiling it asks for 953 days and is refused before a bar is requested. That is the
-    price of a warmup that does not depend on knowing the candidates in advance.
-    """
     service = _AShareService()
+    panel = _provider(service).prepare(user_id=1, code=_SOURCE, config=short)
+    assert panel.frequency == "1d"
+    _, fetch_start, _ = service.fetch_calls[0]
+    assert (split_periods(short).search_start - fetch_start).days == 76
+
+
+def test_the_evolution_fetch_starts_at_the_dsl_ceiling():
+    """Evolution takes the ceiling, and the fetch follows it: an evolved lookback is unknowable.
+
+    A crossover grafts an arbitrary subtree -- carrying any window the DSL accepts -- onto an
+    arbitrary path, so no number short of the ceiling is correct for a run that breeds. The price
+    is provider history: the ceiling's 953 calendar days do not fit the 1095-day CNStock policy
+    for a 2024 range, so this run is refused before a bar is requested, while the same range under
+    enumeration still fetches what its candidates need.
+    """
+    config = _config(template_ids=("reversal",))
+    assert _warmup_bars(config, "evolution") == MAX_LOOKBACK
+    assert backtest_warmup_calendar_days("1d", _warmup_bars(config, "evolution")) == 953
+    refused = _AShareService()
     with pytest.raises(BacktestRangeLimitError):
-        _provider(service).prepare(
-            user_id=1, code=_SOURCE, config=_config(template_ids=("reversal",)))
-    assert service.fetch_calls == []
+        _provider(refused).prepare(user_id=1, code=_SOURCE, config=config,
+                                   search_mode="evolution")
+    assert refused.fetch_calls == []
+
+    # US daily data allows 10 years, so the same run fetches the ceiling's window there.
+    service = _FakeBacktestService()
+    _provider(service).prepare(user_id=1, code=_SOURCE, config=config, search_mode="evolution")
+    _, fetch_start, _ = service.fetch_calls[0]
+    assert (split_periods(config).search_start - fetch_start).days == 953
 
 
 def test_prepare_panel_looks_back_warmup_bars_but_stops_at_the_search_end():

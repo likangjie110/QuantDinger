@@ -49,19 +49,23 @@ class _FakeProvider:
 
     ``fields`` is built by the same ``_field_panels`` the provider uses rather than left empty:
     the fake stands in for the provider, so a field mapping it never filled would hide a real
-    provider bug behind a candidate panel of nothing.
+    provider bug behind a candidate panel of nothing. ``search_modes`` records what the engine
+    asked for, which is the only way to see that the warmup rule traveled with the run.
     """
 
     def __init__(self, frames, members):
         self.panel = PreparedPanel(frames=frames, members=members, fields=_field_panels(frames),
                                    snapshot_id="b" * 64, frequency="1d", warnings=[])
+        self.search_modes: list[str | None] = []
 
-    def prepare(self, *, user_id, code, config):
+    def prepare(self, *, user_id, code, config, search_mode=None):
+        self.search_modes.append(search_mode)
         return self.panel
 
-    def prepare_freeze(self, *, user_id, code, config):
+    def prepare_freeze(self, *, user_id, code, config, search_mode=None):
         # The real provider fetches the frozen tail on this call. The fake holds one panel and
         # serves it for both, so a test that needs a disagreeing tail hands in different frames.
+        self.search_modes.append(search_mode)
         return self.panel
 
 
@@ -811,22 +815,28 @@ def test_the_research_engine_is_told_the_runs_own_frequency(monkeypatch):
 # --- the candidate source: the template expansion, or a stream the engine breeds -----------
 
 
-def test_warmup_uses_the_dsl_lookback_budget(monkeypatch):
-    """The panel's warmup is the DSL's ceiling for every run, whatever its candidates are.
+def test_evolution_warmup_uses_the_dsl_lookback_budget(monkeypatch):
+    """Evolution's warmup is the DSL's ceiling, taken without expanding anything first.
 
-    An evolved individual's longest lookback is not knowable before it has been bred -- a
-    crossover may graft a 252-bar window onto any path -- so the ceiling is the only bound that
-    stays correct for both sources, and reading it off the expanded candidates would under-fetch
-    for an evolved one. The panel is fetched once and every evaluation re-cuts it to the search
-    window, so the extra history costs provider history and nothing else.
+    An evolved individual's longest window is not knowable before it has been bred -- a crossover
+    may graft a 252-bar window onto any path -- so the ceiling is the only bound that stays
+    correct for a run that breeds. Enumeration keeps the candidate-derived warmup instead; that
+    half is pinned where the fetch itself is (`test_enumeration_warmup_is_unchanged_from_v1`).
     """
+    config = _config(template_ids=("reversal",), budget=200, seed=3)
     monkeypatch.setattr(engine_module, "expand_candidates",
-                        lambda **kwargs: pytest.fail("the warmup must not pre-scan the candidates"))
-    assert _warmup_bars() == MAX_LOOKBACK == 504
+                        lambda **kwargs: pytest.fail("evolution must not pre-scan candidates"))
+    assert _warmup_bars(config, "evolution") == MAX_LOOKBACK == 504
 
 
-def _stream_run(monkeypatch, individuals, **overrides):
-    """One evolution pass over exactly ``individuals``: the stream a test wants it to consume."""
+def _stream_run(monkeypatch, individuals, seeds=(), **overrides):
+    """One evolution pass over ``seeds`` and then exactly ``individuals``.
+
+    Both halves are patched so a test decides the whole stream: the template generation the
+    engine scores first, and what evolution yields after it. The empty default leaves the bred
+    half alone, which is what a test about the engine's own handling of an individual wants.
+    """
+    monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: list(seeds))
     monkeypatch.setattr(engine_module, "evolve", lambda source, **kwargs: iter(individuals))
     return _run(*_fixture(), search_mode="evolution", **overrides)
 
@@ -837,27 +847,30 @@ def test_search_consumes_a_generator_source(monkeypatch):
     Two properties in one run. The engine has to score what it already holds before the stream
     is resumed: evolution ranks a generation by the caller's answer about its members, and that
     answer exists only once the engine has evaluated them -- draining the stream first would
-    rank every generation on nothing. And the progress total is the budget, not the length of
-    what the stream produced: draws that yield nothing still spend budget, so the output is an
-    outcome, never a length a reporter may announce in advance.
+    rank every generation on nothing. And the progress total is the generation plus the budget,
+    not the length of what the stream produced: draws that yield nothing still spend budget, so
+    the output is an outcome, never a length a reporter may announce in advance.
     """
-    seeds = _seeds(10)
+    generation = _seeds(2)
+    bred = _seeds(10)
     scored_between_draws: list[float | None] = []
 
     def stream(source, *, fitness, **_kwargs):
-        for index, seed in enumerate(seeds):
+        for index, seed in enumerate(bred):
             if index:
                 # Asked from inside the stream: the individual yielded before this point is only
                 # answerable if the consumer evaluated it before asking for the next one.
-                scored_between_draws.append(fitness(seeds[index - 1].expression))
+                scored_between_draws.append(fitness(bred[index - 1].expression))
             yield seed
 
     monkeypatch.setattr(engine_module, "evolve", stream)
-    result, seen = _run(*_fixture(), search_mode="evolution", budget=25)
+    with _patched_expansion(monkeypatch, generation):
+        result, seen = _run(*_fixture(), search_mode="evolution", budget=25,
+                            thresholds=_NO_DEDUPLICATION)
     assert scored_between_draws and all(value is not None for value in scored_between_draws), \
         "the stream was drained before its individuals were scored"
-    assert len(result["trials"]) == 10
-    assert seen == [{"stage": "search", "evaluated": 10, "total": 25}]
+    assert len(result["trials"]) == 2 + 10
+    assert seen == [{"stage": "search", "evaluated": 10, "total": 2 + 25}]
 
 
 def test_every_scored_individual_cleared_l1_first(monkeypatch):
@@ -902,14 +915,54 @@ def _unvalidated_seed(expression):
                          origin="evolution", params={})
 
 
-def test_every_emitted_individual_gets_a_trial_row(monkeypatch):
-    """Every individual the stream yields is evaluated and written down; the budget bounds it.
+def test_the_template_seeds_are_evaluated_in_evolution_mode():
+    """The seeds evolution breeds from are candidates of this run, and are scored like any other.
 
-    The ledger is the denominator of the selection-bias correction, so an individual that was
-    evaluated may not be missing from it -- and one the stream never yielded has nothing to
-    record: a refused draw, and a draw that repeats an expression the run already holds, both
-    spend budget without being an individual at all. The budget caps the output; it does not
-    size it, because a generation with no legal child ends the stream early.
+    The template library is the only place this feature's hypotheses come from, so an evolution
+    run that bred without evaluating its generation would throw away every hypothesis-backed
+    candidate -- and the ledger, which prices the search, would be missing exactly the candidates
+    R6's fingerprint set assumes it holds.
+    """
+    generation = expand_candidates(budget=12, seed=3)
+    result, _ = _run(*_fixture(), search_mode="evolution", thresholds=_NO_DEDUPLICATION)
+    scored = [item["fingerprint"] for item in result["trials"]]
+    assert [seed.fingerprint for seed in generation] == scored[:len(generation)]
+    assert len(scored) > len(generation), "this run must also have bred something"
+
+
+def test_the_generation_is_ranked_before_evolution_breeds(monkeypatch):
+    """The first generation has measurements by the time evolution's body runs.
+
+    The template generation is chained in front of the bred stream, and a generator's body runs
+    on the first pull -- which is the pull after the generation has been exhausted, and therefore
+    after every seed has been scored. Breeding from an unranked generation is what a ``None``
+    answer is for, and it is not what a run should start from when the seeds are right there.
+    """
+    generation = _seeds(3)
+    opinions: list[float | None] = []
+
+    def stream(source, *, fitness, **_kwargs):
+        opinions.extend(fitness(seed.expression) for seed in generation)
+        # A generator with nothing to yield: the body above still runs on the first pull, and it
+        # must not run at construction time or this test would measure the wrong moment.
+        for individual in ():
+            yield individual
+
+    monkeypatch.setattr(engine_module, "evolve", stream)
+    with _patched_expansion(monkeypatch, generation):
+        _run(*_fixture(), search_mode="evolution", thresholds=_NO_DEDUPLICATION)
+    assert opinions and all(value is not None for value in opinions), \
+        "the first generation was bred from before it was ranked"
+
+
+def test_every_emitted_individual_gets_a_trial_row(monkeypatch):
+    """Every individual the engine receives is evaluated and written down, generation included.
+
+    The ledger is the denominator of the selection-bias correction, so nothing the run scored may
+    be missing from it. What the engine receives is the template generation plus what evolution
+    yields from it, and the two are bounded differently: the generation is a count the run knows,
+    while the yield is only bounded by the budget -- a refused draw, and a draw that repeats an
+    expression the run already holds, both spend budget without being an individual at all.
     """
     emitted: list = []
     real_evolve = engine_module.evolve
@@ -921,9 +974,11 @@ def test_every_emitted_individual_gets_a_trial_row(monkeypatch):
 
     monkeypatch.setattr(engine_module, "evolve", counting)
     result, _ = _run(*_fixture(), search_mode="evolution", budget=20, thresholds=_NO_DEDUPLICATION)
+    generation = expand_candidates(budget=20, seed=3)
     assert emitted, "the stream produced nothing, so this run says nothing about the ledger"
-    assert [item["fingerprint"] for item in result["trials"]] == [item.fingerprint for item in emitted]
-    assert len(emitted) <= 20
+    assert [item["fingerprint"] for item in result["trials"]] == \
+        [seed.fingerprint for seed in generation] + [seed.fingerprint for seed in emitted]
+    assert len(emitted) <= 20, "the budget bounds the draws, not the run's ledger"
 
 
 @pytest.mark.parametrize("search_mode", ["enumeration", "evolution"])
@@ -940,6 +995,24 @@ def test_run_is_byte_identical_for_the_same_seed(search_mode):
     assert first is not second, "a memoized second run would compare a record with itself"
     assert json.dumps(first["trials"], sort_keys=True) == json.dumps(second["trials"], sort_keys=True)
     assert len(first["trials"]) > 1, "a single repeated trial would satisfy any equality"
+
+
+def test_the_search_and_the_review_tell_the_provider_which_warmup_rule_applies():
+    """The warmup follows the mode, so the engine has to say which mode the panel is for.
+
+    A provider left to guess would fetch v1's candidate-derived window for an evolved run --
+    short of the history the candidates being reviewed need, and silent about it.
+    """
+    provider = _FakeProvider(*_fixture())
+    engine = FactorMiningEngine(data_provider=provider)
+    survivor = {"expression": _MOMENTUM_5, "fingerprint": "f" * 64, "origin": "template",
+                "template_id": "momentum", "status": "search", "reason": "",
+                "metrics": {}, "outOfSample": {}}
+    engine.run(user_id=1, code="PORTFOLIO = {}", config=_config(budget=2),
+               search_mode="evolution")
+    engine.review_frozen(user_id=1, code="PORTFOLIO = {}", config=_config(), survivors=[survivor],
+                         trials_count=1, search_mode="evolution")
+    assert provider.search_modes == ["evolution", "evolution"]
 
 
 def test_an_unknown_search_mode_is_refused_rather_than_enumerated():

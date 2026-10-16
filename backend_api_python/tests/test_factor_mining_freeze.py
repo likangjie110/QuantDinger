@@ -77,13 +77,14 @@ class _CountingProvider(_FakeProvider):
         super().__init__(frames, members)
         self.calls: list[str] = []
 
-    def prepare(self, *, user_id, code, config):
+    def prepare(self, *, user_id, code, config, search_mode=None):
         self.calls.append("prepare")
-        return super().prepare(user_id=user_id, code=code, config=config)
+        return super().prepare(user_id=user_id, code=code, config=config, search_mode=search_mode)
 
-    def prepare_freeze(self, *, user_id, code, config):
+    def prepare_freeze(self, *, user_id, code, config, search_mode=None):
         self.calls.append("prepare_freeze")
-        return super().prepare_freeze(user_id=user_id, code=code, config=config)
+        return super().prepare_freeze(user_id=user_id, code=code, config=config,
+                                      search_mode=search_mode)
 
 
 def _record(seed, metrics):
@@ -329,7 +330,7 @@ def test_prepare_freeze_fetches_the_frozen_tail_with_its_warmup():
     search = provider.prepare(user_id=1, code=_SOURCE, config=config)
     panel = provider.prepare_freeze(user_id=1, code=_SOURCE, config=config)
     split = split_periods(config)
-    warmup_days = backtest_warmup_calendar_days(config.timeframe, _warmup_bars())
+    warmup_days = backtest_warmup_calendar_days(config.timeframe, _warmup_bars(config, "enumeration"))
 
     _, search_fetch_start, search_fetch_end = service.fetch_calls[0]
     _, freeze_fetch_start, freeze_fetch_end = service.fetch_calls[1]

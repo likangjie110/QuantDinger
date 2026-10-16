@@ -6,24 +6,24 @@ for the as-of universe, ``fetch_frames`` for the bars -- so mining never grows a
 layer with its own time semantics. Second the split: the requested range is cut into a search
 window and a frozen tail, and the tail is never fetched by the search; the out-of-sample review
 asks for it separately, once. Third the loop: every candidate the source produces -- the
-template expansion, or the stream evolution breeds from it -- is scored through
-``FactorResearchEngine`` and walked down the graded gate ladder, and every one of them -- pass
-or reject -- leaves a trial behind, carrying only the metrics a gate reads: the candidate keeps
-the whole measurement, but the ledger has one row per evaluation and would otherwise grow the
-run's record with the budget. Only what the source produces is a candidate at all: a draw
-evolution refused, or dropped as a repeat, is never scored and never written down. Fourth the
+template expansion, or, in evolution, that expansion plus the stream bred from it -- is scored
+through ``FactorResearchEngine`` and walked down the graded gate ladder, and every one of them
+-- pass or reject -- leaves a trial behind, carrying only the metrics a gate reads: the
+candidate keeps the whole measurement, but the ledger has one row per evaluation and would
+otherwise grow the run's record with the budget. Evolution's first generation is scored before
+it is bred from, and only what the source produces is a candidate at all: a draw evolution
+refused, or dropped as a repeat, is never scored and never written down. Fourth the
 review: the frozen tail is fetched once, scored by that same research engine over its own
 window, and judged by the sign and selection-bias
 gates, which are told the run's whole trial count because that count is what prices the search.
 
-Decisions that are invisible in the signatures. The fetch carries the DSL's whole lookback
-ceiling *before* the search window, because the source may be an evolved stream whose longest
-lookback is not knowable until it has been bred -- a crossover can graft a 252-bar window onto
-any path -- and the panel is evaluated over the fetched window and only then cut to the search
-window. The ceiling costs provider history on every run, and where a policy caps the range,
-shortens the window the run can search; expanding the templates first to measure them would
-buy that history back at the price of a warmup that is wrong for a candidate evolution has not
-produced yet. The field panels are pinned to one shared index and column order
+Decisions that are invisible in the signatures. The fetch carries enough history *before* the
+search window for the candidates the mode can know about, because the panel is evaluated over
+the fetched window and only then cut to the search window. Enumeration can measure its templates
+before it expands them and asks for exactly what they need; evolution cannot -- a crossover can
+graft a 252-bar window onto any path -- so it takes the DSL's whole ceiling, which costs
+provider history on every evolved run and, where a policy caps the fetched range, shortens the
+window the run can search. The field panels are pinned to one shared index and column order
 with a missing field kept as a NaN column, which is what the evaluator assumes when it aligns a
 candidate to ``fields["close"]``.
 
@@ -47,6 +47,7 @@ mocks the network.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import math
 import re
 import statistics
@@ -92,6 +93,8 @@ from app.services.strategy_v2.snapshot import canonical_frame_bytes
 
 
 MINIMUM_SYMBOLS = 3
+MINIMUM_WARMUP_BARS = 40
+WARMUP_MARGIN_BARS = 5
 DEFAULT_FREEZE_RATIO = 0.3
 DEFAULT_SEED = 42
 PROGRESS_EVERY = 10
@@ -227,32 +230,49 @@ class MiningDataProvider:
     ) -> None:
         self._backtest_service = backtest_service or StrategyV2BacktestService()
 
-    def prepare(self, *, user_id: int, code: str, config: MiningConfig) -> PreparedPanel:
+    def prepare(
+        self,
+        *,
+        user_id: int,
+        code: str,
+        config: MiningConfig,
+        search_mode: str = SEARCH_MODE_ENUMERATION,
+    ) -> PreparedPanel:
         """Fetch the point-in-time search panel for ``code``'s compiled universe.
 
         Only the search window, with its warmup lookback, is requested. The frozen tail is the
-        out-of-sample review's input and its single read happens there.
+        out-of-sample review's input and its single read happens there. The mode travels with the
+        request because it decides how much history the window must carry -- see ``_warmup_bars``.
         """
         split = split_periods(config)
         return self._prepare_window(
-            user_id=user_id, code=code, config=config,
+            user_id=user_id, code=code, config=config, search_mode=search_mode,
             start_date=split.search_start, end_date=split.search_end,
         )
 
-    def prepare_freeze(self, *, user_id: int, code: str, config: MiningConfig) -> PreparedPanel:
+    def prepare_freeze(
+        self,
+        *,
+        user_id: int,
+        code: str,
+        config: MiningConfig,
+        search_mode: str = SEARCH_MODE_ENUMERATION,
+    ) -> PreparedPanel:
         """Fetch the frozen tail's panel: the same path, the window the search never read.
 
         The overlap check is structural, not conventional. ``split_periods`` already returns
         disjoint windows, so this can only fire if the split changes meaning -- and a tail that
         overlaps the search window is not a frozen tail. Every candidate would already have been
         fitted to the very bars that are supposed to judge it, so refusing is the honest outcome:
-        a review that cannot falsify anything is worse than no review.
+        a review that cannot falsify anything is worse than no review. The mode arrives from the
+        search that produced the survivors, because it is their lookback the tail must reach back
+        for, and an evolved survivor's is the ceiling.
         """
         split = split_periods(config)
         if split.freeze_start <= split.search_end:
             raise ValueError("factorMining.searchFreezeOverlap")
         return self._prepare_window(
-            user_id=user_id, code=code, config=config,
+            user_id=user_id, code=code, config=config, search_mode=search_mode,
             start_date=split.freeze_start, end_date=split.freeze_end,
         )
 
@@ -262,13 +282,14 @@ class MiningDataProvider:
         user_id: int,
         code: str,
         config: MiningConfig,
+        search_mode: str,
         start_date: datetime,
         end_date: datetime,
     ) -> PreparedPanel:
         """One window's panel, through the one data path both callers share.
 
         The window is the only thing that differs between the search panel and the frozen one.
-        The manifest, the as-of universe, the DSL's warmup ceiling, the range check and the
+        The manifest, the as-of universe, the mode's warmup, the range check and the
         data fingerprint are applied identically -- and the universe is resolved over the whole
         requested range rather than the window, so both panels carry the same members and the
         same point-in-time membership. A second copy of this method would be a second time
@@ -283,7 +304,7 @@ class MiningDataProvider:
         )
         if len(candidates) < MINIMUM_SYMBOLS:
             raise ValueError("factorMining.universeTooSmall")
-        warmup_bars = _warmup_bars()
+        warmup_bars = _warmup_bars(config, search_mode)
         fetch_start = _warmup_start(config.timeframe, start_date, warmup_bars)
         # The same range check the factor-research entry runs before fetching, against the
         # window this call actually loads.
@@ -350,20 +371,25 @@ class FactorMiningEngine:
         sources need different things from this method: enumeration expands the templates, while
         evolution needs a ``fitness`` callback that only the engine can build -- it answers with
         the measurement this run wrote for an individual, and the evolution module must not read
-        data or compute a metric itself. Both sources are an ``Iterable[CandidateSeed]`` and the
-        loop pulls one individual at a time, because evolution consults that callback while it
-        streams: draining the source first would leave every generation ranked on nothing.
+        data or compute a metric itself. The mode also travels to the provider, because it decides
+        how much history the panel must carry before the search window.
+
+        Both sources are an ``Iterable[CandidateSeed]`` and the loop pulls one individual at a
+        time, because evolution consults that callback while it streams: draining the source first
+        would leave every generation ranked on nothing.
 
         ``candidates`` are the survivors of the ladder, in production order; ``trials`` are every
         candidate the run evaluated, rejected ones included, because that count is what the
-        deflated-Sharpe benchmark needs to price the search itself. Only what the source produced
-        is in either: a draw evolution refused, or skipped as one the run already holds, spends
-        budget and leaves nothing behind, so the budget bounds the trial count from above without
-        sizing it.
+        deflated-Sharpe benchmark needs to price the search itself. An evolution run evaluates the
+        template generation as well as what it breeds, so its ledger is longer than the budget --
+        and only what the source produced is in either: a draw evolution refused, or skipped as one
+        the run already holds, spends budget and leaves nothing behind.
         """
         if search_mode not in _SEARCH_MODES:
             raise ValueError("factorMining.invalidParameter")
-        panel = self._data_provider.prepare(user_id=user_id, code=code, config=config)
+        panel = self._data_provider.prepare(
+            user_id=user_id, code=code, config=config, search_mode=search_mode,
+        )
         split = split_periods(config)
         # The provider owns the field panels: they are pinned to one shared index and column
         # order, which is what keeps a candidate's dates and symbols aligned with
@@ -376,11 +402,13 @@ class FactorMiningEngine:
         def fitness(expression: Mapping[str, Any]) -> float | None:
             """What this run measured for ``expression``, or ``None`` if it measured nothing.
 
-            Evolution asks about a whole generation at once, including individuals this run was
-            seeded with and never evaluated: those are the standing stock rather than a new
-            hypothesis, and an answer of ``None`` keeps them out of the elite set instead of
-            ranking them as a zero the caller never measured. Anything the DSL refuses is
-            unrankable for the same reason.
+            The template generation is chained in front of the bred stream, so by the time
+            evolution asks about a generation the engine has scored every individual of it -- the
+            first generation is ranked rather than bred from blind. ``None`` is for what has no
+            measurement to rank on: an individual the DSL refused, one whose evaluation produced
+            no finite ICIR, or an expression this run never received. Such an individual can never
+            be an elite, but it stays eligible to breed -- an unmeasured individual has not earned
+            the label of a bad one either.
             """
             try:
                 fingerprint = normalize_expression(expression).fingerprint
@@ -433,6 +461,7 @@ class FactorMiningEngine:
         config: MiningConfig,
         survivors: Sequence[Mapping[str, Any]],
         trials_count: int,
+        search_mode: str = SEARCH_MODE_ENUMERATION,
     ) -> list[dict[str, Any]]:
         """Judge every survivor on the frozen tail: the one read of the out-of-sample segment.
 
@@ -441,7 +470,9 @@ class FactorMiningEngine:
         ``trials_count`` is the run's *whole* ledger, rejected candidates included: it is the
         deflated-Sharpe denominator, and pricing the search with the survivor count instead would
         understate exactly the bias the correction exists for. Nothing is reviewed when nothing
-        survived, so a search that kept no candidate does not open the tail at all.
+        survived, so a search that kept no candidate does not open the tail at all. The review
+        carries the search's own mode, because the tail reaches back for the survivors' lookback
+        and an evolved survivor's is the ceiling.
 
         Every survivor is reported before it is scored. That report is where ``agent_jobs``
         checks for cancellation, and it is unmodded rather than paced like the search's: a
@@ -450,7 +481,9 @@ class FactorMiningEngine:
         """
         if not survivors:
             return []
-        panel = self._data_provider.prepare_freeze(user_id=user_id, code=code, config=config)
+        panel = self._data_provider.prepare_freeze(
+            user_id=user_id, code=code, config=config, search_mode=search_mode,
+        )
         split = split_periods(config)
         # Same contract as the search: the provider owns the field panels, and the review reads
         # them rather than rebuilding anything it was handed.
@@ -888,11 +921,13 @@ def _candidate_source(
 ) -> tuple[Iterable[CandidateSeed], int]:
     """The candidates this run evaluates, and the count its progress is reported against.
 
-    Enumeration knows its own length. Evolution does not: its budget counts draws, and the draws
-    that yield nothing leave no trace, so its progress is reported against the budget -- the
-    number of draws it may not exceed -- rather than a length it cannot know. The templates are
-    the stream's first generation either way, which is what keeps an evolved run's candidates
-    recognisable as variations of the library's hypotheses.
+    Enumeration is the expansion itself and knows its own length. Evolution is that expansion
+    *plus* the stream bred from it: the templates are the hypotheses this feature has, so they are
+    candidates in their own right rather than breeding stock, and they are chained in front of the
+    stream -- which is also why the stream's first generation is ranked: a generator's body runs
+    on the first pull, and by then the generation ahead of it has been scored. The budget counts
+    draws from that point on, and a draw that yields nothing leaves no trace, so the total is the
+    generation plus the budget rather than a length evolution cannot know.
     """
     seeds = expand_candidates(
         template_ids=config.template_ids or None,
@@ -902,32 +937,51 @@ def _candidate_source(
     if search_mode != SEARCH_MODE_EVOLUTION:
         return seeds, len(seeds)
     return (
-        evolve(
+        itertools.chain(
             seeds,
-            budget=config.budget,
-            seed=config.seed,
-            population=EVOLUTION_POPULATION,
-            generations=EVOLUTION_GENERATIONS,
-            elite_ratio=EVOLUTION_ELITE_RATIO,
-            fitness=fitness,
+            evolve(
+                seeds,
+                budget=config.budget,
+                seed=config.seed,
+                population=EVOLUTION_POPULATION,
+                generations=EVOLUTION_GENERATIONS,
+                elite_ratio=EVOLUTION_ELITE_RATIO,
+                fitness=fitness,
+            ),
         ),
-        config.budget,
+        len(seeds) + config.budget,
     )
 
 
-def _warmup_bars() -> int:
-    """Bars of history the panel must carry before the search window: the DSL's ceiling.
+def _warmup_bars(config: MiningConfig, search_mode: str) -> int:
+    """Bars of history the panel must carry before the search window: what the mode can know.
 
-    Evolution cannot know its longest lookback before it has bred anything -- a crossover grafts
-    an arbitrary subtree onto an arbitrary path, and the window it brings is any window the DSL
-    accepts -- so the ceiling is the only bound that stays correct for both sources. Measuring
-    the expanded templates instead would be an under-fetch for every candidate that was not
-    expanded from a template, and the shortfall would be silent: the first bars of a window
-    simply would not exist. The panel is fetched once and every evaluation re-cuts it to the
-    search window, so what the extra history costs is provider history -- and, where a policy
-    caps the fetched range, a shorter search window than the run asked for.
+    Enumeration can know exactly. Every candidate it produces comes from a template, so the run
+    measures them before it fetches -- the same template selection, budget and seed the search
+    loop expands -- and asks for what they need. The longest template path is 145 bars, and
+    budgeting the ceiling's 504 would spend 3.5x the provider history for it: on a 1095-day daily
+    policy that is the difference between a four-month and a one-year search window, and a run
+    caught by the cap is rejected rather than searched shorter. The margin covers the bar-to-
+    calendar conversion, which can undershoot on intraday timeframes, and per-symbol gaps inside
+    the warmup. The floor and ceiling stay as guards for degenerate runs and for templates that
+    grow.
+
+    Evolution can know nothing of the kind: a crossover grafts an arbitrary subtree -- with any
+    window the DSL accepts -- onto an arbitrary path, so no number short of the ceiling is
+    correct for a run that breeds. The price is provider history, on every evolved run.
     """
-    return MAX_LOOKBACK
+    if search_mode == SEARCH_MODE_EVOLUTION:
+        return MAX_LOOKBACK
+    candidates = expand_candidates(
+        template_ids=config.template_ids or None,
+        budget=config.budget,
+        seed=config.seed,
+    )
+    longest = max(
+        (normalize_expression(candidate.expression).lookback for candidate in candidates),
+        default=MAX_LOOKBACK,
+    )
+    return max(MINIMUM_WARMUP_BARS, min(MAX_LOOKBACK, longest + WARMUP_MARGIN_BARS))
 
 
 def _warmup_start(frequency: str, search_start: datetime, warmup_bars: int) -> datetime:
