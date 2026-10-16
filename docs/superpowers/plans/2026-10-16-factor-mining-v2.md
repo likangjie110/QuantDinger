@@ -39,6 +39,7 @@
 6. **跨市场字段口径不可靠却照跑**：字段存在但按错误时点对齐（用了结算后才可知的费率）→ 看似有信号，实为未来数据。钉住：任务 12 `test_funding_field_is_aligned_to_the_bar_it_was_known_at`。
 7. **新字段被静默拒绝**：`dsl.normalize_expression` 的 `allowed_fields` 默认值是 5 个价量字段，现有 5 个调用点全部依赖默认值——只改白名单常量而不把字段集一路传下去，新字段会在 L1 以 `unknownField` 被拒且看不出原因。钉住：任务 10 `test_a_derivatives_field_is_accepted_after_the_field_set_is_threaded_through`。
 8. **非周末交易市场的日历口径**：`pd.bdate_range` 对 Crypto 把冻结段切成约 21% 的日历日而非 30% 的交易日 → 样本外窗口被系统性缩短。钉住：任务 12 `test_session_calendar_follows_the_markets_trading_days`。
+9. **L4 把「没测到」当成「没问题」**：池段被问过、却因成员表达式损坏 / 面板全 NaN / 观测不足而一条相关度都没测出来时，候选带着 L4 通过并进库 —— 正是本功能要防的那类重复。钉住：任务 7 `test_a_pool_segment_that_was_asked_but_measured_nothing_is_refused`（另有一条 `test_an_empty_pool_is_not_a_reason_to_refuse` 守着「不误杀空池」）。
 
 ---
 
@@ -365,7 +366,11 @@ def test_pool_redundancy_stays_fail_closed_on_all_nan():
 
 - [ ] **步骤 3：实现阈值拆分**
 
-`GateThresholds` 增加 `max_pool_correlation`（默认 0.85，与内置阈值同值——两者判的都是「这个因子没有新信息」，但可分别覆盖）。`screen_redundancy` 按名字命名空间区分两段：`pool:` 前缀的用池阈值与 `factorMining.reject.duplicateInPool`，其余用内置阈值与既有键。**fail-closed 语义不变**：过滤后没有任何有限值时仍以 `unverifiableRedundancy` 淘汰。
+`GateThresholds` 增加 `max_pool_correlation`（默认 0.85，与内置阈值同值——两者判的都是「这个因子没有新信息」，但可分别覆盖）。`screen_redundancy` 按名字命名空间区分两段：`pool:` 前缀的用池阈值与 `factorMining.reject.duplicateInPool`，其余用内置阈值与既有键 `factorMining.reject.duplicateBuiltin`。
+
+**fail-closed 改为按命名空间分组**（R21，推翻本计划早先的「全局语义不变」写法）：对相关度映射里**出现过的每一组**（`pool:` 组 / 其余组）要求至少一个有限值，某组一个有限值都没有 → 以 `unverifiableRedundancy` 淘汰。这天然包含原来的全局规则（全场无有限值 ⇒ 每个出现的组都失败），而空池时池组根本不出现、不触发 ⇒ 不误杀空池 run。
+
+**动机**：全局规则下，池段「被问过但一条都没测成」会被静默放行——池成员表达式坏了（`pool.py` 的 `skipped`）、池面板全 NaN、或观测 <3 被 `factor_research.py:550-553` 从名单里删掉，三者在门那里完全同形。这与 `pool.py` 自己写的「Skipping is not a pass … the gate reading the pool has to answer with its own fail-closed rule」直接冲突，而本任务正是那个 gate。为此 `engine._correlations` 必须把「被问过但没测到」的比较名以 `NaN` 补进映射，让池段的名字在门那里**存在**、只是值不可用。
 
 - [ ] **步骤 4：运行测试验证通过**
 
