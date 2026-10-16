@@ -18,12 +18,16 @@ them -- clamping would systematically over-sample ``WINDOW_MIN`` and ``WINDOW_MA
 
 Inputs are assumed to be DSL-valid trees: both operators validate what they produce, not
 what they are handed.
+
+:func:`evolve` is the loop those operators are drawn by: a deterministic, budgeted search
+over ``CandidateSeed`` rows that keeps the best of each generation and yields each new
+individual it breeds.
 """
 
 from __future__ import annotations
 
 import random
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 
 from app.services.factor_mining.dsl import (
     OPERATOR_SPECS,
@@ -34,8 +38,12 @@ from app.services.factor_mining.dsl import (
     ExpressionError,
     normalize_expression,
 )
+from app.services.factor_mining.templates import CandidateSeed
 
 _MODE_WEIGHTS = {"window": 0.4, "operator": 0.3, "subtree": 0.3}
+
+# Half of a generation is bred by grafting two parents together and half by rewriting one.
+_CROSSOVER_SHARE = 0.5
 
 # Relative window jumps a perturbation may take. Out-of-range picks are re-sampled.
 _WINDOW_STEPS = (-10, -5, -2, -1, 1, 2, 5, 10)
@@ -82,6 +90,127 @@ def crossover(left: dict | str, right: dict | str, rng: random.Random) -> dict |
     _donor_path, donor = rng.choice(list(_walk(right)))
     graft_path = rng.choice(list(_walk(left)))[0]
     return _accept(_replace(left, graft_path, donor), left)
+
+
+def evolve(
+    seeds: Sequence[CandidateSeed],
+    *,
+    budget: int,
+    seed: int,
+    population: int,
+    generations: int,
+    elite_ratio: float,
+    fitness: Callable[[dict], float | None],
+) -> Iterator[CandidateSeed]:
+    """Breed ``seeds`` for up to ``generations`` generations, yielding each new individual.
+
+    The seeds are the first generation. Every generation after it is the best ``elite_ratio``
+    share of its predecessor, kept as it is, plus children drawn from the whole of it, so a
+    generation never outgrows ``population`` (the first one may start larger and settle into
+    it). A child is one tournament-selected parent rewritten by :func:`mutate`, or two of
+    them grafted by :func:`crossover`, and it carries the source template of the parent whose
+    structure it grew out of. ``origin`` is ``"evolution"``, so a caller can tell a bred
+    individual from a template expansion without reading the expression.
+
+    ``fitness`` is the caller's own metric, consulted about every member of a generation and
+    never cached -- the caller's opinion, not a remembered one, is what ranks a generation.
+    ``None`` on an expression means the caller has no opinion about it: such a member can
+    never be an elite, because a generation's elites are the head of a ranking and an
+    unranked expression has no place in one, but it stays eligible to breed.
+
+    ``budget`` counts draws, not survivors. A refused draw -- an illegal rewrite, or one that
+    only re-spelled its parent -- yields nothing and still spends one unit, because a caller
+    pricing its own search has to account for the attempts it paid for and not only for the
+    children that came back. The stream ends when the budget is spent, when the generations
+    run out, or when a generation produces no legal child at all; the last one ends the search
+    rather than repeating a generation that has nothing to draw from.
+
+    Determinism is the whole point: the only source of randomness is ``seed``, every
+    collection is ordered before it is walked, and the same
+    ``(seeds, budget, seed, population, generations, elite_ratio)`` therefore breeds the same
+    individuals, in the same order, spelled the same way.
+    """
+    if budget <= 0 or generations <= 0 or population <= 0 or not seeds:
+        return
+    rng = random.Random(seed)
+    elite_slots = int(population * elite_ratio)
+    members = list(seeds)
+    for _ in range(generations):
+        if budget <= 0:
+            return
+        scored = _scored(members, fitness)
+        elites = [member for score, member in scored if score is not None][:elite_slots]
+        children: list[CandidateSeed] = []
+        while len(children) < population - len(elites) and budget > 0:
+            budget -= 1
+            child = _child(scored, rng)
+            if child is None:
+                continue
+            children.append(child)
+            yield child
+        if not children:
+            return
+        members = elites + children
+
+
+def _scored(
+    members: Sequence[CandidateSeed],
+    fitness: Callable[[dict], float | None],
+) -> list[tuple[float | None, CandidateSeed]]:
+    """Each member with its score, best first.
+
+    The order is total, so no draw ever depends on the order the caller handed the members
+    in: a scored member beats an unscored one, a higher score beats a lower one, and the
+    fingerprint breaks what is left.
+    """
+    scored = [(fitness(member.expression), member) for member in members]
+    scored.sort(key=lambda pair: _rank_key(*pair), reverse=True)
+    return scored
+
+
+def _rank_key(score: float | None, member: CandidateSeed) -> tuple[bool, float, str]:
+    """Best first: scored before unscored, then the score, then the fingerprint."""
+    return (score is not None, score if score is not None else 0.0, member.fingerprint)
+
+
+def _tournament(
+    scored: Sequence[tuple[float | None, CandidateSeed]],
+    rng: random.Random,
+) -> CandidateSeed:
+    """One parent: the better of two distinct members drawn from a generation, best first.
+
+    ``scored`` is already ranked best first, so the lower index wins -- the tournament reads
+    the ranking itself instead of asking the caller's metric a second question about the same
+    expression, which could answer differently.
+    """
+    return scored[min(rng.sample(range(len(scored)), min(2, len(scored))))][1]
+
+
+def _child(
+    scored: Sequence[tuple[float | None, CandidateSeed]],
+    rng: random.Random,
+) -> CandidateSeed | None:
+    """One draw against the budget: a new individual, or ``None`` if the operator refused it."""
+    if rng.random() < _CROSSOVER_SHARE:
+        left = _tournament(scored, rng)
+        right = _tournament(scored, rng)
+        expression = crossover(left.expression, right.expression, rng)
+        template_id = left.template_id
+    else:
+        parent = _tournament(scored, rng)
+        expression = mutate(parent.expression, rng)
+        template_id = parent.template_id
+    if expression is None:
+        return None
+    # The child may be a bare field: the DSL's leaves are field names, and a rewrite can put
+    # one at the root. It is a legal expression, and the evaluator reads it like any other.
+    return CandidateSeed(
+        expression=expression,
+        fingerprint=normalize_expression(expression).fingerprint,
+        template_id=template_id,
+        origin="evolution",
+        params={},
+    )
 
 
 def _mutation_pool(node: dict | str) -> list[str]:

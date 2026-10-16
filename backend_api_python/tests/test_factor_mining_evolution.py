@@ -4,9 +4,11 @@ import random
 
 import pandas as pd
 
+from app.services.factor_mining import evolution
 from app.services.factor_mining.dsl import MAX_DEPTH, WINDOW_MAX, WINDOW_MIN, normalize_expression
 from app.services.factor_mining.evaluator import ExpressionEvaluator
-from app.services.factor_mining.evolution import crossover, mutate
+from app.services.factor_mining.evolution import crossover, evolve, mutate
+from app.services.factor_mining.templates import CandidateSeed
 
 
 def _parent():
@@ -200,3 +202,152 @@ def test_a_bare_field_leaf_can_still_be_mutated():
     for child in produced:
         normalize_expression(child)
         assert _rewrite_locus("close", child) == {()}, "the root is the only locus a leaf has"
+
+
+def _seed(expression, template_id="momentum"):
+    """A candidate shaped like ``expand_candidates`` output, so the loop is fed what the engine feeds it."""
+    return CandidateSeed(
+        expression=expression,
+        fingerprint=normalize_expression(expression).fingerprint,
+        template_id=template_id,
+        origin="template",
+        params={},
+    )
+
+
+def _cohort():
+    """A first generation with a plain window, a compound tree and a cross-sectional rank."""
+    return [
+        _seed({"op": "ts_pct_change", "args": ["close"], "params": {"n": 5}}),
+        _seed({"op": "neg", "args": [{"op": "ts_std", "args": [{"op": "ts_pct_change", "args": ["close"],
+                                                                   "params": {"n": 1}}], "params": {"n": 20}}],
+               "params": {}}, template_id="low_volatility"),
+        _seed({"op": "cs_rank", "args": [{"op": "ts_mean", "args": ["volume"], "params": {"n": 10}}],
+               "params": {}}, template_id="liquidity_level"),
+        _seed({"op": "safe_div", "args": ["volume", {"op": "ts_mean", "args": ["volume"], "params": {"n": 20}}],
+               "params": {}}, template_id="volume_price_confirm"),
+    ]
+
+
+def _saturated_cohort():
+    """Trees sitting on the DSL's budgets, where a graft into them rarely fits: refusal is the norm."""
+    nested = {"op": "ts_mean", "args": [{"op": "ts_mean", "args": ["close"], "params": {"n": 252}}],
+              "params": {"n": 252}}
+    correlated = {"op": "ts_corr", "args": ["close", {"op": "ts_mean", "args": ["volume"], "params": {"n": 240}}],
+                  "params": {"n": 240}}
+    return [
+        _seed(_chain(MAX_DEPTH)),
+        _seed(nested),
+        _seed({"op": "add", "args": [_chain(MAX_DEPTH - 1), correlated], "params": {}}),
+        _seed({"op": "mul", "args": [_chain(MAX_DEPTH - 1), _chain(MAX_DEPTH - 1)], "params": {}}),
+        _seed(correlated),
+        _seed({"op": "neg", "args": [nested], "params": {}}),
+    ]
+
+
+def _shorter_wins(expression):
+    """A deterministic stand-in for the injected metric: the smaller tree scores higher."""
+    return -float(normalize_expression(expression).node_count)
+
+
+def _evolve(seeds, **overrides):
+    """``evolve`` with the run parameters these tests hold fixed, so each test names its own."""
+    settings = {"budget": 60, "seed": 17, "population": 4, "generations": 20, "elite_ratio": 0.25,
+                "fitness": _shorter_wins}
+    settings.update(overrides)
+    return list(evolve(seeds, **settings))
+
+
+def test_evolution_is_byte_identical_for_the_same_seed():
+    def run():
+        return _evolve(_cohort())
+
+    first, second = run(), run()
+    assert first, "no individual was produced, so the two runs agree about nothing"
+    assert first == second
+    spellings = [normalize_expression(row.expression).canonical for row in first]
+    assert spellings == [normalize_expression(row.expression).canonical for row in second]
+
+
+def test_evolution_respects_budget():
+    cohort = _cohort()
+    rows = _evolve(cohort, budget=30, seed=23, generations=1000)
+    assert 0 < len(rows) <= 30
+    for row in rows:
+        assert row.origin == "evolution"
+        assert row.template_id, "a child keeps the template of the lineage it grew out of"
+        assert row.fingerprint == normalize_expression(row.expression).fingerprint
+    # A smaller budget buys a prefix of a larger one, never a different search.
+    longer = _evolve(cohort, budget=31, seed=23, generations=1000)
+    assert longer[:len(rows)] == rows
+
+
+def test_rejected_children_are_counted_not_silently_dropped(monkeypatch):
+    """A refused draw spends a unit of budget: the search pays for every attempt, not every child."""
+    attempts = []
+
+    def counted(operator):
+        def spy(*arguments):
+            attempts.append(arguments[0])
+            return operator(*arguments)
+        return spy
+
+    for name in ("mutate", "crossover"):
+        monkeypatch.setattr(evolution, name, counted(getattr(evolution, name)))
+
+    rows = _evolve(_saturated_cohort(), budget=120, seed=29, population=6, generations=1000)
+    assert attempts, "the run drew nothing, so no refusal could be counted"
+    assert len(rows) < len(attempts), "nothing was refused, so this test proved nothing"
+    assert len(attempts) <= 120, "a refused draw was retried for free instead of spending the budget"
+    assert len(rows) < 120, "the run filled a quota of children, which is what refusals must prevent"
+
+
+def test_elite_survives_across_generations():
+    """The best individual of one generation sits in the next, where the ranking asks about it again.
+
+    The metric is the observation point: ranking a generation consults ``fitness`` about every
+    member of it, so an expression the caller is asked about twice is one that lived through
+    two generations. An elite the shuffle was allowed to drop would be asked about once.
+    """
+    cohort = _cohort()
+    champion = cohort[-1].fingerprint
+    ranked = []
+
+    def fitness(expression):
+        fingerprint = normalize_expression(expression).fingerprint
+        ranked.append(fingerprint)
+        return 1.0 if fingerprint == champion else 0.0
+
+    rows = _evolve(cohort, budget=60, seed=31, generations=6, fitness=fitness)
+    assert rows, "the run produced nothing, so no generation after the first was ever ranked"
+    assert ranked.count(champion) >= 2, (
+        "the best individual was ranked in one generation only, so it was not kept")
+
+
+def test_an_unscored_individual_is_never_an_elite():
+    """``None`` is "no opinion", not "worst": such a member breeds, but it is never kept."""
+    cohort = _cohort()
+    # The highest fingerprint wins every tie, so a ranking that reads ``None`` as a score
+    # would hand the elite slot to exactly this member.
+    abstains = max(cohort, key=lambda member: member.fingerprint).fingerprint
+    ranked = []
+
+    def fitness(expression):
+        fingerprint = normalize_expression(expression).fingerprint
+        ranked.append(fingerprint)
+        return None if fingerprint == abstains else 0.0
+
+    rows = _evolve(cohort, budget=60, seed=37, generations=4, fitness=fitness)
+    assert rows
+    assert ranked.count(abstains) == 1, "an unscored individual was kept as an elite"
+
+
+def test_degenerate_runs_still_terminate():
+    """No cohort, no budget, no generations, one member: each of them ends, none of them crashes."""
+    assert _evolve([]) == []
+    assert _evolve(_cohort(), budget=0) == []
+    assert _evolve(_cohort(), generations=0) == []
+    # A budget under the size of the first generation is a hard stop, not an escape hatch.
+    assert len(_evolve(_cohort(), budget=2, seed=3)) <= 2
+    # One member: the pool is the individual itself, drawn against itself.
+    assert len(_evolve(_cohort()[:1], budget=5, seed=3, population=1, elite_ratio=0.0)) <= 5
