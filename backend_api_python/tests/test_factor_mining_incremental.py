@@ -164,8 +164,11 @@ def test_an_empty_pool_short_circuits_to_no_measurement():
     """No pool is not "no value": the question was never asked, and the answer says so.
 
     A candidate is not worse for having nothing to compare against, so the empty pool is neither
-    verdict: nothing is measured, both readings stay absent, and the reason is no rejection --
-    a caller reading this as "no incremental value" would retire a candidate on no evidence.
+    verdict: nothing is measured, both readings stay absent, the value flag is ``None`` rather
+    than the ``False`` a failed measurement wears, and the reason is no rejection -- a caller
+    reading this as "no incremental value" would retire a candidate on no evidence. The reason
+    names the empty pool itself, so an operator is not left comparing two counts to find out
+    whether the library is empty or its members could not be measured.
     """
     rng = np.random.default_rng(61)
     candidate = _panel(SEARCH_DATES, rng)
@@ -175,20 +178,21 @@ def test_an_empty_pool_short_circuits_to_no_measurement():
     )
 
     assert result.measured is False
-    assert result.has_incremental_value is False
+    assert result.has_incremental_value is None
     assert result.residual_ic is None and result.raw_ic is None
     assert result.used_cross_sections == 0 and result.skipped_cross_sections == 0
-    assert result.reason == "factorMining.poolGainUnmeasured"
+    assert result.reason == "factorMining.poolIncrement.noPool"
     assert not result.reason.startswith("factorMining.reject.")
 
 
 def test_too_few_usable_cross_sections_is_unmeasured_not_a_rejection():
-    """A member no panel can be built from is a missing measurement, not a clearance or a verdict.
+    """A comparing set nothing could be read off is a missing measurement, not a verdict.
 
-    The member has values in one session only and the mean of a single IC is that IC, so there is
-    no incremental reading to compare against the bar. The counts are handed back with it, so a
-    caller can tell a pool that could not be measured from one that was -- and text of a rejected
-    kind never comes out of a measurement that never happened.
+    The member was rebuilt and carries values in one session only, and the mean of a single IC is
+    that IC, so there is no incremental reading to compare against the bar. What comes back is
+    the *other* unmeasured reason -- the pool is there and could not be measured, which is not the
+    same fact as a library that is empty -- and rejection of no kind comes out of a measurement
+    that never happened.
     """
     rng = np.random.default_rng(71)
     candidate = _panel(SEARCH_DATES, rng)
@@ -199,9 +203,11 @@ def test_too_few_usable_cross_sections_is_unmeasured_not_a_rejection():
     result = incremental.residual_ic(candidate, {MEMBER: member}, returns)
 
     assert result.measured is False
+    assert result.has_incremental_value is None
     assert result.residual_ic is None and result.raw_ic is None
     assert result.used_cross_sections == 1
     assert result.skipped_cross_sections == len(SEARCH_DATES) - 1
+    assert result.reason == "factorMining.poolIncrement.unmeasured"
     assert not result.reason.startswith("factorMining.reject.")
 
 
@@ -221,6 +227,7 @@ def test_a_section_the_pool_cannot_be_measured_on_is_skipped_and_counted():
     result = incremental.residual_ic(candidate, {MEMBER: member}, returns)
 
     assert result.measured is True
+    assert result.has_incremental_value is True
     assert result.used_cross_sections == len(SEARCH_DATES) - 10
     assert result.skipped_cross_sections == 10
 
@@ -228,9 +235,10 @@ def test_a_section_the_pool_cannot_be_measured_on_is_skipped_and_counted():
 def test_a_candidate_with_no_values_anywhere_is_unmeasured_not_rejected():
     """A candidate nothing could be read on is not a candidate that carries nothing.
 
-    A candidate that never evaluated has no session to be orthogonalized over, which is the same
-    state as a pool that never rebuilt: no reading, no verdict, and no rejection key -- the
-    invalid candidate is the engine's to reject, and on its own evidence rather than this one's.
+    A candidate that never evaluated has no session to be orthogonalized over -- the same state a
+    member that never carries values leaves every session in: no reading, no verdict, and no
+    rejection key. The invalid candidate is the engine's to reject, and on its own evidence rather
+    than this module's.
     """
     rng = np.random.default_rng(91)
     member = _panel(SEARCH_DATES, rng)
@@ -242,10 +250,11 @@ def test_a_candidate_with_no_values_anywhere_is_unmeasured_not_rejected():
     )
 
     assert result.measured is False
-    assert result.has_incremental_value is False
+    assert result.has_incremental_value is None
     assert result.residual_ic is None and result.raw_ic is None
     assert result.used_cross_sections == 0
     assert result.skipped_cross_sections == len(SEARCH_DATES)
+    assert result.reason == "factorMining.poolIncrement.unmeasured"
     assert not result.reason.startswith("factorMining.reject.")
 
 

@@ -35,14 +35,13 @@ Nothing here knows about the frozen tail. The increment is a search-period judgm
 frozen window is not evidence for it, so the caller hands over the in-sample and validation rows
 and this module -- which reads only the panels it is given -- has no way to reach the rest.
 
-Three outcomes, and the caller has to tell them apart. ``measured`` and ``has_incremental_value``
-both true is "adds information"; measured and false is "carries nothing the pool does not", the
-only state a caller may retire a candidate on. ``measured`` false is "no answer": an empty pool
-(the question was never asked) or too few usable cross-sections to average (nothing to answer
-with). Both are reported as such rather than as a rejection, because a candidate is not weaker
-for having had nothing to be compared against -- and both are reported rather than silently
-passed, because a reader who cannot tell "measured and clear" from "never measured" reads the
-second as the first.
+Three outcomes, and a caller has to tell them apart, because two of them are not verdicts. ``True``
+is "adds information"; ``False`` is "carries nothing the pool does not", the only state a caller
+may retire a candidate on; ``None`` is "no answer" -- an empty library (the question was never
+asked, :data:`NO_POOL_REASON`) or too few usable sessions to average (nothing to answer with,
+:data:`UNMEASURED_REASON`). Neither no-answer state is a rejection, because a candidate is not
+weaker for having had nothing to be compared against; and neither is silent, because a reader who
+cannot tell "measured and clear" from "never measured" reads the second as the first.
 """
 
 from __future__ import annotations
@@ -75,28 +74,51 @@ MIN_CROSS_SECTIONS = 2
 _NUMERICAL_ZERO = 1e-9
 
 REJECT_NO_INCREMENTAL_VALUE = "factorMining.reject.noIncrementalValue"
-UNMEASURED_REASON = "factorMining.poolGainUnmeasured"
+
+# The two no-answer states, spelled in the key namespace the plan reserved for this reading. They
+# are two keys because the facts are different: an empty library is a question that was never
+# asked, a pool nothing could be read off is a question that got no answer, and an operator
+# reading one of them should not have to compare two counts to find out which happened. Neither
+# is a rejection -- a candidate is not weaker for having had nothing to be measured against.
+NO_POOL_REASON = "factorMining.poolIncrement.noPool"
+UNMEASURED_REASON = "factorMining.poolIncrement.unmeasured"
 
 
 @dataclass(frozen=True)
 class PoolGain:
     """One verdict on what the candidate adds to the pool, with the readings behind it.
 
-    Read ``measured`` first. ``has_incremental_value`` is ``False`` whenever nothing was measured,
-    so a caller that skips the flag retires candidates on a question that was never answered;
-    ``reason`` is a closed i18n key -- empty when the candidate carries incremental value, a
-    ``factorMining.reject.*`` key when it does not, and :data:`UNMEASURED_REASON` -- deliberately
-    *not* a rejection -- when there is no verdict at all.
+    ``has_incremental_value`` carries the verdict and has three states a caller has to tell apart:
+    ``True`` (measured, adds information), ``False`` (measured, carries nothing the pool does not)
+    and ``None`` (nothing was measured, so no verdict either way). ``measured`` is the same
+    distinction said as a flag -- it is ``has_incremental_value is not None`` -- and the flag is
+    the shorter read for a caller that only branches on whether a verdict exists.
+
+    The three states are told apart in the flags and not only in the reason, deliberately. A
+    caller writing ``if not has_incremental_value: reject(reason)`` retires every candidate that
+    was never measured, and ``None`` is what makes that a decision the caller has to make on
+    purpose rather than a ``False`` that reads like a failed measurement.
+
+    ``reason`` is a closed i18n key: empty when the candidate carries incremental value, a
+    ``factorMining.reject.*`` key when it does not, and one of :data:`NO_POOL_REASON` /
+    :data:`UNMEASURED_REASON` -- deliberately *not* rejections -- when there is no verdict.
 
     ``residual_ic`` and ``raw_ic`` are the means over the sessions counted in
     ``used_cross_sections``, and are ``None`` when nothing was measured: a partial mean is not a
-    reading, and a caller shown one would use it. The two counts are how a caller tells a pool
-    that was measured from one that could not be -- a pool whose members do not rebuild leaves
-    every session unmeasurable, and the count says so.
+    reading, and a caller shown one would use it.
+
+    What no field here can tell a caller is whether the pool it was handed was the whole pool.
+    Members :func:`~app.services.factor_mining.pool.pool_panels` could not rebuild are left out of
+    its ``panels`` mapping entirely -- they appear only in that function's ``skipped`` list, which
+    this module is not given -- so a pool arriving one member short is compared here as if it had
+    always had that shape, and a candidate the missing member would have explained is measured
+    against the members that did rebuild. This module cannot see the difference; the caller that
+    assembled the pool holds the record, and refusing to measure a candidate against a truncated
+    pool is that caller's rule to keep.
     """
 
     measured: bool
-    has_incremental_value: bool
+    has_incremental_value: bool | None
     residual_ic: float | None
     raw_ic: float | None
     used_cross_sections: int
@@ -121,15 +143,20 @@ def residual_ic(
 
     Sessions where the pool cannot be measured -- a member with no values on that session, a
     session too small for the fit, a flat candidate or a flat return column -- are skipped and
-    counted rather than allowed to stand for the whole judgment. An all-NaN member skips every
-    session and comes back unmeasured: the pool could not be removed, so the candidate was not
-    measured, and a candidate is never retired for a measurement that did not happen.
+    counted rather than allowed to stand for the whole judgment. A member present but carrying no
+    values anywhere skips every session and comes back unmeasured (:data:`UNMEASURED_REASON`): the
+    pool could not be removed, so the candidate was not measured, and a candidate is never retired
+    for a measurement that did not happen. That is about a member *in the mapping and empty*. A
+    member :func:`~app.services.factor_mining.pool.pool_panels` could not rebuild never arrives
+    here at all -- it is in that function's ``skipped`` list, not in the panels -- so a shorter
+    pool is simply a smaller pool as far as this function can tell, and the caller owning that
+    list is where a truncated comparison set has to be refused.
     """
     members = list(pool_factor_panels.values()) if pool_factor_panels else []
     if not members:
         # No pool, no question. Reporting a reading of zero here would read as "no value" and
         # report section counts for a comparison that was never drawn.
-        return _unmeasured(0, 0)
+        return _unmeasured(0, 0, NO_POOL_REASON)
 
     readings: list[tuple[float, float]] = []
     skipped = 0
@@ -166,7 +193,7 @@ def residual_ic(
         readings.append((raw, incremental))
 
     if len(readings) < MIN_CROSS_SECTIONS:
-        return _unmeasured(len(readings), skipped)
+        return _unmeasured(len(readings), skipped, UNMEASURED_REASON)
     raw_ic = float(pd.Series([raw for raw, _ in readings]).mean())
     incremental_ic = float(pd.Series([value for _, value in readings]).mean())
     has_incremental_value = abs(incremental_ic) >= min_abs_rank_ic and incremental_ic * raw_ic > 0
@@ -203,14 +230,18 @@ def _section(
     return frame.where(np.isfinite(frame)).dropna()
 
 
-def _unmeasured(used: int, skipped: int) -> PoolGain:
-    """No answer: neither verdict, no readings, and a reason that is not a rejection."""
+def _unmeasured(used: int, skipped: int, reason: str) -> PoolGain:
+    """No answer: no verdict in either direction, no readings, and a reason that is not a rejection.
+
+    ``has_incremental_value`` is ``None`` rather than ``False`` so that a caller cannot reach this
+    state's conclusion -- no value -- by not thinking about it.
+    """
     return PoolGain(
         measured=False,
-        has_incremental_value=False,
+        has_incremental_value=None,
         residual_ic=None,
         raw_ic=None,
         used_cross_sections=used,
         skipped_cross_sections=skipped,
-        reason=UNMEASURED_REASON,
+        reason=reason,
     )
