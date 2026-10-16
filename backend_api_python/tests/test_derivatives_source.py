@@ -51,6 +51,12 @@ _FUNDING_PAGE = {
     "okx": "_OKX_FUNDING_PAGE",
 }
 _OI_PAGE = {"binance": "_BINANCE_OI_PAGE", "gate": "_GATE_OI_PAGE", "okx": "_OKX_OI_PAGE"}
+# The page widths the recordings themselves answer at, i.e. the real ceilings the module asks for.
+_FUNDING_PAGE_WIDTH = {"binance": 1000, "gate": 1000, "okx": 100}
+_OI_PAGE_WIDTH = {"binance": 500, "okx": 100}
+# The clock the clamp case freezes: the hour its fixture was recorded in, so the request it pins is
+# inside Gate's own 180-day edge.
+_FROZEN_NOW = pd.Timestamp("2026-10-16 19:00")
 
 
 class _Response:
@@ -171,6 +177,9 @@ def test_funding_history_is_normalised_to_a_per_interval_rate(recorded, venue):
     for stamp, expected in _FUNDING_EXPECTED[venue].items():
         assert series.loc[stamp] == pytest.approx(expected)
 
+    # The recordings answer at the venue's own page ceiling, so the request pins that width too.
+    assert [params["limit"] for _url, params in recorded.calls] == [_FUNDING_PAGE_WIDTH[venue]]
+
 
 # --- open interest: a level, in USD, per venue-reported bucket -------------------------------
 
@@ -227,6 +236,9 @@ def test_open_interest_history_is_returned_as_a_level_series(recorded, monkeypat
     assert (series > 1e6).all(), "a level series, not a ratio"
     assert (steps < 0.05).all(), "a change series would move in percent, not by a factor of a billion"
 
+    expected_limit = 3 if venue == "gate" else _OI_PAGE_WIDTH[venue]
+    assert [params["limit"] for _url, params in recorded.calls] == [expected_limit] * len(recorded.calls)
+
 
 def test_gate_open_interest_is_published_at_the_end_of_the_bucket_it_measured(recorded, monkeypatch):
     """Gate stamps the bucket's *last* observation at the bucket's start (measured 2026-10-16).
@@ -277,6 +289,47 @@ def test_an_unsupported_venue_returns_an_empty_series(recorded):
     )
 
     assert series.empty
+    assert recorded.calls == []
+
+
+def test_a_key_that_names_only_a_market_type_reads_the_default_venue(recorded):
+    """``Crypto:BTC/USDT@swap`` is a key this repository really builds.
+
+    ``InstrumentSpec.key`` spells the market type alone when the run recorded no exchange id, so the
+    word after ``@`` is a product here and not a venue: the key asks the same question the bare pair
+    does and must get the same answer, not an empty column from a venue named ``swap``.
+    """
+    by_key = derivatives.fetch_funding_history(
+        "Crypto", "Crypto:BTC/USDT@swap", start=_FUNDING_START, end=_FUNDING_END
+    )
+    bare = derivatives.fetch_funding_history("Crypto", "BTC/USDT", start=_FUNDING_START, end=_FUNDING_END)
+
+    assert list(by_key.index) == sorted(_FUNDING_EXPECTED["binance"])
+    assert by_key.equals(bare)
+    assert recorded.urls() == [_FUNDING_URL["binance"]] * 2
+
+
+@pytest.mark.parametrize("symbol", [
+    "Crypto:BTC/USDT@binance:spot",
+    "Crypto:BTC/USDT@okx:spot",
+    "Crypto:BTC/USDT@binance:cash",
+    "Crypto:BTC/USDT@binance:margin",
+])
+def test_a_key_that_names_a_product_other_than_a_perpetual_returns_an_empty_series(recorded, symbol):
+    """A spot member has no funding rate and no open interest to read.
+
+    The perpetual endpoint answers for the perpetual contract of the same base asset, so accepting
+    the key would feed a spot symbol a perpetual's numbers -- the cross-market mix this module
+    exists to avoid. A product word this module cannot place (``margin``) is refused the same way,
+    because it cannot be established to be a perpetual either.
+    """
+    for fetch, start, end in (
+        (derivatives.fetch_funding_history, _FUNDING_START, _FUNDING_END),
+        (derivatives.fetch_open_interest_history, _OI_START, _OI_END),
+    ):
+        series = fetch("Crypto", symbol, start=start, end=end)
+        assert series.empty
+
     assert recorded.calls == []
 
 
@@ -347,6 +400,81 @@ def test_a_reversed_window_is_empty_and_asks_nobody(recorded):
     assert recorded.calls == []
 
 
+def test_a_settlement_exactly_on_a_single_point_window_is_returned(recorded):
+    """``start == end`` is one settlement, not an empty window: the bounds are inclusive."""
+    series = derivatives.fetch_funding_history(
+        "Crypto", _SYMBOL["gate"], start=_at("2026-10-08 08:00"), end=_at("2026-10-08 08:00")
+    )
+
+    assert list(series.index) == [_at("2026-10-08 08:00")]
+    assert series.iloc[0] == pytest.approx(0.0013)
+
+
+def test_gate_funding_reads_the_tail_it_keeps_when_the_window_ends_in_the_past(recorded, monkeypatch):
+    """Gate's 180-day funding edge is measured on *its* clock, not against the caller's window.
+
+    A floor taken from the window alone asks for a ``from`` older than that edge whenever the window
+    ends in the past -- which is the normal case, since a factor-mining window ends on the last
+    closed bar -- and Gate answers 400, which this module turns into an empty column while it holds
+    the window's tail. Measured 2026-10-16: ``now - 180d`` answers, ``now - 180d - 1h`` does not.
+    """
+    monkeypatch.setattr(derivatives, "_now", lambda: _FROZEN_NOW)
+
+    series = derivatives.fetch_funding_history(
+        "Crypto",
+        _SYMBOL["gate"],
+        start=_FROZEN_NOW - pd.Timedelta(days=730),
+        end=_FROZEN_NOW - pd.Timedelta(days=1),
+    )
+
+    assert len(series) == 537
+    # The clamped floor is 2026-04-19 20:00, so the first settlement at or after it opens the series
+    # -- 2026-04-20 00:00, two seconds early in the recording and rounded onto the grid.
+    assert series.index.min() == _at("2026-04-20 00:00")
+    assert series.index.max() == _at("2026-10-15 16:00")
+    assert (series > -1).all() and (series < 1).all(), "percent per settlement, not a raw decimal"
+
+
+def test_a_window_older_than_the_venue_keeps_is_not_asked_for(recorded, monkeypatch):
+    """A window entirely past Gate's edge has no funding to give, so nobody is asked for it."""
+    monkeypatch.setattr(derivatives, "_now", lambda: _FROZEN_NOW)
+
+    series = derivatives.fetch_funding_history(
+        "Crypto",
+        _SYMBOL["gate"],
+        start=_FROZEN_NOW - pd.Timedelta(days=1095),
+        end=_FROZEN_NOW - pd.Timedelta(days=730),
+    )
+
+    assert series.empty
+    assert recorded.calls == []
+
+
+def test_the_open_interest_page_width_is_the_venue_ceiling(recorded):
+    """Gate's stats ceiling is pinned here rather than in a fixture: one row is ~1.1 KB.
+
+    A recording at the real width would be a megabyte, so the other five ceilings are pinned by the
+    requests their recordings answer (see the funding and open interest cases) and this one by
+    value. It is the ceiling Gate documents and the one a live call was measured at (1000 rows).
+    """
+    assert derivatives._GATE_OI_PAGE == 1000
+
+
+def test_a_stamp_no_calendar_can_hold_costs_the_series_not_the_call(recorded):
+    """Assembling the answer is part of answering: a wild window must not raise through a caller.
+
+    A year-5000 bound converts to a ``Timestamp`` and then overflows the moment it is turned into
+    milliseconds, which is three frames below the promise that these functions return an empty
+    series rather than raising.
+    """
+    for fetch, start, end in (
+        (derivatives.fetch_funding_history, datetime(5000, 1, 1), datetime(5000, 1, 2)),
+        (derivatives.fetch_open_interest_history, datetime(5000, 1, 1), datetime(5000, 2, 1)),
+    ):
+        series = fetch("Crypto", _SYMBOL["gate"], start=start, end=end)
+        assert series.empty
+
+
 # --- request shape and paging --------------------------------------------------------------
 
 
@@ -387,7 +515,7 @@ _FUNDING_PAGED = {
         _at("2026-10-07 08:00"): -0.00076,
         _at("2026-10-07 16:00"): 0.00243,
         _at("2026-10-08 00:00"): 0.00584,
-        _at("2026-10-08 08:00"): 0.00112,
+        _at("2026-10-08 08:00"): -0.00247,
     },
 }
 

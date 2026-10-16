@@ -10,13 +10,19 @@ nothing from here instead of a substitute.
 The two fields are fetched independently and share no state: one endpoint failing costs its own
 series, not the other's.
 
+Two of the venues keep only a window of history and refuse requests that reach past it, so a window
+older than the edge answers with nothing even though the field exists: Gate's funding history is 180
+days measured on *its* clock, and Binance's open interest is one month (an older ``startTime`` is
+rejected outright with ``-1130``, which is why that endpoint is asked by its end alone).
+
 Stamp semantics, measured against the venues on 2026-10-16 -- a factor reads these series
 point-in-time, so what an index means is part of the contract:
 
+* Every stamp is rounded to the minute it names (:func:`_on_the_minute`): settlements are scheduled
+  on the minute grid and the venues miss it by seconds, so the index lands on the same grid as any
+  bar a reader can align it to.
 * Funding rates are indexed by their **settlement instant** (Gate settles BTC at 00:00, 08:00 and
-  16:00 UTC). The rate at ``t`` is the one that crystallized at ``t``. Binance stamps some rows a
-  millisecond or three late; that reporting noise is floored away, because a settlement stamped
-  00:00:00.002 would fall past a bar stamped 00:00:00 and be read one interval late.
+  16:00 UTC). The rate at ``t`` is the one that crystallized at ``t``.
 * Open interest is indexed by the instant the observation became known. Binance stamps a daily row
   with the observation it holds, so its rows publish at their own stamp; Gate stamps a bucket's
   *last* observation at the bucket's *start* (a 1d row stamped 10-09 repeats the open interest the
@@ -55,6 +61,18 @@ _INSTRUMENT_NAME = {
 }
 _QUOTE_ASSETS = ("USDT", "USDC", "USD")
 
+# The product words a member key can carry where an exchange id would otherwise sit, because a key
+# with no exchange id spells its market type alone (``Crypto:BTC/USDT@swap``). The vocabulary is
+# the repository's own (``professional_report.features.crypto`` and ``data_sources.native_crypto``).
+# Only a perpetual has funding and open interest: a key that names any other product (``@spot``, or
+# a word this module cannot place) gets nothing rather than a perpetual's numbers.
+_PERPETUAL_PRODUCTS = frozenset({
+    "future", "futures", "linear", "perp", "perpetual", "perpetual_contract", "perpetual_future",
+    "perpetual_futures", "perpetual_swap", "swap",
+})
+_SPOT_PRODUCTS = frozenset({"cash", "spot"})
+_PRODUCT_WORDS = _PERPETUAL_PRODUCTS | _SPOT_PRODUCTS
+
 _BINANCE = "https://fapi.binance.com"
 _GATE = "https://api.gateio.ws/api/v4/futures/usdt"
 _OKX = "https://www.okx.com"
@@ -73,19 +91,22 @@ _MAX_PAGES = 200
 _TIMEOUT_SECONDS = 10
 _DAY_MS = 86_400_000
 _MS_PER_SECOND = 1000
-# Gate refuses a funding ``from`` older than this and keeps no deeper history.
-_GATE_FUNDING_LOOKBACK_SECONDS = 180 * 86_400
+_MINUTE_MS = 60_000
+# Gate refuses a funding ``from`` older than 180 days by its own clock and keeps no deeper history.
+# The clamp stays an hour inside that edge: the venue's clock is ahead of this one by the request's
+# round trip, and a request a second past the line is refused rather than trimmed.
+_GATE_FUNDING_LOOKBACK_SECONDS = 180 * 86_400 - 3600
 
 
 def fetch_funding_history(market: str, symbol: str, *, start: datetime, end: datetime) -> pd.Series:
     """Realized funding rates for one perpetual, one value per settlement, **in percent**.
 
-    The index is each rate's settlement instant (tz-naive UTC, whole seconds). The value at ``t`` is
-    the rate that crystallized at ``t``, which is also when it became known, so a point-in-time
-    reader takes the last settlement at or before its bar and no earlier bar sees it. Points are
-    spaced by the venue's own funding interval -- 8h on BTC, 4h or 1h on some contracts -- and are
-    never annualised and never rescaled to the caller's bar size: a 4h settlement is the rate paid
-    over those four hours, and a series mixing both intervals stays readable as such.
+    The index is each rate's settlement instant (tz-naive UTC, rounded to the minute). The value at
+    ``t`` is the rate that crystallized at ``t``, which is also when it became known, so a
+    point-in-time reader takes the last settlement at or before its bar and no earlier bar sees it.
+    Points are spaced by the venue's own funding interval -- 8h on BTC, 4h or 1h on some contracts
+    -- and are never annualised and never rescaled to the caller's bar size: a 4h settlement is the
+    rate paid over those four hours, and a series mixing both intervals stays readable as such.
 
     Values are percent per settlement, the unit the repository reports as ``funding_rate``
     (``professional_report`` stores the same field as ``unit: percent`` over a ``decimal`` source),
@@ -124,7 +145,7 @@ def _history(*, market: str, symbol: str, start: datetime, end: datetime, field:
         return _empty()
     parsed = _instrument(symbol, market)
     if parsed is None:
-        logger.debug("no base/quote pair in %r", symbol)
+        logger.debug("%r names no perpetual base/quote pair", symbol)
         return _empty()
     venue, base, quote = parsed
     fetcher = _FETCHERS.get((venue, field))
@@ -135,23 +156,40 @@ def _history(*, market: str, symbol: str, start: datetime, end: datetime, field:
     lower, upper = _utc(start), _utc(end)
     if lower > upper:
         return _empty()
-    return _series(fetcher(template.format(base, quote), lower, upper), lower, upper)
+    try:
+        return _series(fetcher(template.format(base, quote), lower, upper), lower, upper)
+    except Exception as exc:
+        # Assembling the answer is part of answering. A window no calendar holds raises the moment
+        # it is turned into milliseconds, and a caller promised an empty series must get one rather
+        # than an OverflowError from three frames down.
+        logger.warning("%s history for %r (%s) could not be assembled: %s", field, symbol, venue, exc)
+        return _empty()
 
 
 def _instrument(symbol: str, market: str) -> tuple[str, str, str] | None:
     """``Crypto:BTC/USDT@binance:swap`` -> ``("binance", "BTC", "USDT")``, or ``None``.
 
-    The venue is read from the ``@venue`` suffix of a portfolio member key, because the caller's
-    signature carries no exchange argument and the key is where the run recorded one. A bare pair
-    (``BTC/USDT``, or the unified ``BTC/USDT:USDT``) takes :data:`DEFAULT_VENUE`; a caller that
-    must not read another venue's funding passes the key.
+    A member key spells its venue as ``@exchange_id[:market_type]``, or the market type alone when
+    the run recorded no exchange id (``Crypto:BTC/USDT@swap``, a key this repository really
+    builds). So a suffix whose first word is a product word names a market type, not a venue, and
+    such a key reads on :data:`DEFAULT_VENUE` -- the same rule a bare pair follows. A key whose
+    product is not a perpetual names no funding rate and no open interest and returns ``None``
+    rather than a perpetual's numbers under a spot symbol.
     """
     text = str(symbol or "").strip()
     if not text:
         return None
     head, _, suffix = text.partition("@")
-    venue, _, _market_type = suffix.partition(":")
-    venue = venue.strip().lower() or DEFAULT_VENUE
+    first, _, rest = suffix.partition(":")
+    first, rest = first.strip().lower(), rest.strip().lower()
+    if not first:
+        venue, product = DEFAULT_VENUE, ""
+    elif first in _PRODUCT_WORDS:
+        venue, product = DEFAULT_VENUE, first
+    else:
+        venue, product = first, rest
+    if product and product not in _PERPETUAL_PRODUCTS:
+        return None
     # ``Crypto:BTC/USDT`` prefixes the market, ``BTC/USDT:USDT`` suffixes the settle asset.
     prefix = f"{market}:"
     if head[: len(prefix)].lower() == prefix.lower():
@@ -188,6 +226,31 @@ def _millis(stamp: pd.Timestamp) -> int:
 
 def _seconds(stamp: pd.Timestamp) -> int:
     return _millis(stamp) // _MS_PER_SECOND
+
+
+def _now() -> pd.Timestamp:
+    """The wall clock, tz-naive UTC.
+
+    The one clock read here, and it is not optional: Gate measures its 180-day funding limit
+    against *its* clock, so a floor computed from the caller's window alone asks for a ``from``
+    Gate refuses whenever that window ends in the past -- and a factor-mining window ends on the
+    last closed bar, which is yesterday.
+    """
+    return _utc(pd.Timestamp.now(tz="UTC"))
+
+
+def _on_the_minute(millis: int) -> int:
+    """A stamp rounded to the minute it names.
+
+    Settlements are scheduled on the minute grid, but the venues' stamps miss it by seconds: Gate's
+    rows older than a month sit one to two seconds late (measured 2026-10-16: 40- and 178-day-old
+    rows at ``t % 60 == 2``, 90- and 150-day-old rows at 1, recent rows exact), and Binance prints
+    sub-second offsets. Left alone, a settlement stamped one second past midnight is not visible to
+    a bar stamped midnight at all, so a forward-filled column lags one funding period -- and only
+    over the stretch of history where the venue's stamps drifted, which no coverage gate can see.
+    Rounding is bounded by thirty seconds, and a minute is the finest bar this repository trades.
+    """
+    return (millis + _MINUTE_MS // 2) // _MINUTE_MS * _MINUTE_MS
 
 
 def _number(value: object) -> float | None:
@@ -238,19 +301,19 @@ def _rows(
 
 
 def _series(rows: Iterable[tuple[int, float]], lower: pd.Timestamp, upper: pd.Timestamp) -> pd.Series:
-    """Ascending series over the requested window, one point per timestamp, in whole seconds.
+    """Ascending series over the requested window, one point per timestamp, on the minute grid.
 
-    Timestamps are floored to the second before the window is applied. Binance prints real
-    sub-second offsets on some settlements (``...600002``, recorded 2026-10-16): they are reporting
-    noise around a scheduled instant, and a settlement stamped 00:00:00.002 would otherwise fall
-    past a bar stamped 00:00:00 and be read one funding interval late by a forward-fill.
+    Stamps are rounded to the minute (see :func:`_on_the_minute`) before the window is applied, so
+    the same window selects the same settlements on every venue.
     """
     lower_ms, upper_ms = _millis(lower), _millis(upper)
     frame = pd.DataFrame(list(rows), columns=["time", "value"])
     if frame.empty:
         return _empty()
-    frame["time"] = frame["time"] // _MS_PER_SECOND * _MS_PER_SECOND
+    frame["time"] = frame["time"].map(_on_the_minute)
     frame = frame[(frame["time"] >= lower_ms) & (frame["time"] <= upper_ms)]
+    # The venues page with exclusive cursors, so a repeated instant means a page was read twice and
+    # the later page wins -- a rule about the provider's own row order, not about the values.
     frame = frame.drop_duplicates(subset="time", keep="last").sort_values("time")
     if frame.empty:
         return _empty()
@@ -319,11 +382,22 @@ def _gate_funding(instrument: str, lower: pd.Timestamp, upper: pd.Timestamp) -> 
 
     ``from`` is inclusive and ``to`` exclusive, so a window ending on a settlement asks for one
     second past it -- asking for the settlement itself would drop it. Gate keeps 180 days and
-    refuses an older ``from``, so the floor is clamped to what it will answer; a window ending
-    before that floor has no Gate funding to give.
+    refuses an older ``from`` against its own clock (measured 2026-10-16: ``now - 180d`` answers,
+    ``now - 180d - 1h`` answers ``from time exceeds 180-day limit``), so the floor is the latest of
+    the window's start, the window's own lookback, and the clock's -- without the clock's, every
+    window ending in the past asks for a ``from`` Gate refuses and loses the tail it does hold. A
+    window that ends before the venue's edge has no Gate funding to give and is not asked for.
     """
     rows: list[tuple[int, float]] = []
-    floor = max(_seconds(lower), _seconds(upper) - _GATE_FUNDING_LOOKBACK_SECONDS)
+    floor = max(
+        _seconds(lower),
+        _seconds(upper) - _GATE_FUNDING_LOOKBACK_SECONDS,
+        _seconds(_now()) - _GATE_FUNDING_LOOKBACK_SECONDS,
+    )
+    if floor > _seconds(upper):
+        logger.debug("gate funding window for %s ends before the venue's %d-day edge",
+                     instrument, _GATE_FUNDING_LOOKBACK_SECONDS // 86_400)
+        return rows
     cursor = _seconds(upper) + 1
     try:
         for _ in range(_MAX_PAGES):
@@ -337,7 +411,9 @@ def _gate_funding(instrument: str, lower: pd.Timestamp, upper: pd.Timestamp) -> 
                 break
             rows.extend(page)
             oldest = page[0][0] // _MS_PER_SECOND
-            if oldest <= floor or oldest >= cursor:
+            # A short page is the window's end (`limit` returns at most that many rows), and the
+            # floor covers a window whose start the venue answered to the row.
+            if len(page) < _GATE_FUNDING_PAGE or oldest <= floor or oldest >= cursor:
                 break
             cursor = oldest
     except Exception as exc:
@@ -430,6 +506,14 @@ def _okx_interest_rows(payload: object) -> list[tuple[int, float]]:
     The statistics rows are lists rather than mappings, and a three-field row is the currency
     aggregate: it names no contract and carries no USD notional, so it is skipped rather than read
     as one.
+
+    UNVERIFIED, and the one thing here that would fail *silently*: OKX is unreachable from this
+    host, so the column order comes from the endpoint's documented shape and ccxt's live-verified
+    client rather than from a recorded body. A wrong order yields a plausible number of the wrong
+    kind, which no coverage gate can catch. The verification owed is a networked smoke call that
+    asserts the magnitude, not merely that the series is non-empty: the value must read as USD
+    notional (``> 1e6``, and the same order as ``oi`` x price). If OKX answers mapping rows instead
+    of lists, read the fields by name here rather than by position.
     """
     items = payload.get("data") if isinstance(payload, dict) else payload
     rows = []
