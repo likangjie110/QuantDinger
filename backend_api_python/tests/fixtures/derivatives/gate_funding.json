@@ -1,0 +1,83 @@
+{
+  "source": "recorded",
+  "recorded_at": "2026-10-16T19:35:30Z",
+  "note": "Real provider responses. Binance bodies were recorded through www.binance.com (same production futures API) because fapi.binance.com answers HTTP 451 from the recording host; the fixture keeps the URL the implementation calls.",
+  "responses": [
+    {
+      "url": "https://api.gateio.ws/api/v4/futures/usdt/funding_rate",
+      "params": {
+        "contract": "BTC_USDT",
+        "from": 1791417600,
+        "to": 1791475201,
+        "limit": 1000
+      },
+      "body": [
+        {
+          "r": "0.000031",
+          "t": 1791475200
+        },
+        {
+          "r": "0.000013",
+          "t": 1791446400
+        },
+        {
+          "r": "0.000051",
+          "t": 1791417600
+        }
+      ]
+    },
+    {
+      "url": "https://api.gateio.ws/api/v4/futures/usdt/funding_rate",
+      "params": {
+        "contract": "BTC_USDT",
+        "from": 1791331200,
+        "to": 1791446401,
+        "limit": 2
+      },
+      "body": [
+        {
+          "r": "0.000013",
+          "t": 1791446400
+        },
+        {
+          "r": "0.000051",
+          "t": 1791417600
+        }
+      ]
+    },
+    {
+      "url": "https://api.gateio.ws/api/v4/futures/usdt/funding_rate",
+      "params": {
+        "contract": "BTC_USDT",
+        "from": 1791331200,
+        "to": 1791417600,
+        "limit": 2
+      },
+      "body": [
+        {
+          "r": "0.000034",
+          "t": 1791388800
+        },
+        {
+          "r": "-0.000015",
+          "t": 1791360000
+        }
+      ]
+    },
+    {
+      "url": "https://api.gateio.ws/api/v4/futures/usdt/funding_rate",
+      "params": {
+        "contract": "BTC_USDT",
+        "from": 1791331200,
+        "to": 1791360000,
+        "limit": 2
+      },
+      "body": [
+        {
+          "r": "0.000028",
+          "t": 1791331200
+        }
+      ]
+    }
+  ]
+}

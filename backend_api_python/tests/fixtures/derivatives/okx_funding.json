@@ -1,0 +1,56 @@
+{
+  "source": "schema-only",
+  "recorded_at": "2026-10-16",
+  "note": "NOT recorded: www.okx.com is unreachable from the recording host (connection failure, no route). The body shape follows OKX API v5 (/api/v5/public/funding-rate-history): a code/msg/data envelope whose rows carry fundingTime in milliseconds as a string. Values are illustrative. The realizedRate/fundingRate pair is real: a capped settlement reports the uncapped fundingRate next to the realized one.",
+  "reference": "https://www.okx.com/docs-v5/en/#public-data-rest-api-get-funding-rate-history",
+  "responses": [
+    {
+      "url": "https://www.okx.com/api/v5/public/funding-rate-history",
+      "params": {"instId": "BTC-USDT-SWAP", "after": 1791475200001, "limit": 100},
+      "body": {
+        "code": "0",
+        "msg": "",
+        "data": [
+          {"instId": "BTC-USDT-SWAP", "instType": "SWAP", "method": "cap", "fundingRate": "0.00015000", "realizedRate": "0.00003610", "fundingTime": "1791475200000", "settState": "settled", "formulaType": "noRate"},
+          {"instId": "BTC-USDT-SWAP", "instType": "SWAP", "method": "current_period", "fundingRate": "-0.00002470", "realizedRate": "-0.00002470", "fundingTime": "1791446400000", "settState": "settled", "formulaType": "noRate"},
+          {"instId": "BTC-USDT-SWAP", "instType": "SWAP", "method": "current_period", "fundingRate": "0.00005840", "realizedRate": "0.00005840", "fundingTime": "1791417600000", "settState": "settled", "formulaType": "noRate"}
+        ]
+      }
+    },
+    {
+      "url": "https://www.okx.com/api/v5/public/funding-rate-history",
+      "params": {"instId": "BTC-USDT-SWAP", "after": 1791446400001, "limit": 2},
+      "body": {
+        "code": "0",
+        "msg": "",
+        "data": [
+          {"instId": "BTC-USDT-SWAP", "instType": "SWAP", "method": "current_period", "fundingRate": "0.00001120", "realizedRate": "0.00001120", "fundingTime": "1791446400000", "settState": "settled", "formulaType": "noRate"},
+          {"instId": "BTC-USDT-SWAP", "instType": "SWAP", "method": "current_period", "fundingRate": "0.00005840", "realizedRate": "0.00005840", "fundingTime": "1791417600000", "settState": "settled", "formulaType": "noRate"}
+        ]
+      }
+    },
+    {
+      "url": "https://www.okx.com/api/v5/public/funding-rate-history",
+      "params": {"instId": "BTC-USDT-SWAP", "after": 1791417600000, "limit": 2},
+      "body": {
+        "code": "0",
+        "msg": "",
+        "data": [
+          {"instId": "BTC-USDT-SWAP", "instType": "SWAP", "method": "current_period", "fundingRate": "0.00002430", "realizedRate": "0.00002430", "fundingTime": "1791388800000", "settState": "settled", "formulaType": "noRate"},
+          {"instId": "BTC-USDT-SWAP", "instType": "SWAP", "method": "current_period", "fundingRate": "-0.00000760", "realizedRate": "-0.00000760", "fundingTime": "1791360000000", "settState": "settled", "formulaType": "noRate"}
+        ]
+      }
+    },
+    {
+      "url": "https://www.okx.com/api/v5/public/funding-rate-history",
+      "params": {"instId": "BTC-USDT-SWAP", "after": 1791360000000, "limit": 2},
+      "body": {
+        "code": "0",
+        "msg": "",
+        "data": [
+          {"instId": "BTC-USDT-SWAP", "instType": "SWAP", "method": "current_period", "fundingRate": "0.00004180", "realizedRate": "0.00004180", "fundingTime": "1791331200000", "settState": "settled", "formulaType": "noRate"}
+        ]
+      }
+    }
+  ]
+}

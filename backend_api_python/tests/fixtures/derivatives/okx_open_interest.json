@@ -1,0 +1,24 @@
+{
+  "source": "schema-only",
+  "recorded_at": "2026-10-16",
+  "note": "NOT recorded: www.okx.com is unreachable from the recording host (connection failure, no route). The body shape follows OKX API v5 /api/v5/rubik/stat/contracts/open-interest-history as implemented live by ccxt (fetchOpenInterestHistory): rows are [ts, oi, oiCcy, oiUsd] with oiUsd in USD, newest first, and end exclusive. Values are illustrative.",
+  "reference": "https://www.okx.com/docs-v5/en/#rubik-statistic-rest-api-get-contract-open-interest-history",
+  "responses": [
+    {
+      "url": "https://www.okx.com/api/v5/rubik/stat/contracts/open-interest-history",
+      "params": {"instId": "BTC-USDT-SWAP", "period": "1D", "end": 1792022400001, "limit": 100},
+      "body": {
+        "code": "0",
+        "msg": "",
+        "data": [
+          ["1792022400000", "61234.5", "61234.5", "5099000000"],
+          ["1791936000000", "61002.25", "61002.25", "5073100000.125"],
+          ["1791849600000", "60488.75", "60488.75", "4982500000.5"],
+          ["1791763200000", "60930.5", "60930.5", "5018700000.75"],
+          ["1791676800000", "59710.25", "59710.25", "4951200000.25"],
+          ["1791590400000", "59120.75", "59120.75", "4893000000.5"]
+        ]
+      }
+    }
+  ]
+}
