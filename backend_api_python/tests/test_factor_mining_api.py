@@ -335,6 +335,22 @@ def test_catalog_lists_fields_operators_and_templates(app):
     assert payload["templates"]
 
 
+def test_catalog_fields_follow_the_market_the_caller_is_about_to_run(app):
+    """The editor's vocabulary has to be the validator's: a Crypto run may name more fields.
+
+    The endpoint reads the market from its own query argument and resolves the set through
+    ``fields_for`` -- the call L1 validates with -- so the two cannot drift. A market this build
+    does not know takes ``fields_for``'s fallback rather than a second rule here.
+    """
+    crypto = _invoke(app, mining_routes.factor_mining_catalog, path="/?market=Crypto")
+    assert "funding_rate" in crypto.get_json()["data"]["fields"]
+    plain = _invoke(app, mining_routes.factor_mining_catalog, path="/?market=USStock")
+    assert "funding_rate" not in plain.get_json()["data"]["fields"]
+    unknown = _invoke(app, mining_routes.factor_mining_catalog, path="/?market=crypto")
+    assert unknown.get_json()["data"]["fields"] == _invoke(
+        app, mining_routes.factor_mining_catalog).get_json()["data"]["fields"]
+
+
 def test_catalog_templates_carry_metadata_but_never_the_build_callable(app):
     payload = _invoke(app, mining_routes.factor_mining_catalog).get_json()["data"]
     for template in payload["templates"]:
