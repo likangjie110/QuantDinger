@@ -40,6 +40,7 @@ from typing import Any
 
 from app.markets.registry import list_market_keys
 from app.services.backtest_execution import DEFAULT_COMMISSION, DEFAULT_SLIPPAGE
+from app.services.factor_mining.dsl import fields_for
 from app.services.factor_mining.engine import (
     FactorMiningEngine,
     MiningConfig,
@@ -110,6 +111,7 @@ class FactorMiningService:
             template_ids=config.template_ids or None,
             budget=config.budget,
             seed=config.seed,
+            allowed_fields=fields_for(config.market),
         )
         # Deduped like the expansion dedupes: a repeated id contributes nothing to the search, and
         # counting it twice would report a template total the candidate count cannot come from.

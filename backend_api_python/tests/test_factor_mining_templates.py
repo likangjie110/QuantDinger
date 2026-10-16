@@ -2,8 +2,14 @@
 
 import pytest
 
-from app.services.factor_mining.dsl import MAX_DEPTH, normalize_expression
-from app.services.factor_mining.templates import MAX_BUDGET, TEMPLATES, expand_candidates, template_catalog
+from app.services.factor_mining.dsl import MAX_DEPTH, ExpressionError, fields_for, normalize_expression
+from app.services.factor_mining.templates import (
+    MAX_BUDGET,
+    TEMPLATES,
+    FactorTemplate,
+    expand_candidates,
+    template_catalog,
+)
 
 
 def test_catalog_exposes_hypothesis_keys_and_grids():
@@ -38,6 +44,28 @@ def test_budget_limits_candidate_count_and_dedupes():
 def test_expansion_can_be_restricted_to_one_template():
     candidates = expand_candidates(template_ids=["reversal"], budget=MAX_BUDGET)
     assert {item.template_id for item in candidates} == {"reversal"}
+
+
+def test_expansion_reads_a_candidate_against_the_given_field_set(monkeypatch):
+    """The expansion fingerprints every grid point, so its field set has to reach the DSL.
+
+    No shipped template names a derivatives field yet; this one stands in for the template that
+    will. A set the caller widened admits it, and the default -- the price-volume alias -- still
+    refuses it, which is what keeps the set a policy the caller states rather than one the
+    expansion assumes.
+    """
+    monkeypatch.setitem(TEMPLATES, "funding_trend", FactorTemplate(
+        template_id="funding_trend", hypothesis_i18n_key="factorMining.template.momentum",
+        category="cross_market", parameter_grid={"N": (20,)},
+        build=lambda params: {"op": "ts_mean", "args": ["funding_rate"],
+                              "params": {"n": params["N"]}}))
+    with pytest.raises(ExpressionError, match="unknownField"):
+        expand_candidates(template_ids=["funding_trend"], smoothing=False)
+    seeds = expand_candidates(template_ids=["funding_trend"], smoothing=False,
+                              allowed_fields=fields_for("Crypto"))
+    assert [seed.expression["args"] for seed in seeds] == [["funding_rate"]]
+    assert seeds[0].fingerprint == normalize_expression(
+        seeds[0].expression, allowed_fields=fields_for("Crypto")).fingerprint
 
 
 def test_budget_above_hard_limit_is_rejected():

@@ -16,21 +16,25 @@ or network access.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from app.services.factor_mining.dsl import normalize_expression
+from app.services.factor_mining.dsl import PRICE_VOLUME_FIELDS, normalize_expression
 from app.services.factor_mining.operators import apply_operator
 
 
 class ExpressionEvaluator:
     """Evaluate DSL expressions against a fixed set of price-volume panels."""
 
-    def __init__(self, fields: Mapping[str, pd.DataFrame]) -> None:
+    def __init__(self, fields: Mapping[str, pd.DataFrame], *,
+                 allowed_fields: Collection[str] = PRICE_VOLUME_FIELDS) -> None:
         self._fields = fields
+        # The set the run validated against, not what the mapping happens to carry: a name the
+        # mapping lacks is a missing column, which is the mapping's business and not a rejection.
+        self._allowed_fields = allowed_fields
         reference = fields.get("close")
         if reference is None:
             reference = next(iter(fields.values()), pd.DataFrame())
@@ -53,7 +57,7 @@ class ExpressionEvaluator:
 
     def _eval(self, node: Any) -> Any:
         """Return a panel, or a plain number for an all-scalar subtree (``const``)."""
-        key = normalize_expression(node).canonical
+        key = normalize_expression(node, allowed_fields=self._allowed_fields).canonical
         if key in self._cache:
             self._hits += 1
             return self._cache[key]

@@ -1,11 +1,18 @@
 """Factor mining evolution: mutation and crossover stay inside the DSL's bounds."""
 
+import json
 import random
 
 import pandas as pd
 
 from app.services.factor_mining import evolution
-from app.services.factor_mining.dsl import MAX_DEPTH, WINDOW_MAX, WINDOW_MIN, normalize_expression
+from app.services.factor_mining.dsl import (
+    MAX_DEPTH,
+    WINDOW_MAX,
+    WINDOW_MIN,
+    fields_for,
+    normalize_expression,
+)
 from app.services.factor_mining.evaluator import ExpressionEvaluator
 from app.services.factor_mining.evolution import crossover, evolve, mutate
 from app.services.factor_mining.templates import CandidateSeed
@@ -117,6 +124,25 @@ def test_mutation_at_the_depth_budget_is_legal_or_none():
         if child is not None:
             normalize_expression(child)
             assert len(_rewrite_locus(parent, child)) == 1
+
+
+def test_the_operators_read_a_child_under_the_given_field_set():
+    """A parent that names a derivatives field can only breed under a set that admits it.
+
+    A refused draw is not an error, so a field set the caller never passed would end a derivatives
+    run's evolution one silent ``None`` at a time; the parent's own fingerprint is compared
+    outside the guarded call, so it would be a crash that came instead of the silence.
+    """
+    parent = {"op": "ts_mean", "args": ["funding_rate"], "params": {"n": 20}}
+    children = [mutate(parent, random.Random(seed), allowed_fields=fields_for("Crypto"))
+                for seed in range(12)]
+    kept = [child for child in children if child is not None]
+    assert kept, "every draw was refused: the parent's leaf was not admitted"
+    assert any("funding_rate" in json.dumps(child) for child in kept), \
+        "no child kept the parent's own leaf, so the set was only wide enough for the by-products"
+    grafted = [crossover(parent, kept[0], random.Random(seed), allowed_fields=fields_for("Crypto"))
+               for seed in range(12)]
+    assert any(child is not None for child in grafted)
 
 
 def test_the_locus_oracle_notices_a_second_rewrite():
@@ -305,8 +331,8 @@ def test_rejected_children_are_counted_not_silently_dropped(monkeypatch):
     draws = []
 
     def counted(operator):
-        def spy(*arguments):
-            child = operator(*arguments)
+        def spy(*arguments, **keywords):
+            child = operator(*arguments, **keywords)
             draws.append(child)
             return child
         return spy
@@ -332,8 +358,8 @@ def test_a_duplicate_expression_is_never_produced_twice(monkeypatch):
     produced = []
 
     def counted(operator):
-        def spy(*arguments):
-            child = operator(*arguments)
+        def spy(*arguments, **keywords):
+            child = operator(*arguments, **keywords)
             if isinstance(child, dict):
                 produced.append(child)
             return child
@@ -366,8 +392,8 @@ def test_a_child_that_equals_a_seed_is_not_produced(monkeypatch):
     collisions = []
 
     def counted(operator):
-        def spy(*arguments):
-            child = operator(*arguments)
+        def spy(*arguments, **keywords):
+            child = operator(*arguments, **keywords)
             if isinstance(child, dict) and normalize_expression(child).fingerprint in seeded:
                 collisions.append(child)
             return child
@@ -392,8 +418,8 @@ def test_a_bare_field_child_is_never_produced(monkeypatch):
     drawn = []
 
     def counted(operator):
-        def spy(*arguments):
-            child = operator(*arguments)
+        def spy(*arguments, **keywords):
+            child = operator(*arguments, **keywords)
             drawn.append(child)
             return child
         return spy

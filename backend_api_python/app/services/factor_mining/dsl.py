@@ -24,7 +24,20 @@ MAX_NODES = 24
 WINDOW_MIN = 1
 WINDOW_MAX = 252
 MAX_LOOKBACK = 504
-PRICE_VOLUME_FIELDS = ("open", "high", "low", "close", "volume")
+# The field groups a market's panel can offer. A market's allowed set is the union of the groups
+# it has, so a cross-market field is one entry here and every caller that was handed
+# ``fields_for(market)`` admits it at once.
+FIELD_GROUPS: dict[str, tuple[str, ...]] = {
+    "price_volume": ("open", "high", "low", "close", "volume"),
+    "derivatives": ("funding_rate", "open_interest"),
+}
+# The price-volume group under its v1 name: a bare ``normalize_expression`` call defaults to it,
+# and importers that spelled the constant this way keep reading the same tuple.
+PRICE_VOLUME_FIELDS = FIELD_GROUPS["price_volume"]
+# The markets whose panel carries the derivatives group. Membership says the data exists, not that
+# a run would like it to: a field joins a market's set once a source can answer for it, which is
+# also why futures' term structure and roll cost are in no group yet.
+_DERIVATIVES_MARKETS = frozenset({"Crypto"})
 WINDOW_PARAM = "n"
 
 # op -> (arity, windowed). Windowed operators shift or aggregate over one symbol's
@@ -64,6 +77,19 @@ OPERATOR_SPECS: dict[str, tuple[int, bool]] = {
 }
 
 _CLIP_PARAMS = ("lo", "hi")
+
+
+def fields_for(market: str) -> tuple[str, ...]:
+    """The fields a candidate in ``market`` may name, in group order.
+
+    An unknown or empty market falls back to the price-volume group alone, which is the
+    conservative direction: a field no source can fill is refused at L1 rather than measured as a
+    column of nothing. That the panel may still be missing a column for an allowed field is a
+    separate question -- a symbol with no derivative data keeps a NaN column (``_field_panels``),
+    and the coverage gate decides what the gap means.
+    """
+    groups = ("price_volume", "derivatives") if market in _DERIVATIVES_MARKETS else ("price_volume",)
+    return tuple(field for group in groups for field in FIELD_GROUPS[group])
 
 
 class ExpressionError(ValueError):
@@ -126,6 +152,11 @@ def normalize_expression(
     spelling variants of one expression share a fingerprint. ``lookback`` is the largest
     window sum along any root-to-leaf path; ``depth`` counts the root as 1 and
     ``node_count`` counts every leaf and operator node.
+
+    ``allowed_fields`` is a validation policy and nothing else: a leaf outside it is
+    ``unknownField``, and the set is not folded into the fingerprint, so one expression keeps one
+    hash across the markets and runs that checked it. Callers that hold a run's market pass
+    ``fields_for(market)``; the default is the price-volume group.
     """
     fields: set[str] = set()
     windows: set[int] = set()

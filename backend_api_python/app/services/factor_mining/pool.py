@@ -18,12 +18,13 @@ here caches, because a cached panel would outlive the data it was built from.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
 
+from app.services.factor_mining.dsl import PRICE_VOLUME_FIELDS
 from app.services.factor_mining.evaluator import ExpressionEvaluator
 from app.services.factor_mining.storage import FactorMiningRepository
 
@@ -106,12 +107,16 @@ def load_pool(
 def pool_panels(
     entries: Sequence[PoolMember],
     field_panels: Mapping[str, pd.DataFrame],
+    *,
+    allowed_fields: Collection[str] = PRICE_VOLUME_FIELDS,
 ) -> tuple[dict[str, pd.DataFrame], list[dict[str, str]]]:
     """``(fingerprint -> rebuilt panel, the members no panel could be built for)``.
 
     ``field_panels`` is the caller's own field mapping -- the one the engine scores candidates
     with -- so a member is aligned to the same dates, symbols, and field semantics as the
-    candidate it is compared against.
+    candidate it is compared against. ``allowed_fields`` is the field set the caller's run
+    validated against; a member is read under it too, or a member that names a field the market
+    offers would be reported as unbuildable and count against the candidate.
 
     A member whose stored expression no longer evaluates (an operator set that moved on, a row
     whose JSON did not parse) is handed back in ``skipped`` with its fingerprint, rather than
@@ -121,7 +126,7 @@ def pool_panels(
     answer with its own fail-closed rule, exactly as it would for a candidate nothing could be
     measured on.
     """
-    evaluator = ExpressionEvaluator(field_panels)
+    evaluator = ExpressionEvaluator(field_panels, allowed_fields=allowed_fields)
     panels: dict[str, pd.DataFrame] = {}
     skipped: list[dict[str, str]] = []
     for member in entries:

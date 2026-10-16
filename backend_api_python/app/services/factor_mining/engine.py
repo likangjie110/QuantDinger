@@ -70,6 +70,7 @@ from app.services.factor_mining.dsl import (
     MAX_LOOKBACK,
     PRICE_VOLUME_FIELDS,
     ExpressionError,
+    fields_for,
     normalize_expression,
 )
 from app.services.factor_mining.evaluator import ExpressionEvaluator
@@ -409,7 +410,8 @@ def _comparison_set(
     members = pool_loader(
         user_id, config.market, config.timeframe, limit=max(0, int(pool_limit)),
     )
-    rebuilt, skipped = pool_panels(members, panel.fields)
+    rebuilt, skipped = pool_panels(members, panel.fields,
+                                   allowed_fields=fields_for(config.market))
     pooled: list[str] = []
     for member in members:
         member_panel = rebuilt.get(member.fingerprint)
@@ -800,7 +802,7 @@ class FactorMiningEngine:
         # order, which is what keeps a candidate's dates and symbols aligned with
         # ``fields["close"]``. Recomputing them here would silently paper over a provider that
         # handed out nothing.
-        evaluator = ExpressionEvaluator(panel.fields)
+        evaluator = ExpressionEvaluator(panel.fields, allowed_fields=fields_for(config.market))
         members = _resolved_members(panel.members)
         measured: dict[str, float] = {}
 
@@ -816,7 +818,8 @@ class FactorMiningEngine:
             the label of a bad one either.
             """
             try:
-                fingerprint = normalize_expression(expression).fingerprint
+                fingerprint = normalize_expression(
+                    expression, allowed_fields=fields_for(config.market)).fingerprint
             except ExpressionError:
                 return None
             return measured.get(fingerprint)
@@ -911,7 +914,7 @@ class FactorMiningEngine:
         )
         # Same contract as the search: the provider owns the field panels, and the review reads
         # them rather than rebuilding anything it was handed.
-        evaluator = ExpressionEvaluator(panel.fields)
+        evaluator = ExpressionEvaluator(panel.fields, allowed_fields=fields_for(config.market))
         members = _resolved_members(panel.members)
         reviewed: list[dict[str, Any]] = []
         for evaluated, survivor in enumerate(survivors, start=1):
@@ -981,7 +984,8 @@ class FactorMiningEngine:
         verdict unanswered.
         """
         try:
-            panel = ExpressionEvaluator(evidence.fields).evaluate(expression)
+            panel = ExpressionEvaluator(
+                evidence.fields, allowed_fields=fields_for(config.market)).evaluate(expression)
             return residual_ic(
                 panel.reindex(index=evidence.returns.index),
                 evidence.members,
@@ -1014,7 +1018,7 @@ class FactorMiningEngine:
         the fold signs L3 reads alongside everything the other gates read.
         """
         try:
-            normalize_expression(expression)
+            normalize_expression(expression, allowed_fields=fields_for(config.market))
             candidate_panel = evaluator.evaluate(expression)
             metrics = _metrics_payload(
                 self._research(config, split, panel, members, candidate_panel, comparison), config,
@@ -1056,7 +1060,7 @@ class FactorMiningEngine:
         surfaces as this candidate's invalid verdict instead of a silently weaker gate.
         """
         try:
-            normalize_expression(survivor["expression"])
+            normalize_expression(survivor["expression"], allowed_fields=fields_for(config.market))
             candidate_panel = evaluator.evaluate(survivor["expression"])
             out_of_sample = _metrics_payload(
                 self._research_window(
@@ -1524,6 +1528,7 @@ def _candidate_source(
         template_ids=config.template_ids or None,
         budget=config.budget,
         seed=config.seed,
+        allowed_fields=fields_for(config.market),
     )
     if search_mode != SEARCH_MODE_EVOLUTION:
         return seeds, len(seeds)
@@ -1538,6 +1543,7 @@ def _candidate_source(
                 generations=config.generations,
                 elite_ratio=config.elite_ratio,
                 fitness=fitness,
+                allowed_fields=fields_for(config.market),
             ),
         ),
         len(seeds) + config.budget,
@@ -1567,9 +1573,12 @@ def _warmup_bars(config: MiningConfig, search_mode: str) -> int:
         template_ids=config.template_ids or None,
         budget=config.budget,
         seed=config.seed,
+        allowed_fields=fields_for(config.market),
     )
     longest = max(
-        (normalize_expression(candidate.expression).lookback for candidate in candidates),
+        (normalize_expression(candidate.expression,
+                              allowed_fields=fields_for(config.market)).lookback
+         for candidate in candidates),
         default=MAX_LOOKBACK,
     )
     return max(MINIMUM_WARMUP_BARS, min(MAX_LOOKBACK, longest + WARMUP_MARGIN_BARS))

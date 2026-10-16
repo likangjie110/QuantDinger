@@ -63,8 +63,15 @@ _FRESH_OPERATORS = tuple(sorted(
 _FRESH_CONSTANTS = (-1.0, 0.0, 0.5, 1.0)
 
 
-def mutate(node: dict | str, rng: random.Random) -> dict | str | None:
-    """Return one child of ``node`` rewritten at a single locus, or ``None`` if refused."""
+def mutate(node: dict | str, rng: random.Random, *,
+           allowed_fields: Sequence[str] = PRICE_VOLUME_FIELDS) -> dict | str | None:
+    """Return one child of ``node`` rewritten at a single locus, or ``None`` if refused.
+
+    ``allowed_fields`` is the field set the child is validated and its leaves drawn against --
+    ``fields_for(market)`` for a run. A set that refuses the parent's own leaves refuses every
+    draw that keeps one, so the default is only correct for a run that has none of the wider
+    market's fields.
+    """
     pool = _mutation_pool(node)
     cut = rng.random() * sum(_MODE_WEIGHTS[name] for name in pool)
     for name in pool:
@@ -76,20 +83,22 @@ def mutate(node: dict | str, rng: random.Random) -> dict | str | None:
     elif name == "operator":
         candidate = _substitute_operator(node, rng)
     else:
-        candidate = _replace_subtree(node, rng)
-    return _accept(candidate, node)
+        candidate = _replace_subtree(node, rng, allowed_fields)
+    return _accept(candidate, node, allowed_fields)
 
 
-def crossover(left: dict | str, right: dict | str, rng: random.Random) -> dict | str | None:
+def crossover(left: dict | str, right: dict | str, rng: random.Random, *,
+              allowed_fields: Sequence[str] = PRICE_VOLUME_FIELDS) -> dict | str | None:
     """Return ``left`` with one subtree of ``right`` grafted into it, or ``None`` if refused.
 
     One graft point, so the child stays one locus away from ``left`` and inherits the rest
     of its structure from it. ``None`` covers a graft the DSL rejects and a graft that would
-    have handed back ``left`` unchanged.
+    have handed back ``left`` unchanged. ``allowed_fields`` is the set both sides are read
+    against, as in :func:`mutate`.
     """
     _donor_path, donor = rng.choice(list(_walk(right)))
     graft_path = rng.choice(list(_walk(left)))[0]
-    return _accept(_replace(left, graft_path, donor), left)
+    return _accept(_replace(left, graft_path, donor), left, allowed_fields)
 
 
 def evolve(
@@ -101,6 +110,7 @@ def evolve(
     generations: int,
     elite_ratio: float,
     fitness: Callable[[dict], float | None],
+    allowed_fields: Sequence[str] = PRICE_VOLUME_FIELDS,
 ) -> Iterator[CandidateSeed]:
     """Breed ``seeds`` for up to ``generations`` generations, yielding each new individual.
 
@@ -118,6 +128,9 @@ def evolve(
     never be an elite, because a generation's elites are the head of a ranking and an
     unranked expression has no place in one, but it stays eligible to breed.
 
+    ``allowed_fields`` is the run's field set, in the order fresh leaves are drawn from. It
+    travels to every rewrite (``mutate``, ``crossover``) and to the fingerprint of each child.
+
     ``budget`` counts draws, not survivors. A draw that comes back refused -- an illegal
     rewrite, one that only re-spelled its parent, or one whose root is a bare field name --
     yields nothing and still spends one unit, and so does a draw that reproduces an expression
@@ -130,8 +143,8 @@ def evolve(
 
     Determinism is the whole point: the only source of randomness is ``seed``, every
     collection is ordered before it is walked, and the same
-    ``(seeds, budget, seed, population, generations, elite_ratio)`` therefore breeds the same
-    individuals, in the same order, spelled the same way.
+    ``(seeds, budget, seed, population, generations, elite_ratio, allowed_fields)`` therefore
+    breeds the same individuals, in the same order, spelled the same way.
     """
     if budget <= 0 or generations <= 0 or population <= 0 or not seeds:
         return
@@ -150,7 +163,7 @@ def evolve(
         children: list[CandidateSeed] = []
         while len(children) < population - len(elites) and budget > 0:
             budget -= 1
-            child = _child(scored, rng)
+            child = _child(scored, rng, allowed_fields)
             if child is None or child.fingerprint in known:
                 continue
             known.add(child.fingerprint)
@@ -197,16 +210,18 @@ def _tournament(
 def _child(
     scored: Sequence[tuple[float | None, CandidateSeed]],
     rng: random.Random,
+    allowed_fields: Sequence[str],
 ) -> CandidateSeed | None:
     """One draw against the budget: an individual, or ``None`` if nothing usable came back."""
     if rng.random() < _CROSSOVER_SHARE:
         left = _tournament(scored, rng)
         right = _tournament(scored, rng)
-        expression = crossover(left.expression, right.expression, rng)
+        expression = crossover(left.expression, right.expression, rng,
+                               allowed_fields=allowed_fields)
         template_id = left.template_id
     else:
         parent = _tournament(scored, rng)
-        expression = mutate(parent.expression, rng)
+        expression = mutate(parent.expression, rng, allowed_fields=allowed_fields)
         template_id = parent.template_id
     if not isinstance(expression, dict):
         # A refused draw -- and a bare field name is refused with it. The DSL allows a leaf at
@@ -216,7 +231,7 @@ def _child(
         return None
     return CandidateSeed(
         expression=expression,
-        fingerprint=normalize_expression(expression).fingerprint,
+        fingerprint=normalize_expression(expression, allowed_fields=allowed_fields).fingerprint,
         template_id=template_id,
         origin="evolution",
         params={},
@@ -266,35 +281,38 @@ def _substitute_operator(node: dict | str, rng: random.Random) -> dict | str:
     return _replace(node, path, {"op": op, "args": list(target.get("args") or []), "params": params})
 
 
-def _replace_subtree(node: dict | str, rng: random.Random) -> dict | str:
+def _replace_subtree(node: dict | str, rng: random.Random,
+                     allowed_fields: Sequence[str]) -> dict | str:
     path = rng.choice(list(_walk(node)))[0]
-    return _replace(node, path, _fresh_subtree(rng))
+    return _replace(node, path, _fresh_subtree(rng, allowed_fields))
 
 
-def _fresh_subtree(rng: random.Random) -> dict | str:
+def _fresh_subtree(rng: random.Random, allowed_fields: Sequence[str]) -> dict | str:
     """A small fresh expression: a field, a const, or one operator over fresh leaves.
 
     Depth-2 by construction, so grafting it can only break the node, depth, or lookback
-    budget of its host -- and ``normalize_expression`` is what decides that.
+    budget of its host -- and ``normalize_expression`` is what decides that. Its leaves are
+    drawn from ``allowed_fields``, so a run only ever proposes fields its own market carries.
     """
     roll = rng.random()
     if roll < 0.4:
-        return rng.choice(PRICE_VOLUME_FIELDS)
+        return rng.choice(allowed_fields)
     if roll < 0.5:
         return {"op": "const", "args": [], "params": {"value": rng.choice(_FRESH_CONSTANTS)}}
     op = rng.choice(_FRESH_OPERATORS)
     arity, windowed = OPERATOR_SPECS[op]
     params = {WINDOW_PARAM: rng.randint(WINDOW_MIN, WINDOW_MAX)} if windowed else {}
-    return {"op": op, "args": [rng.choice(PRICE_VOLUME_FIELDS) for _ in range(arity)], "params": params}
+    return {"op": op, "args": [rng.choice(allowed_fields) for _ in range(arity)], "params": params}
 
 
-def _accept(candidate: dict | str, parent: dict | str) -> dict | str | None:
+def _accept(candidate: dict | str, parent: dict | str,
+            allowed_fields: Sequence[str]) -> dict | str | None:
     """``candidate`` if the DSL accepts it and it is more than its parent re-spelled."""
     try:
-        accepted = normalize_expression(candidate)
+        accepted = normalize_expression(candidate, allowed_fields=allowed_fields)
     except ExpressionError:
         return None
-    if accepted.fingerprint == normalize_expression(parent).fingerprint:
+    if accepted.fingerprint == normalize_expression(parent, allowed_fields=allowed_fields).fingerprint:
         return None
     return candidate
 

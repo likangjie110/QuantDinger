@@ -27,7 +27,7 @@ import pytest
 
 from app.services.factor_mining import engine as engine_module
 from app.services.factor_mining import pool
-from app.services.factor_mining.dsl import MAX_LOOKBACK
+from app.services.factor_mining.dsl import MAX_LOOKBACK, fields_for
 from app.services.factor_mining.engine import (
     DEFAULT_BUILTIN_COMPARISON_LIMIT,
     ComparisonSet,
@@ -1198,6 +1198,117 @@ def test_a_failing_candidate_does_not_stop_the_candidates_after_it(monkeypatch):
     assert [item["verdict"] for item in result["trials"]] == ["reject", "pass"]
     assert result["trials"][0]["reason"] == "factorMining.reject.invalid"
     assert result["trials"][1]["reason"] == ""
+
+
+# --- the field set the run's market allows, at every point that validates a candidate ----------
+
+# A candidate that *names* a derivatives leaf without depending on its values: the condition holds
+# on every bar of the fixture, so its panel is the momentum leg alone. What these tests read is
+# which leaf the run's field set admits -- a candidate whose panel was a column of nothing would
+# be refused by a later gate, for a reason this fixture cannot tell apart from the one it means.
+_FUNDING_LEG = {
+    "op": "where",
+    "args": [
+        {"op": "gt", "args": ["close", {"op": "const", "args": [], "params": {"value": 0}}],
+         "params": {}},
+        {"op": "ts_pct_change", "args": ["close"], "params": {"n": 3}},
+        "funding_rate",
+    ],
+    "params": {},
+}
+
+
+def _funding_seed(expression, market="Crypto"):
+    """A seed for an expression only ``market``'s field set admits.
+
+    ``_seed_for`` cannot build this one -- it fingerprints through the DSL, which refuses the leaf
+    under the default set -- so the fingerprint is read the way the engine reads it.
+    """
+    from app.services.factor_mining.dsl import normalize_expression
+    from app.services.factor_mining.templates import CandidateSeed
+
+    return CandidateSeed(
+        expression=expression,
+        fingerprint=normalize_expression(expression, allowed_fields=fields_for(market)).fingerprint,
+        template_id="momentum", origin="template", params={},
+    )
+
+
+def test_a_derivatives_field_is_accepted_after_the_field_set_is_threaded_through(monkeypatch):
+    """A Crypto run may name a derivatives field, and the whole ladder has to agree it may.
+
+    L1 is not the only validation point in the path: the evaluator normalizes every subtree it
+    memoizes, so a field set that stopped at the DSL call would raise inside the candidate the
+    whitelist had just admitted.
+    """
+    result, _ = _run_with_seeds(monkeypatch, [_funding_seed(_FUNDING_LEG)], market="Crypto",
+                                thresholds=_NO_DEDUPLICATION)
+    assert [item["verdict"] for item in result["trials"]] == ["pass"]
+    assert result["candidates"], "a candidate that cleared L1-L4 is kept, not merely tolerated"
+
+
+def test_a_derivatives_field_is_rejected_when_the_market_has_none(monkeypatch):
+    """On a market with no funding history the leaf is an unknown field, not a missing column.
+
+    This is the direction the whitelist must not lose: a USStock run reads the same expression
+    against the price-volume group alone and refuses it at L1, with the field key.
+    """
+    result, _ = _run_with_seeds(monkeypatch, [_funding_seed(_FUNDING_LEG)])
+    assert [item["verdict"] for item in result["trials"]] == ["reject"]
+    assert result["trials"][0]["stage"] == "L1"
+    assert result["trials"][0]["reason"] == "factorMining.reject.invalid"
+    assert result["candidates"] == []
+
+
+@pytest.mark.parametrize("market,refused", [("Crypto", False), ("USStock", True)])
+def test_the_frozen_review_reads_the_survivor_under_the_runs_field_set(market, refused):
+    """L5 re-reads the survivor on the tail, so it has to be handed the field set L1 was.
+
+    A review that fell back to the default would reject a derivatives survivor as invalid -- the
+    one verdict that says "the expression is broken" about an expression that is not.
+    """
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    survivor = {"expression": _FUNDING_LEG, "fingerprint": "f" * 64, "origin": "template",
+                "template_id": "momentum", "status": "search", "reason": "",
+                "metrics": {}, "outOfSample": {}}
+    reviewed = engine.review_frozen(user_id=1, code="PORTFOLIO = {}", config=_config(market=market),
+                                    survivors=[survivor], trials_count=1)
+    assert (reviewed[0]["reason"] == "factorMining.reject.invalid") is refused
+
+
+def test_the_warmup_scan_reads_the_candidates_under_the_runs_field_set(monkeypatch):
+    """The warmup pre-scan normalizes every template candidate before a bar is fetched.
+
+    A leaf the set refuses raises out of the scan, which ends the run before a single candidate
+    was scored -- the same rejection as L1's, only louder. The window is longer than the fixture's
+    templates so the answer cannot hide behind the warmup floor.
+    """
+    seed = _funding_seed({"op": "ts_mean", "args": ["funding_rate"], "params": {"n": 60}})
+    monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: [seed])
+    assert _warmup_bars(_config(market="Crypto"), "enumeration") == 60 + engine_module.WARMUP_MARGIN_BARS
+
+
+def test_the_fitness_lookup_reads_an_expression_under_the_runs_field_set(monkeypatch):
+    """Evolution ranks a generation by what this run measured for each member.
+
+    ``fitness`` fingerprints the member to find that measurement, and a member it cannot name is
+    "unmeasured" rather than "bad": it can never be an elite. A default field set here would rank
+    every derivatives individual last while the run reported nothing wrong.
+    """
+    seed = _funding_seed(_FUNDING_LEG)
+    answers: list = []
+
+    def stream(source, *, fitness, **_kwargs):
+        # A generator, so the body runs on the first pull -- after the generation chained ahead of
+        # it was scored, which is the only point at which the lookup has an answer to give.
+        yield from ()
+        answers.append(fitness(seed.expression))
+
+    monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: [seed])
+    monkeypatch.setattr(engine_module, "evolve", stream)
+    _run(*_fixture(), search_mode="evolution", market="Crypto", thresholds=_NO_DEDUPLICATION)
+    assert answers and answers[0] is not None, \
+        "the individual was scored, so the lookup has no excuse for not naming it"
 
 
 def test_run_reports_the_config_split_and_summary():

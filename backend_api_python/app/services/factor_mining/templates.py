@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import itertools
 import random
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
-from app.services.factor_mining.dsl import normalize_expression
+from app.services.factor_mining.dsl import PRICE_VOLUME_FIELDS, normalize_expression
 
 MAX_BUDGET = 2000
 DEFAULT_BUDGET = 400
@@ -215,6 +215,7 @@ def expand_candidates(
     budget: int = DEFAULT_BUDGET,
     seed: int = 42,
     smoothing: bool = True,
+    allowed_fields: Collection[str] = PRICE_VOLUME_FIELDS,
 ) -> list[CandidateSeed]:
     """Expand templates into at most ``budget`` distinct candidates, in a stable order.
 
@@ -224,6 +225,10 @@ def expand_candidates(
     spelling wins) before truncation, so a truncated run is reproducible. An unknown
     template id and a budget above :data:`MAX_BUDGET` both raise ``ValueError`` carrying a
     stable ``factorMining.*`` key, so callers never translate a bare ``KeyError``.
+
+    ``allowed_fields`` is the field set the expansion fingerprints each candidate against --
+    ``fields_for(market)`` for a run. It is a parameter rather than a module constant because
+    which fields a market can offer is the caller's run to state.
     """
     if budget > MAX_BUDGET:
         raise ValueError("factorMining.budgetExceeded")
@@ -239,7 +244,7 @@ def expand_candidates(
             if smoothing:
                 variants.extend(_smoothed(base, window) for window in SMOOTHING_WINDOWS)
             for node in variants:
-                fingerprint = normalize_expression(node).fingerprint
+                fingerprint = normalize_expression(node, allowed_fields=allowed_fields).fingerprint
                 if fingerprint in seen:
                     continue
                 seen.add(fingerprint)
