@@ -651,6 +651,20 @@ def test_evolution_mode_requires_a_population_size(missing):
         )
 
 
+@pytest.mark.parametrize("blank", ["population", "generations", "eliteRatio"])
+def test_a_blank_breeding_setting_is_refused_like_a_missing_one(blank):
+    """A blank field is not a stated value, and all three are read the same way.
+
+    The existence check looked for ``None`` alone while ``eliteRatio``'s own read treated ``""``
+    as absent, so a blank share was silently priced as the placeholder 0.25 instead of being
+    refused -- a population this layer invented, which is the objection that makes all three
+    required. A caller who leaves the field empty has stated no more than one who omits the key.
+    """
+    settings = {"population": 40, "generations": 5, "eliteRatio": 0.2, blank: ""}
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        FactorMiningService().estimate(_payload(searchMode="evolution", **settings))
+
+
 @pytest.mark.parametrize("overrides", [
     {"population": 0}, {"population": -3}, {"generations": 0}, {"generations": -1},
     {"eliteRatio": 1}, {"eliteRatio": 1.5}, {"eliteRatio": -0.25},

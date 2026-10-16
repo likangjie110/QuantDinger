@@ -954,6 +954,10 @@ def _evolution_settings(
     a population this layer invented would be a different search than the one requested -- and
     the count itself is only half of it: ``int(population * elite_ratio)`` is the generation's
     elite quota, so the share decides how much of a generation is kept as much as the size does.
+    An empty field states no more than an absent key, so all three read ``""`` the same way: as
+    absent, and therefore as refused for a run that breeds. A blank share used to slip through --
+    the requirement looked for a missing key while the read below treated one as absent -- and
+    was priced as the placeholder instead.
 
     The bounds are enforced here for the same reason the budget cap is, and there is nowhere else
     to enforce them: ``evolution.py`` feeds the share straight into ``int()`` and a list slice
@@ -966,7 +970,7 @@ def _evolution_settings(
     worse outcome.
     """
     if search_mode == SEARCH_MODE_EVOLUTION and any(
-        payload.get(key) is None for key in ("population", "generations", "eliteRatio")
+        payload.get(key) in (None, "") for key in ("population", "generations", "eliteRatio")
     ):
         raise ValueError("factorMining.invalidParameter")
     population = _payload_int(payload, "population", DEFAULT_EVOLUTION_POPULATION)
