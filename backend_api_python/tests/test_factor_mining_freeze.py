@@ -407,7 +407,7 @@ class _SplitProvider(_FakeProvider):
         return self.frozen
 
 
-def _searched(panel, comparison):
+def _searched(panel, comparison, *, frozen=None, config=None):
     """``(engine, provider, config)`` for an engine that has run over ``panel``.
 
     Every L6 reading is taken from the search that produced the survivors, so a test has to run
@@ -415,8 +415,8 @@ def _searched(panel, comparison):
     nothing to measure an increment on. The budget is one template because the count of
     candidates a run evaluates is not what L6 reads.
     """
-    config = _config(budget=1, seed=_SEED)
-    provider = _SplitProvider(panel)
+    config = config or _config(budget=1, seed=_SEED)
+    provider = _SplitProvider(panel, frozen)
     provider.comparison = comparison
     engine = FactorMiningEngine(data_provider=provider)
     engine.run(user_id=1, code=_CODE, config=config)
@@ -426,6 +426,12 @@ def _searched(panel, comparison):
 def _review(engine, config, survivors):
     return engine.review_frozen(
         user_id=1, code=_CODE, config=config, survivors=survivors, trials_count=12)
+
+
+def _truncated(panel, end):
+    """The same fixture with every frame cut at ``end``: a source that stopped at the window end."""
+    frames, members = panel
+    return {key: frame.loc[:end] for key, frame in frames.items()}, members
 
 
 def _drifted(panel):
@@ -470,12 +476,15 @@ def test_a_frozen_survivor_carries_its_pool_increment():
     assert increment["reason"] == ""
     assert increment["residualIc"] * increment["rawIc"] > 0, "the sign rule is what passed"
     assert abs(increment["residualIc"]) >= increment["minAbsRankIc"]
-    # The increment's own grid and nothing wider: the search window of this fixture is 31
-    # cross-sections (200 bars, every fifth one, 70% of them searched) and five of them have no
-    # complete forward return yet. Reading the fetched panel instead of that grid would count the
-    # warmup and the rest of the tail as sessions the pool could not be measured on.
-    assert increment["usedCrossSections"] == 26
-    assert increment["skippedCrossSections"] == 5
+    # The increment's own grid and nothing wider: the search window of this fixture holds 31
+    # cross-sections (200 bars, every fifth one, 70% of them searched), of which 25 are measured.
+    # Five of the six the pool could not be read on are the window's opening dates, where the
+    # candidate's own 23-bar lookback reaches back past the start of the panel; the sixth is its
+    # last date, whose forward return exits after ``search_end`` and so is not in the window at
+    # all. Reading the fetched panel instead of that window would measure the last one off the
+    # frozen tail and count the rest of the tail as sessions the pool could not be measured on.
+    assert increment["usedCrossSections"] == 25
+    assert increment["skippedCrossSections"] == 6
     assert increment["poolSize"] == 1 and increment["complete"] is True
     assert increment["compared"] == [_MEMBER] and increment["skipped"] == []
 
@@ -639,3 +648,109 @@ def test_a_pool_nothing_can_be_measured_off_never_retires_a_candidate():
     assert increment["residualIc"] is None
     assert increment["reason"] == "factorMining.poolIncrement.unmeasured"
     assert increment["usedCrossSections"] == 0 and increment["skippedCrossSections"] > 0
+
+
+def test_a_review_without_a_search_behind_it_does_not_report_an_empty_library():
+    """A review that never read a pool is not a caller whose library is empty.
+
+    L6's inputs are assembled by the search, so a review run on an engine that never searched has
+    no search window to measure on at all. That is the third fact again: nothing was compared
+    against, and it is neither the empty library -- ``noPool``, which an operator reads as "this
+    caller has no library yet" -- nor a pool that could not be read. Whether or not anything can
+    replace the missing window, the survivor is not retired for it: ``None`` is not a verdict.
+    """
+    panel = _oscillating_fixture()
+    survivor = _survivors(panel=panel)[0]
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*panel))
+
+    reviewed = _review(engine, _config(), [survivor])
+
+    assert [item["status"] for item in reviewed] == ["frozen"]
+    increment = reviewed[0]["outOfSample"]["poolIncrement"]
+    assert increment["hasIncrementalValue"] is None
+    assert increment["reason"] == "factorMining.poolIncrement.unmeasured"
+    assert increment["reason"] != "factorMining.poolIncrement.noPool"
+
+
+def test_the_increment_is_measured_inside_the_search_window_whatever_the_source_returns():
+    """Bars past the window's end cannot reach the reading, whether the source sends them or not.
+
+    A forward return is read *at* a date and takes its exit price from bars after it, so the last
+    cross-sections of a window are the ones a source that over-returns would fill from the frozen
+    tail -- the tail the review measures L5 on, which may not also be what L6 reads. The research
+    engine's window cut is what stops that, and this reads the increment through it: the same
+    survivor, one search over frames that carry on into the tail and one over frames that stop at
+    ``search_end``, has to come back with the same reading, the same counts and the same verdict.
+    """
+    panel = _oscillating_fixture()
+    survivor = _survivors(panel=panel)[0]
+    comparison = _pool({_MEMBER: _unrelated_panel(panel[0])})
+    end = split_periods(_config()).search_end
+
+    carried_on, _provider, carried_on_config = _searched(panel, comparison)
+    stopped, _stopped_provider, stopped_config = _searched(
+        _truncated(panel, end), comparison, frozen=panel)
+
+    first = _review(carried_on, carried_on_config, [survivor])[0]["outOfSample"]["poolIncrement"]
+    second = _review(stopped, stopped_config, [survivor])[0]["outOfSample"]["poolIncrement"]
+
+    assert first["hasIncrementalValue"] is True, "a reading, so the equality below is not vacuous"
+    assert first == second
+
+
+def test_a_holding_period_that_cannot_go_forward_is_clamped_like_the_research_engines():
+    """A period the payload got wrong cannot turn the forward return pastward.
+
+    ``holdingPeriod`` reaches the config without a lower bound, and the shift that builds a forward
+    return is negative: at a period of ``-3`` the exit price lands *before* the entry, and the
+    increment would be a measured verdict read off a series running backwards -- candidates retired
+    for a sign the engine never looked at. The research engine clamps the period once and reads
+    every window with ``max(1, int(period or 5))``; the increment has to read the same window, so a
+    period below one and a period of one are one reading.
+    """
+    panel = _oscillating_fixture()
+    survivor = _survivors(panel=panel)[0]
+    comparison = _pool({_MEMBER: _unrelated_panel(panel[0])})
+
+    backwards, _provider, backwards_config = _searched(
+        panel, comparison, config=_config(budget=1, seed=_SEED, holding_period=-3))
+    forward, _other, forward_config = _searched(
+        panel, comparison, config=_config(budget=1, seed=_SEED, holding_period=1))
+
+    first = _review(backwards, backwards_config, [survivor])[0]["outOfSample"]["poolIncrement"]
+    second = _review(forward, forward_config, [survivor])[0]["outOfSample"]["poolIncrement"]
+
+    assert first["hasIncrementalValue"] is True, "a reading, so the equality below is not vacuous"
+    assert first == second
+
+
+def test_an_increment_that_cannot_be_measured_never_ends_the_review(monkeypatch):
+    """The increment's guard covers everything the measurement does, not only the evaluation.
+
+    ``residual_ic`` is handed panels the review did not build, and a measurement that raises from
+    inside it would travel out of the review and into the job -- failing a run whose candidates
+    were already judged, which is the opposite of what the guards around every other evaluation in
+    this engine are for. One candidate whose increment cannot be measured is a missing measurement:
+    no verdict, no rejection, and the review carries on to the survivors behind it.
+    """
+    panel = _oscillating_fixture()
+    survivors = _survivors(count=2, panel=panel)
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("the measurement blew up")
+
+    monkeypatch.setattr(engine_module, "residual_ic", _explode)
+    engine, _provider, config = _searched(panel, _pool({_MEMBER: _unrelated_panel(panel[0])}))
+
+    reviewed = _review(engine, config, survivors)
+
+    assert len(reviewed) == len(survivors), "the review carried on past the measurement that raised"
+    # Not every seed of this fixture clears L5, so the assertion is on the survivors that reached
+    # L6 -- and there has to be one, or the guard was never exercised.
+    increments = [item["outOfSample"]["poolIncrement"] for item in reviewed
+                  if item["status"] == "frozen"]
+    assert increments, "no survivor reached L6, so this test measured nothing"
+    assert [item["hasIncrementalValue"] for item in increments] == [None] * len(increments)
+    assert [item["reason"] for item in increments] == [
+        "factorMining.poolIncrement.unmeasured"] * len(increments)
+    assert all(item["reason"] != "factorMining.reject.noIncrementalValue" for item in reviewed)

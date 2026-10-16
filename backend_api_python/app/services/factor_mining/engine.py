@@ -85,7 +85,6 @@ from app.services.factor_mining.gates import (
     screen_stability,
 )
 from app.services.factor_mining.incremental import (
-    NO_POOL_REASON,
     UNMEASURED_REASON,
     PoolGain,
     residual_ic,
@@ -438,33 +437,38 @@ def _pool_increment_evidence(
 ) -> PoolIncrementEvidence:
     """L6's inputs, cut from the search window the candidates of ``panel`` were scored on.
 
-    The window is ``split``'s search half, and the dates are the research engine's own
-    cross-sections (:meth:`FactorResearchEngine.research_window`) -- the grid the candidate's
-    in-sample IC was read on -- because the increment is a question about that measurement: does
-    this candidate still predict once the pool is taken out of it. The calendar year's other
-    panel, the tail ``split`` freezes, is not reachable from here: these frames stop at
-    ``search_end``. The panel's own warmup is excluded the same way every other reading excludes
-    it, by measuring on the window's dates rather than on the fetched index.
+    The window is ``split``'s search half, and both the dates and the frames are the research
+    engine's own prepared ones (:meth:`FactorResearchEngine.research_window`) -- the grid the
+    candidate's in-sample IC was read on, and the frames that grid was read off. Taking the frames
+    from there rather than from the panel is not a shortcut around them: the research engine builds
+    its window by trimming the frames at the window's end (``_prepare_frames``), and the increment
+    needs that trim for the same reason it does. A forward return is read *at* a date and takes its
+    exit price from bars after it, so a source that over-returns -- one more bar, or the whole tail
+    it was not asked for -- would put frozen-tail prices into the last cross-sections of a
+    measurement that is supposed to be the search window's alone.
 
     The returns are the research engine's forward return, spelled the way ``run`` spells it (entry
     at the next bar's open, exit ``holding_period`` bars later) so the raw IC the increment is
-    compared against is read on the same side of the trade the candidate's own metrics were.
-    Restated rather than imported because it is one expression over a panel both callers hold,
-    and the module that owns it is the entry the candidate is scored through.
+    compared against is read on the same side of the trade the candidate's own metrics were. The
+    period is clamped once, with ``run``'s own rule, and both the grid and the two shifts are given
+    that one value: ``holdingPeriod`` arrives from a payload with no lower bound, and a negative
+    one would put the exit *before* the entry -- a reading taken off a series running backwards,
+    and a verdict read off it.
 
     Only the pool's half of ``comparison`` travels: the registry's factors are the comparison L4
     has already made, not the library a candidate is added to.
     """
+    holding_period = max(1, int(config.holding_period or 5))
     frames, dates = FactorResearchEngine.research_window(
         frames=panel.frames,
         start_date=split.search_start,
         end_date=split.search_end,
-        holding_period=config.holding_period,
+        holding_period=holding_period,
     )
     index = pd.Index(dates)
-    opening = panel.fields["open"]
+    opening = FactorResearchEngine._panel(frames, "open")
     returns = (
-        opening.shift(-(config.holding_period + 1)) / opening.shift(-1) - 1.0
+        opening.shift(-(holding_period + 1)) / opening.shift(-1) - 1.0
     ).reindex(index=index)
     members = {
         name: comparison.panels[name].reindex(index=index)
@@ -481,13 +485,15 @@ def _pool_increment_evidence(
     )
 
 
-# The two "nothing was measured" readings the review can reach on its own, spelled here rather
-# than built at the call site: neither is a verdict, both must carry the increment's own reason
-# keys rather than one of the rejections, and the third state of the flag is the whole reason
-# ``PoolGain`` has one.
+# The two "nothing was measured" readings the review can reach on its own. Both carry
+# ``unmeasured`` and never ``noPool``: ``noPool`` is "this caller's library is empty", which is a
+# fact about the library, and the only thing these two know is that no comparison was drawn --
+# neither has a pool that could be read and failed to be. An operator sent to the wrong one of the
+# two looks for a library in the wrong place. The third state of the flag is the whole reason
+# ``PoolGain`` has one: neither reading may retire a candidate.
 _NOT_COMPARED = PoolGain(
     measured=False, has_incremental_value=None, residual_ic=None, raw_ic=None,
-    used_cross_sections=0, skipped_cross_sections=0, reason=NO_POOL_REASON,
+    used_cross_sections=0, skipped_cross_sections=0, reason=UNMEASURED_REASON,
 )
 _UNREADABLE_CANDIDATE = PoolGain(
     measured=False, has_incremental_value=None, residual_ic=None, raw_ic=None,
@@ -939,7 +945,9 @@ class FactorMiningEngine:
         evidence = self._pool_increment
         if evidence is None:
             # No search on this engine, so no search window to measure on: nothing was compared
-            # against, which is the empty pool's answer rather than a rejection or a clearance.
+            # against. That is not the empty library -- ``noPool`` would send an operator looking
+            # for a library that is there -- and it is not a rejection either: the survivor keeps
+            # what L5 gave it.
             gain, compared, skipped = _NOT_COMPARED, (), ()
         else:
             gain = self._pool_gain(record["expression"], evidence, config)
@@ -967,17 +975,21 @@ class FactorMiningEngine:
         does: an expression can die past the DSL on a value the operator layer refuses, and one
         candidate that cannot be measured is a missing measurement -- ``None``, which retires
         nobody -- rather than the end of a review that has already judged the candidates before it.
+        The guard covers the measurement and not only the evaluation, because what raises is not
+        always the expression: the panels handed to it were built elsewhere, and an exception out
+        of here would leave the review -- and, behind it, the job -- rather than one candidate's
+        verdict unanswered.
         """
         try:
             panel = ExpressionEvaluator(evidence.fields).evaluate(expression)
+            return residual_ic(
+                panel.reindex(index=evidence.returns.index),
+                evidence.members,
+                evidence.returns,
+                min_abs_rank_ic=config.thresholds.min_abs_rank_ic,
+            )
         except Exception:
             return _UNREADABLE_CANDIDATE
-        return residual_ic(
-            panel.reindex(index=evidence.returns.index),
-            evidence.members,
-            evidence.returns,
-            min_abs_rank_ic=config.thresholds.min_abs_rank_ic,
-        )
 
     def _evaluate(
         self,
