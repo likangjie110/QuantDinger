@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -129,7 +130,27 @@ def _no_network(monkeypatch):
 def recorded(monkeypatch, _no_network):
     transport = _Recorded(bodies=_BODIES)
     monkeypatch.setattr(derivatives, "requests", transport)
+    # A default venue every case can rely on: the real one is deployment configuration, and the
+    # case that pins where it comes from states it for itself.
+    monkeypatch.setattr(
+        derivatives, "CryptoPublicConfig", SimpleNamespace(DEFAULT_EXCHANGE="binance")
+    )
     return transport
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch):
+    """Pin the one clock the module reads.
+
+    Gate validates its 180-day funding ``from`` against *its* clock, so these fixed windows would
+    start asking a different question as the real clock advances: the first request changes shape on
+    2027-04-04 23:00 (the paging window) and 2027-04-05 23:00 (the one-day window), which an
+    unrecorded request turns into a red test, and from 2027-04-06 the windows sit entirely past the
+    venue's edge and answer with an empty series instead. Either way the test would break on a
+    calendar day, and whoever meets it then did not write it. Frozen at an hour later than every
+    window in this file, so the clamp stays a no-op for them.
+    """
+    monkeypatch.setattr(derivatives, "_now", lambda: _FROZEN_NOW)
 
 
 def _at(stamp: str) -> pd.Timestamp:
@@ -158,7 +179,7 @@ _FUNDING_EXPECTED = {
 
 
 @pytest.mark.parametrize("venue", ["binance", "gate", "okx"])
-def test_funding_history_is_normalised_to_a_per_interval_rate(recorded, venue):
+def test_funding_history_is_normalised_to_a_per_interval_rate(recorded, frozen_clock, venue):
     """One rate per settlement, in percent, indexed by the instant the rate settled.
 
     The fixtures carry the venues' own decimals (0.000051 on Gate, -0.00000992 on Binance,
@@ -333,10 +354,52 @@ def test_a_key_that_names_a_product_other_than_a_perpetual_returns_an_empty_seri
     assert recorded.calls == []
 
 
-@pytest.mark.parametrize("symbol", ["BTC", "@binance:swap", ":"])
+@pytest.mark.parametrize("symbol", [
+    "BTC",
+    "@binance:swap",
+    ":",
+])
 def test_a_symbol_without_a_pair_returns_an_empty_series(recorded, symbol):
     series = derivatives.fetch_open_interest_history(
         "Crypto", symbol, start=_OI_START, end=_OI_END
+    )
+
+    assert series.empty
+    assert recorded.calls == []
+
+
+@pytest.mark.parametrize("configured, expected", [("gate", "gate"), ("okx", "okx"), ("", "binance")])
+def test_a_symbol_that_names_no_venue_is_read_on_the_configured_venue(
+    recorded, frozen_clock, monkeypatch, configured, expected
+):
+    """The venue behind "no venue named" is the app's, read when the call is made.
+
+    ``CRYPTO_PUBLIC_DEFAULT_EXCHANGE`` is what the rest of the repository reads to place a bare
+    crypto symbol, so a deployment pointed at Gate must get Gate's funding rates next to Gate's
+    prices. A constant copied from that setting's factory value would keep reading Binance, which is
+    the cross-venue mix this module exists to avoid and, worse than an empty column, a
+    plausible-looking wrong number. An empty setting falls back rather than answering for nobody.
+    """
+    monkeypatch.setattr(
+        derivatives, "CryptoPublicConfig", SimpleNamespace(DEFAULT_EXCHANGE=configured)
+    )
+
+    series = derivatives.fetch_funding_history(
+        "Crypto", "BTC/USDT", start=_FUNDING_START, end=_FUNDING_END
+    )
+
+    assert list(series.index) == sorted(_FUNDING_EXPECTED[expected])
+    assert recorded.urls() == [_FUNDING_URL[expected]]
+
+
+def test_a_configured_venue_this_module_does_not_serve_returns_an_empty_series(recorded, monkeypatch):
+    """The configuration is not a promise that this module can read that venue."""
+    monkeypatch.setattr(
+        derivatives, "CryptoPublicConfig", SimpleNamespace(DEFAULT_EXCHANGE="bybit")
+    )
+
+    series = derivatives.fetch_funding_history(
+        "Crypto", "BTC/USDT", start=_FUNDING_START, end=_FUNDING_END
     )
 
     assert series.empty
@@ -400,7 +463,7 @@ def test_a_reversed_window_is_empty_and_asks_nobody(recorded):
     assert recorded.calls == []
 
 
-def test_a_settlement_exactly_on_a_single_point_window_is_returned(recorded):
+def test_a_settlement_exactly_on_a_single_point_window_is_returned(recorded, frozen_clock):
     """``start == end`` is one settlement, not an empty window: the bounds are inclusive."""
     series = derivatives.fetch_funding_history(
         "Crypto", _SYMBOL["gate"], start=_at("2026-10-08 08:00"), end=_at("2026-10-08 08:00")
@@ -410,7 +473,7 @@ def test_a_settlement_exactly_on_a_single_point_window_is_returned(recorded):
     assert series.iloc[0] == pytest.approx(0.0013)
 
 
-def test_gate_funding_reads_the_tail_it_keeps_when_the_window_ends_in_the_past(recorded, monkeypatch):
+def test_gate_funding_reads_the_tail_it_keeps_when_the_window_ends_in_the_past(recorded, frozen_clock):
     """Gate's 180-day funding edge is measured on *its* clock, not against the caller's window.
 
     A floor taken from the window alone asks for a ``from`` older than that edge whenever the window
@@ -418,8 +481,6 @@ def test_gate_funding_reads_the_tail_it_keeps_when_the_window_ends_in_the_past(r
     closed bar -- and Gate answers 400, which this module turns into an empty column while it holds
     the window's tail. Measured 2026-10-16: ``now - 180d`` answers, ``now - 180d - 1h`` does not.
     """
-    monkeypatch.setattr(derivatives, "_now", lambda: _FROZEN_NOW)
-
     series = derivatives.fetch_funding_history(
         "Crypto",
         _SYMBOL["gate"],
@@ -435,10 +496,8 @@ def test_gate_funding_reads_the_tail_it_keeps_when_the_window_ends_in_the_past(r
     assert (series > -1).all() and (series < 1).all(), "percent per settlement, not a raw decimal"
 
 
-def test_a_window_older_than_the_venue_keeps_is_not_asked_for(recorded, monkeypatch):
+def test_a_window_older_than_the_venue_keeps_is_not_asked_for(recorded, frozen_clock):
     """A window entirely past Gate's edge has no funding to give, so nobody is asked for it."""
-    monkeypatch.setattr(derivatives, "_now", lambda: _FROZEN_NOW)
-
     series = derivatives.fetch_funding_history(
         "Crypto",
         _SYMBOL["gate"],
@@ -521,7 +580,7 @@ _FUNDING_PAGED = {
 
 
 @pytest.mark.parametrize("venue", ["binance", "gate", "okx"])
-def test_the_funding_series_walks_the_venue_pages(recorded, monkeypatch, venue):
+def test_the_funding_series_walks_the_venue_pages(recorded, frozen_clock, monkeypatch, venue):
     """A window wider than one page is stitched back together, ascending and without repeats.
 
     The page cap is lowered to 2 so the recordings cover the loop: three pages each, the last one

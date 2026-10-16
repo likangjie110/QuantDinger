@@ -41,6 +41,7 @@ from datetime import datetime
 import pandas as pd
 import requests
 
+from app.config.data_sources import CryptoPublicConfig
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -49,9 +50,11 @@ logger = get_logger(__name__)
 # admitting a field is the field set's call, and an empty series is this module's way of saying it
 # has nothing to add rather than overruling that call.
 DERIVATIVES_MARKETS = frozenset({"Crypto"})
-# A symbol that names no venue in its ``@venue`` suffix is read on this one -- the repository's
-# default public crypto venue (``CRYPTO_PUBLIC_DEFAULT_EXCHANGE``).
-DEFAULT_VENUE = "binance"
+# The floor for a default venue this module cannot read. The default itself is not a constant here:
+# it is the app's configured public crypto venue, read at call time by :func:`_default_venue` -- a
+# deployment pointed at another venue must not be handed Binance's funding and open interest under
+# that venue's prices, which is a plausible-looking wrong number rather than a missing one.
+_FALLBACK_VENUE = "binance"
 
 # The venue name each market's instrument has to be spelled in.
 _INSTRUMENT_NAME = {
@@ -139,6 +142,17 @@ def fetch_open_interest_history(market: str, symbol: str, *, start: datetime, en
     return _history(market=market, symbol=symbol, start=start, end=end, field="open_interest")
 
 
+def _default_venue() -> str:
+    """The app's configured public crypto venue, as of this call.
+
+    ``CRYPTO_PUBLIC_DEFAULT_EXCHANGE`` is what the rest of the repository reads to decide where a
+    bare crypto symbol trades, so this module reads the same setting at the same moment rather than
+    a copy of its factory value: a deployment pointed at another venue would otherwise get that
+    venue's prices next to Binance's funding rates.
+    """
+    return str(CryptoPublicConfig.DEFAULT_EXCHANGE or "").strip().lower() or _FALLBACK_VENUE
+
+
 def _history(*, market: str, symbol: str, start: datetime, end: datetime, field: str) -> pd.Series:
     """The one path both entry points take: decide, fetch, filter, index."""
     if market not in DERIVATIVES_MARKETS:
@@ -172,9 +186,10 @@ def _instrument(symbol: str, market: str) -> tuple[str, str, str] | None:
     A member key spells its venue as ``@exchange_id[:market_type]``, or the market type alone when
     the run recorded no exchange id (``Crypto:BTC/USDT@swap``, a key this repository really
     builds). So a suffix whose first word is a product word names a market type, not a venue, and
-    such a key reads on :data:`DEFAULT_VENUE` -- the same rule a bare pair follows. A key whose
-    product is not a perpetual names no funding rate and no open interest and returns ``None``
-    rather than a perpetual's numbers under a spot symbol.
+    such a key reads on the default venue -- the same rule a bare pair follows. A key whose product
+    is not a perpetual names no funding rate and no open interest and returns ``None`` rather than a
+    perpetual's numbers under a spot symbol. The default venue is read from the app's configuration
+    per call (:func:`_default_venue`), not fixed here.
     """
     text = str(symbol or "").strip()
     if not text:
@@ -183,9 +198,9 @@ def _instrument(symbol: str, market: str) -> tuple[str, str, str] | None:
     first, _, rest = suffix.partition(":")
     first, rest = first.strip().lower(), rest.strip().lower()
     if not first:
-        venue, product = DEFAULT_VENUE, ""
+        venue, product = _default_venue(), ""
     elif first in _PRODUCT_WORDS:
-        venue, product = DEFAULT_VENUE, first
+        venue, product = _default_venue(), first
     else:
         venue, product = first, rest
     if product and product not in _PERPETUAL_PRODUCTS:
