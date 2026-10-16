@@ -117,10 +117,13 @@ def _substitute_operator(node: dict | str, rng: random.Random) -> dict | str:
     path, target = rng.choice([(path, current) for path, current in _walk(node) if _alternatives(current)])
     op = rng.choice(_alternatives(target))
     previous = (target.get("params") or {}).get(WINDOW_PARAM)
-    # A non-windowed target drops the window rather than carrying a stale ``n``: that number
-    # would mean nothing, and it would split one expression into two fingerprints.
-    params = {WINDOW_PARAM: previous if previous is not None else rng.randint(WINDOW_MIN, WINDOW_MAX)} \
-        if OPERATOR_SPECS[op][1] else {}
+    if OPERATOR_SPECS[op][1]:
+        window = previous if previous is not None else rng.randint(WINDOW_MIN, WINDOW_MAX)
+        params = {WINDOW_PARAM: window}
+    else:
+        # A non-windowed target drops the window rather than carrying a stale ``n``: that
+        # number would mean nothing, and it would split one expression into two fingerprints.
+        params = {}
     return _replace(node, path, {"op": op, "args": list(target.get("args") or []), "params": params})
 
 
