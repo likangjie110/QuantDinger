@@ -40,13 +40,19 @@ class NetworkReached(BaseException):
 
 @pytest.fixture(autouse=True)
 def _block_network(monkeypatch):
-    """No test opens a connection: a request fails here, before it leaves the process.
+    """A test's ``requests.get`` / ``requests.request`` fails here, before it leaves the process.
 
     Unit tests stub what they read, so a test that reaches a venue has stubbed the wrong name or
     is exercising a path nobody meant to run -- both cheaper to find as a failure here than as a
     rate-limit error and a column of nothing. A test with its own ``requests`` double patches
     over this one and keeps working. Live checks live under ``tests/integration`` and are run by
     hand; ``requests`` is the client this repository's data layer uses.
+
+    Those two names are the whole guard, deliberately: ``requests.post`` and an explicit
+    ``requests.Session`` are not intercepted, because the module-level session and POST paths
+    this repository has (``app/services/llm.py``, ``signal_notifier`` and others) are stubbed by
+    the tests that exercise them. So this is a net under the data-layer read paths rather than
+    proof that a green suite dialed out nowhere.
     """
     def blocked(*_args, **_kwargs):
         raise NetworkReached("a unit test tried to open a connection")

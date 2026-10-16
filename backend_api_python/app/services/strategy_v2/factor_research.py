@@ -529,12 +529,15 @@ class FactorResearchEngine:
         set this block has always reported as a full symmetric matrix, and the factor-research
         response carries that whole. An injected set fills **the studied factor's row alone**,
         because it is the candidate's comparison set and not a peer group to cross-correlate.
-        That row is what the de-duplication gate reads, and it is what keeps an injected set
-        affordable: the mining search hands in the whole registry plus its candidate pool, and
-        the quadratic work of measuring every comparison factor against every other -- along with
-        storing it in every candidate's record -- is work nothing reads. The unmeasured cells
-        stay zero in the matrix and zero observations in the observation matrix, which is this
-        block's way of saying "not measured" rather than inventing a value for them.
+        That row is what the de-duplication gate reads, and it is the *measurement* that keeps an
+        injected set affordable: the mining search hands in the whole registry plus its candidate
+        pool, and measuring every comparison factor against every other is quadratic work nothing
+        reads. What is saved is the computation alone -- the matrices stay square over every name,
+        and the rows an injected set did not measure are still there, zero-valued, because the
+        reader indexes them positionally and a ragged matrix would be a shape for every consumer
+        to reconcile. The unmeasured cells stay zero in the matrix and zero observations in the
+        observation matrix, which is this block's way of saying "not measured" rather than
+        inventing a value for them.
         """
         names = list(dict.fromkeys((selected_factor, *(
             self._CORRELATION_FACTORS if comparison_factors is None else comparison_factors

@@ -207,6 +207,11 @@ def test_enumeration_warmup_is_unchanged_from_v1():
     _, fetch_start, _ = service.fetch_calls[0]
     assert (split_periods(short).search_start - fetch_start).days == 76
 
+    # A full year is inside the cap for the whole template library too.
+    every_template = _AShareService()
+    _provider(every_template).prepare(user_id=1, code=_SOURCE, config=_config())
+    assert every_template.fetch_calls
+
 
 def test_the_evolution_fetch_starts_at_the_dsl_ceiling():
     """Evolution takes the ceiling, and the fetch follows it: an evolved lookback is unknowable.

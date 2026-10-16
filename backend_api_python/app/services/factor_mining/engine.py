@@ -30,8 +30,9 @@ search window for the candidates the mode can know about, because the panel is e
 the fetched window and only then cut to the search window. Enumeration can measure its templates
 before it expands them and asks for exactly what they need; evolution cannot -- a crossover can
 graft a 252-bar window onto any path -- so it takes the DSL's whole ceiling, which costs
-provider history on every evolved run and, where a policy caps the fetched range, shortens the
-window the run can search. The field panels are pinned to one shared index and column order
+provider history on every evolved run and, where a policy caps the fetched range, gets the run
+refused outright (``BacktestRangeLimitError``, before a bar is requested) rather than searched
+over a shorter window. The field panels are pinned to one shared index and column order
 with a missing field kept as a NaN column, they carry the run's whole field set
 (``fields_for(market)``, derivative fields included where the market has them), and the data
 fingerprint covers every one of those columns -- which is what the evaluator assumes when it
@@ -50,8 +51,10 @@ same object as its two smoothing variants' inner argument, and a bred individual
 subtree its parents did not rewrite -- so nothing here writes into one.
 
 The provider falls back to the real services so the search and freeze stages can construct it
-without arguments; tests inject fakes. Nothing here opens a connection, reads a clock, or
-mocks the network.
+without arguments; tests inject fakes. This module opens no connection and reads no clock of its
+own, but the panels it assembles can: a market whose field set carries derivative fields is
+enriched from the venues' public endpoints (``market_fields``), and the funding-rate series is
+bounded against the wall clock there -- so ``prepare`` over such a market does reach the network.
 """
 
 from __future__ import annotations

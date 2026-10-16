@@ -8,8 +8,10 @@ mode is invisible to every behavioural test -- the path still runs, it just refu
 The call-site set grows with the code, which is why this is a scan and not a convention: the plan
 for the field-group work counted five call sites, the audit that accompanied it found twenty, and
 four of those lived in modules written after the count was taken. A bare call now fails here, with
-its file and line. There are no exceptions: a whitelist entry would be the one place the failure
-mode could hide, so a site that genuinely needs the default has to say so in this file first.
+its file and line. There is no exemption list, and adding one would defeat the check: a call site
+that genuinely wants the price-volume default has to change this file rather than register itself
+somewhere. ``_REACHED_AT_LEAST`` below is not such a list -- it counts what the scan used to reach,
+so a scan that silently stopped seeing call sites cannot pass by finding nothing.
 """
 
 import ast
