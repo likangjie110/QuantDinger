@@ -60,10 +60,18 @@ from app.utils import agent_jobs
 
 JOB_KIND = "factor_mining"
 
-# The integer fields ``MiningConfig`` reads with ``int()``. Only an absent key falls back to its
-# default there, so a blank ``""`` would raise a bare ``ValueError`` and escape this module's
-# closed key set; the boundary reads it as absent instead.
-_BLANK_AS_ABSENT = ("sourceId", "budget", "seed", "groups", "holdingPeriod")
+# The numeric fields ``MiningConfig`` reads with ``int()``/``float()``. Only an absent key falls
+# back to its default there, so a blank ``""`` would raise a bare ``ValueError`` and escape this
+# module's closed key set; the boundary reads it as absent instead. That tolerance is the whole
+# contract for the breeder's three numbers: they are optional in enumeration mode and bounded
+# whenever they are given, and a form that serializes an empty box as ``""`` must not be answered
+# with a key that says the parameter was illegal. The engine's own requirement is a separate check
+# and stays one -- a blank still cannot satisfy a run that breeds, because evolution names all
+# three rather than defaulting into a population nobody asked for.
+_BLANK_AS_ABSENT = (
+    "sourceId", "budget", "seed", "groups", "holdingPeriod",
+    "population", "generations", "eliteRatio",
+)
 
 _KNOWN_MARKETS = frozenset(list_market_keys())
 

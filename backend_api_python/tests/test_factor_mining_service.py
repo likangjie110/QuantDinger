@@ -539,6 +539,28 @@ def test_blank_integer_fields_read_as_absent(monkeypatch):
         FactorMiningService().estimate(_payload(sourceId=""))
 
 
+def test_blank_evolution_fields_read_as_absent_for_enumeration():
+    """The breeder's three numbers are optional where they are optional, and refused where not.
+
+    The product contract has the three optional in enumeration mode and bounded whenever they
+    are given, and an empty form box serialized as ``""`` is the shape that contract has to
+    survive. The boundary reads ``""`` as an absent key, the same rule the integer fields above
+    follow, so enumeration prices the search the defaults describe -- and the engine's own
+    requirement is untouched: evolution is not a mode a payload defaults into, so a blank there
+    is still refused by key rather than priced as the placeholder. Both halves matter: a
+    boundary that tolerated the blank while the engine priced it would search a population the
+    caller never named.
+    """
+    payload = _payload(searchMode="enumeration", population="", generations="", eliteRatio="")
+    assert FactorMiningService().estimate(payload)["candidateBudget"] == len(
+        expand_candidates(template_ids=None, budget=_payload()["budget"], seed=DEFAULT_SEED)
+    )
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        FactorMiningService().estimate(
+            _payload(searchMode="evolution", population="", generations="", eliteRatio=""),
+        )
+
+
 @pytest.mark.parametrize("market", ["", "NASDAQ"])
 def test_unknown_market_is_rejected_by_key(market):
     with pytest.raises(ValueError, match="factorMining.invalidMarket"):
