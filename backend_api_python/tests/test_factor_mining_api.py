@@ -165,6 +165,21 @@ def test_run_drops_request_keys_a_run_config_never_reads(app, service):
     }
 
 
+def test_run_and_estimate_pass_the_search_mode_and_pool_settings(app, service):
+    """The whitelist is all that stands between the body and the service: a dropped key searches
+    something else, silently. ``/estimate`` is priced the same either way and answers the same two
+    keys -- the client knows which mode it submitted, so the body does not echo one back."""
+    body = {"sourceId": 1, "searchMode": "evolution", "population": 40, "generations": 5,
+            "eliteRatio": 0.2}
+    stub = service(submit=_receipt(), estimate={"templateCount": 8, "candidateBudget": 40})
+    _invoke(app, mining_routes.run_factor_mining, path="/api/factor-mining/run", json=body)
+    estimate = _invoke(app, mining_routes.estimate_factor_mining,
+                       path="/api/factor-mining/estimate", json=body)
+    assert stub.calls["submit"]["payload"] == body
+    assert stub.calls["estimate"]["payload"] == body
+    assert estimate.get_json()["data"] == {"templateCount": 8, "candidateBudget": 40}
+
+
 def test_run_field_whitelist_matches_the_config_it_feeds():
     """The whitelist is a hand-copied key set, so a field added to ``MiningConfig`` and forgotten
     here would drop the caller's value silently: the job would search the default instead."""

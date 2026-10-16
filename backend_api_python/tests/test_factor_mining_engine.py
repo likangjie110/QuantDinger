@@ -1015,6 +1015,40 @@ def test_the_search_and_the_review_tell_the_provider_which_warmup_rule_applies()
     assert provider.search_modes == ["evolution", "evolution"]
 
 
+def test_the_breeding_settings_come_from_the_run_config(monkeypatch):
+    """The population, its generations and its elite share are the run's own, not the engine's.
+
+    A second copy of these numbers inside the engine would leave a stored run's config unable to
+    explain the search it ran -- the record and the numbers would be free to drift apart.
+    """
+    seen: dict = {}
+
+    def stream(source, **kwargs):
+        seen.update(kwargs)
+        return iter(())
+
+    monkeypatch.setattr(engine_module, "evolve", stream)
+    _run(*_fixture(), search_mode="evolution", population=7, generations=3, elite_ratio=0.5,
+         thresholds=_NO_DEDUPLICATION)
+
+    assert (seen["population"], seen["generations"], seen["elite_ratio"]) == (7, 3, 0.5)
+
+
+def test_a_run_that_names_no_mode_is_byte_identical_to_enumeration():
+    """No mode named anywhere searches v1's templates: the same candidates, byte for byte.
+
+    The service leans on this default, so it is pinned here rather than assumed -- a changed
+    default would move what every v1 caller searches without any of them naming a mode.
+    """
+    unnamed = FactorMiningEngine(data_provider=_FakeProvider(*_fixture())).run(
+        user_id=1, code="PORTFOLIO = {}", config=_config(thresholds=_NO_DEDUPLICATION),
+    )
+    named, _ = _search(thresholds=_NO_DEDUPLICATION)
+    assert unnamed["candidates"], "a run with no candidates would satisfy any comparison"
+    assert json.dumps(unnamed["candidates"], sort_keys=True) == \
+        json.dumps(named["candidates"], sort_keys=True)
+
+
 def test_an_unknown_search_mode_is_refused_rather_than_enumerated():
     """A mode the engine does not know is a caller's bug, not a request for the default.
 
@@ -1024,3 +1058,20 @@ def test_an_unknown_search_mode_is_refused_rather_than_enumerated():
     engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
     with pytest.raises(ValueError, match="factorMining.invalidParameter"):
         engine.run(user_id=1, code="PORTFOLIO = {}", config=_config(), search_mode="genetic")
+
+
+def test_the_review_refuses_an_unknown_search_mode_too():
+    """Both entries read the same config, so both have to answer for its mode.
+
+    A mode the search would have refused must not reach the review at all -- and the review that
+    has nothing to review is no exception, because the two entries must not disagree about one
+    config. The refusal comes before the empty-survivors shortcut for that reason.
+    """
+    survivor = {"expression": _MOMENTUM_5, "fingerprint": "f" * 64, "origin": "template",
+                "template_id": "momentum", "status": "search", "reason": "",
+                "metrics": {}, "outOfSample": {}}
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    for survivors in ([survivor], []):
+        with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+            engine.review_frozen(user_id=1, code="PORTFOLIO = {}", config=_config(),
+                                 survivors=survivors, trials_count=1, search_mode="genetic")

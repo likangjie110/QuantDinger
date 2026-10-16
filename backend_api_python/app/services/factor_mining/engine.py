@@ -104,11 +104,13 @@ SEARCH_MODE_ENUMERATION = "enumeration"
 SEARCH_MODE_EVOLUTION = "evolution"
 _SEARCH_MODES = (SEARCH_MODE_ENUMERATION, SEARCH_MODE_EVOLUTION)
 
-# The evolution search's own settings. The run's payload does not carry them yet, so they are
-# the engine's defaults rather than a caller's choice.
-EVOLUTION_POPULATION = 32
-EVOLUTION_GENERATIONS = 20
-EVOLUTION_ELITE_RATIO = 0.25
+# The evolution search's own defaults. A run that breeds names all three in its payload -- the
+# boundary refuses one that does not -- and these are what a config built in process starts from.
+# They live on the config's fields and nowhere else: a second copy here would be a second answer
+# to what a stored run's config says it searched.
+DEFAULT_EVOLUTION_POPULATION = 32
+DEFAULT_EVOLUTION_GENERATIONS = 20
+DEFAULT_EVOLUTION_ELITE_RATIO = 0.25
 
 # What evolution ranks a generation by: a metric every evaluated individual already carries, so
 # the fitness callback never computes anything and the evolution module never reads data.
@@ -135,6 +137,13 @@ class MiningConfig:
     slippage: float = 0.0005
     neutralize_industry: bool = False
     thresholds: GateThresholds = GateThresholds()
+    # The mode the run was submitted with. The engine is handed it as an argument rather than
+    # reading it here -- the candidate source is the engine's to choose -- and the caller that
+    # owns this config is the one that passes it, including to the frozen review.
+    search_mode: str = SEARCH_MODE_ENUMERATION
+    population: int = DEFAULT_EVOLUTION_POPULATION
+    generations: int = DEFAULT_EVOLUTION_GENERATIONS
+    elite_ratio: float = DEFAULT_EVOLUTION_ELITE_RATIO
 
     @classmethod
     def from_payload(
@@ -150,11 +159,15 @@ class MiningConfig:
         normalized to the chart vocabulary the data sources accept, and the end date is pushed
         to the end of its day so the final session is part of the range. A budget above the
         hard cap and a freeze ratio that would leave no usable search window are rejected by
-        key rather than clamped, because silently searching a different run is worse.
+        key rather than clamped, because silently searching a different run is worse. The search
+        mode's own settings are read by the same rule and are required of a run that breeds --
+        see ``_evolution_settings``.
         """
         budget = _payload_int(payload, "budget", DEFAULT_BUDGET)
         if budget > MAX_BUDGET:
             raise ValueError("factorMining.budgetExceeded")
+        search_mode = _search_mode(payload.get("searchMode"))
+        population, generations, elite_ratio = _evolution_settings(payload, search_mode)
         return cls(
             market=str(payload.get("market") or ""),
             timeframe=_timeframe(payload.get("timeframe"), "1D"),
@@ -174,6 +187,10 @@ class MiningConfig:
             slippage=_rate(payload.get("slippage"), default_slippage),
             neutralize_industry=bool(payload.get("neutralizeIndustry", False)),
             thresholds=GateThresholds.from_payload(payload.get("thresholds")),
+            search_mode=search_mode,
+            population=population,
+            generations=generations,
+            elite_ratio=elite_ratio,
         )
 
 
@@ -342,10 +359,10 @@ class MiningDataProvider:
 class FactorMiningEngine:
     """Expand the templates or breed from them, score every candidate, keep the ledger.
 
-    Determinism is a contract, not a property: the same panel plus the same
-    ``(template_ids, budget, seed, search_mode)`` produce the same trials and the same candidates
-    in the same order, because the template expansion is seeded, the evolution stream draws from
-    ``random.Random(seed)`` alone, the gate ladder is pure, and nothing here iterates a set.
+    Determinism is a contract, not a property: the same panel plus the same ``(config,
+    search_mode)`` produce the same trials and the same candidates in the same order, because the
+    template expansion is seeded, the evolution stream draws from ``random.Random(seed)`` alone,
+    the gate ladder is pure, and nothing here iterates a set.
     """
 
     def __init__(
@@ -478,7 +495,13 @@ class FactorMiningEngine:
         checks for cancellation, and it is unmodded rather than paced like the search's: a
         review that never reported would let a cancelled job keep writing candidates into its
         run and close it as a success, so the two records would disagree about one event.
+
+        The mode is refused here by the same rule ``run`` applies, and before the no-survivors
+        shortcut: both entries read one config, and a mode one of them refused cannot be one the
+        other quietly reads as enumeration.
         """
+        if search_mode not in _SEARCH_MODES:
+            raise ValueError("factorMining.invalidParameter")
         if not survivors:
             return []
         panel = self._data_provider.prepare_freeze(
@@ -906,6 +929,60 @@ def _freeze_ratio(value: Any) -> float:
     return ratio
 
 
+def _search_mode(value: Any) -> str:
+    """Read the search mode. One the engine does not know is refused, never read as the default.
+
+    The modes search different candidate sets over different amounts of history, so a mode that
+    fell back to enumeration would run a search the caller did not ask for while the run record
+    carried the mode they did name -- two records disagreeing about what ran. Only an absent key
+    is the default: a value that is merely falsy, ``false`` or ``0``, is not a mode anyone named
+    and is read as the malformed value it is.
+    """
+    mode = str(value).strip() if value not in (None, "") else SEARCH_MODE_ENUMERATION
+    if mode not in _SEARCH_MODES:
+        raise ValueError("factorMining.invalidParameter")
+    return mode
+
+
+def _evolution_settings(
+    payload: Mapping[str, Any],
+    search_mode: str,
+) -> tuple[int, int, float]:
+    """The breeding population's settings: named by an evolution run, bounded whenever supplied.
+
+    A run that breeds must state all three. Evolution is not a mode a payload defaults into --
+    a population this layer invented would be a different search than the one requested -- and
+    the count itself is only half of it: ``int(population * elite_ratio)`` is the generation's
+    elite quota, so the share decides how much of a generation is kept as much as the size does.
+
+    The bounds are enforced here for the same reason the budget cap is, and there is nowhere else
+    to enforce them: ``evolution.py`` feeds the share straight into ``int()`` and a list slice
+    without checking it, so an ``elite_ratio`` of 1 or more makes every slot of a generation an
+    elite, leaves the breeding loop no room for children, and ends the stream before it yields
+    anything -- a run recorded as a success that searched the template expansion and bred nothing.
+    A negative share reads as a slice from the end of the ranking rather than an error, and a
+    population or generation count below one ends the stream the same silent way. All of them are
+    refused by key rather than clamped to a legal range: silently searching something else is the
+    worse outcome.
+    """
+    if search_mode == SEARCH_MODE_EVOLUTION and any(
+        payload.get(key) is None for key in ("population", "generations", "eliteRatio")
+    ):
+        raise ValueError("factorMining.invalidParameter")
+    population = _payload_int(payload, "population", DEFAULT_EVOLUTION_POPULATION)
+    generations = _payload_int(payload, "generations", DEFAULT_EVOLUTION_GENERATIONS)
+    try:
+        elite_ratio = (
+            DEFAULT_EVOLUTION_ELITE_RATIO if payload.get("eliteRatio") in (None, "")
+            else float(payload["eliteRatio"])
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("factorMining.invalidParameter") from exc
+    if population < 1 or generations < 1 or not 0.0 <= elite_ratio < 1.0:
+        raise ValueError("factorMining.invalidParameter")
+    return population, generations, elite_ratio
+
+
 def _portfolio_manifest(code: str) -> StrategyManifest:
     """Compile the source, keeping the portfolio-only contract the research entry enforces."""
     manifest = compile_strategy_v2(code).manifest
@@ -927,7 +1004,9 @@ def _candidate_source(
     stream -- which is also why the stream's first generation is ranked: a generator's body runs
     on the first pull, and by then the generation ahead of it has been scored. The budget counts
     draws from that point on, and a draw that yields nothing leaves no trace, so the total is the
-    generation plus the budget rather than a length evolution cannot know.
+    generation plus the budget rather than a length evolution cannot know. What it breeds with --
+    the population, its generations, and the elite share -- is the run config's, so the numbers a
+    stored run reports are the ones the search actually used.
     """
     seeds = expand_candidates(
         template_ids=config.template_ids or None,
@@ -943,9 +1022,9 @@ def _candidate_source(
                 seeds,
                 budget=config.budget,
                 seed=config.seed,
-                population=EVOLUTION_POPULATION,
-                generations=EVOLUTION_GENERATIONS,
-                elite_ratio=EVOLUTION_ELITE_RATIO,
+                population=config.population,
+                generations=config.generations,
+                elite_ratio=config.elite_ratio,
                 fitness=fitness,
             ),
         ),

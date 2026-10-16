@@ -128,18 +128,21 @@ class _Engine:
         self.error = error
         self.review_error = review_error
         self.trials_counts = []
+        self.search_modes = []
         self.survivors = None
         self.configs = []
 
-    def run(self, *, user_id, code, config):
+    def run(self, *, user_id, code, config, search_mode=None):
         self.trace.append("engine.run")
         self.configs.append(config)
+        self.search_modes.append(search_mode)
         if self.error is not None:
             raise self.error
         return self.run_result
 
-    def review_frozen(self, *, user_id, code, config, survivors, trials_count):
+    def review_frozen(self, *, user_id, code, config, survivors, trials_count, search_mode=None):
         self.trace.append("review_frozen")
+        self.search_modes.append(search_mode)
         self.survivors = list(survivors)
         self.trials_counts.append(trials_count)
         if self.review_error is not None:
@@ -261,6 +264,21 @@ def test_a_job_carries_the_config_its_caller_submitted(monkeypatch):
     job = FactorMiningService().get_job("job-1", user_id=USER_ID)
     assert job["config"] == {"sourceId": 7, "market": "USStock", "startDate": "2023-01-02",
                              "endDate": "2023-06-30", "budget": 50}
+
+
+def test_a_job_carries_the_search_mode_it_was_submitted_with(monkeypatch):
+    """A listed job withholds ``result``, so ``config`` is the only place its mode is visible.
+
+    ``_RUN_FIELDS`` lets the mode and the breeding pool into the stored request; a read-back that
+    dropped them would leave a poller unable to tell an evolving job from an enumerating one --
+    the two searches cost different amounts and take different lengths of history.
+    """
+    monkeypatch.setattr(mining_service.agent_jobs, "get_job", lambda job_id, *, user_id: _job_row(
+        job_id=job_id, request={"sourceId": 7, "market": "USStock", "searchMode": "evolution",
+                                "population": 40, "generations": 5, "eliteRatio": 0.2}))
+    job = FactorMiningService().get_job("job-1", user_id=USER_ID)
+    assert job["config"] == {"sourceId": 7, "market": "USStock", "searchMode": "evolution",
+                             "population": 40, "generations": 5, "eliteRatio": 0.2}
 
 
 def test_the_job_config_never_echoes_the_job_stores_own_channel(monkeypatch):
@@ -527,7 +545,7 @@ def test_unknown_market_is_rejected_by_key(market):
         FactorMiningService().estimate(_payload(market=market))
 
 
-@pytest.mark.parametrize("field", ["seed", "groups", "holdingPeriod"])
+@pytest.mark.parametrize("field", ["seed", "groups", "holdingPeriod", "population", "generations"])
 @pytest.mark.parametrize("value", [[], "abc", {}, float("inf")], ids=["list", "text", "object", "infinity"])
 def test_an_unreadable_integer_field_is_refused_by_key(field, value):
     """``int([])`` is a ``TypeError`` and ``int("abc")`` a bare ``ValueError``.
@@ -583,7 +601,8 @@ def test_the_timeframe_contract_keeps_the_existing_alias_behaviour(timeframe, ex
 
 @pytest.mark.parametrize("field,key", [("freezeRatio", "factorMining.freezeRatioInvalid"),
                                        ("commission", "factorMining.invalidParameter"),
-                                       ("slippage", "factorMining.invalidParameter")])
+                                       ("slippage", "factorMining.invalidParameter"),
+                                       ("eliteRatio", "factorMining.invalidParameter")])
 def test_an_overflowing_number_is_refused_by_the_fields_own_key(field, key):
     """``float(10**400)`` overflows in three more readers on the payload path.
 
@@ -602,10 +621,77 @@ def test_thresholds_that_are_not_an_object_are_refused_by_key(thresholds):
         FactorMiningService().estimate(_payload(thresholds=thresholds))
 
 
+@pytest.mark.parametrize("mode", ["genetic", "EVolUTION", False, 0],
+                         ids=["unknown", "mis-cased", "boolean", "zero"])
+def test_a_search_mode_the_engine_does_not_have_is_refused(mode):
+    """A mode is refused, never read as enumeration: the two search different candidate sets.
+
+    Only an absent key takes the default. A value that is merely falsy is not a mode anyone named,
+    and reading it as enumeration would run the template search while the run record carried what
+    the caller actually sent.
+    """
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        FactorMiningService().estimate(_payload(searchMode=mode))
+
+
+@pytest.mark.parametrize("missing", ["population", "generations", "eliteRatio"])
+def test_evolution_mode_requires_a_population_size(missing):
+    """A run that breeds states its population; evolution is not a mode a payload defaults into.
+
+    The engine's placeholder settings are gone, so the numbers have to come from the run -- and a
+    ``population`` this layer invented would be a search the caller never asked for, which is the
+    reading the budget cap already takes. Every one of the three is required, not just the size:
+    a generation's elite quota is ``int(population * elite_ratio)``, so the share is as much a
+    part of "which population" as the count is.
+    """
+    settings = {"population": 40, "generations": 5, "eliteRatio": 0.2}
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        FactorMiningService().estimate(
+            _payload(searchMode="evolution", **{k: v for k, v in settings.items() if k != missing}),
+        )
+
+
+@pytest.mark.parametrize("overrides", [
+    {"population": 0}, {"population": -3}, {"generations": 0}, {"generations": -1},
+    {"eliteRatio": 1}, {"eliteRatio": 1.5}, {"eliteRatio": -0.25},
+], ids=["population-zero", "population-negative", "generations-zero", "generations-negative",
+        "elite-ratio-one", "elite-ratio-above-one", "elite-ratio-negative"])
+def test_breeding_settings_out_of_range_are_refused_rather_than_clamped(overrides):
+    """``evolution.py`` turns these into slices and loop bounds without checking any of them.
+
+    An ``elite_ratio`` of 1 or more makes every slot of a generation an elite, so the breeding
+    loop has no room for children left and the stream ends before it yields anything: the run is
+    recorded as a success that searched the template expansion and bred nothing, silently. A
+    negative share reads as a slice from the end of the ranking instead. A population or
+    generation count below one ends the stream the same way. All of them are refused by key
+    here, where a client first reaches them, rather than clamped to a legal range -- the
+    budget cap's precedent is that silently searching something else is the worse outcome.
+    """
+    settings = {**{"population": 40, "generations": 5, "eliteRatio": 0.2}, **overrides}
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        FactorMiningService().estimate(_payload(searchMode="evolution", **settings))
+
+
 def test_estimate_reports_candidate_count_within_budget():
     estimate = FactorMiningService().estimate(_payload(budget=20))
+    # The two keys v1 promised, and nothing else: a search mode the client already knows it
+    # submitted is not something this body has to echo back.
+    assert set(estimate) == {"templateCount", "candidateBudget"}
     assert estimate["candidateBudget"] == 20
     assert estimate["templateCount"] >= 1
+
+
+def test_an_evolution_payload_is_priced_by_the_same_expansion():
+    """``estimate`` counts the template expansion, and every mode seeds the search with it.
+
+    The two numbers are what the caller submits against, and the expansion is the same one in
+    either mode -- evolution breeds *from* it rather than replacing it -- so the price does not
+    move with the mode.
+    """
+    estimate = FactorMiningService().estimate(_payload(
+        budget=20, searchMode="evolution", population=40, generations=5, eliteRatio=0.2,
+    ))
+    assert estimate == FactorMiningService().estimate(_payload(budget=20))
 
 
 def test_estimate_narrows_the_candidate_count_to_a_small_template_set():
@@ -686,6 +772,53 @@ def test_runner_ledgers_every_trial_and_writes_the_frozen_count_back(monkeypatch
     assert persisted["trials"] == trials
     assert persisted["split"] == run_result["split"]
     assert result["summary"]["frozen"] == 1
+
+
+def test_search_mode_defaults_to_enumeration(monkeypatch):
+    """A payload that names no mode searches v1's templates, and says so to *both* engine calls.
+
+    The mode is also the warmup rule the provider fetches the panel with, so a default that
+    reached only the search would leave the frozen review reaching back the template expansion's
+    depth across a tail that evolved survivors -- whose lookback is the DSL's ceiling -- were
+    measured over. Nothing raises when that happens: the out-of-sample window is simply shorter
+    than the candidates being judged on it.
+    """
+    repository = _Repository()
+    engine = _Engine(repository.trace, run_result=_run_result([], []))
+    build, _ = _factory(repository.trace, engine)
+    monkeypatch.setattr(mining_service, "get_script_source_service", lambda: _SourceService(_SOURCE))
+
+    service = FactorMiningService(engine_factory=build, repository=repository)
+    service._run_mining_job({"__userId": USER_ID, **_payload()}, _PROGRESS)
+
+    assert engine.configs[0].search_mode == "enumeration"
+    assert engine.search_modes == ["enumeration", "enumeration"]
+
+
+def test_the_frozen_review_carries_the_modes_own_warmup_rule(monkeypatch):
+    """An evolution run tells the review its mode, not only the search.
+
+    The review is where the cost of getting this wrong lands. The mode is the warmup rule the
+    panel is fetched with, and an evolved survivor's lookback is the DSL's ceiling while
+    enumeration's is the template expansion's depth -- so a review left on the engine's default
+    would fetch the frozen tail shorter than the candidates it judges were measured over, and
+    nothing about that raises: the out-of-sample window is simply truncated.
+    """
+    repository = _Repository()
+    engine = _Engine(repository.trace, run_result=_run_result([], []))
+    build, _ = _factory(repository.trace, engine)
+    monkeypatch.setattr(mining_service, "get_script_source_service", lambda: _SourceService(_SOURCE))
+
+    service = FactorMiningService(engine_factory=build, repository=repository)
+    service._run_mining_job(
+        {"__userId": USER_ID, **_payload(
+            searchMode="evolution", population=40, generations=5, eliteRatio=0.2,
+        )},
+        _PROGRESS,
+    )
+
+    assert engine.configs[0].search_mode == "evolution"
+    assert engine.search_modes == ["evolution", "evolution"]
 
 
 def test_runner_reads_panels_through_the_injected_backtest_service(monkeypatch):

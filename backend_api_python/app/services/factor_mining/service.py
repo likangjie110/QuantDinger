@@ -75,7 +75,7 @@ _KNOWN_MARKETS = frozenset(list_market_keys())
 _JOB_CONFIG_KEYS = (
     "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio",
     "budget", "seed", "templateIds", "groups", "holdingPeriod", "commission", "slippage",
-    "neutralizeIndustry", "thresholds",
+    "neutralizeIndustry", "thresholds", "searchMode", "population", "generations", "eliteRatio",
 )
 
 
@@ -247,7 +247,8 @@ class FactorMiningService:
                 data_provider=MiningDataProvider(backtest_service=self._backtest_service),
                 on_progress=on_progress,
             )
-            search = engine.run(user_id=user_id, code=code, config=config)
+            search = engine.run(user_id=user_id, code=code, config=config,
+                                search_mode=config.search_mode)
             self._repository.save_trials(run_id, user_id=user_id, trials=search["trials"])
             # The counts may only be persisted once the ledger holds them: a run row closed before
             # its trials were written would claim evaluations the ledger never received.
@@ -261,6 +262,11 @@ class FactorMiningService:
                 config=config,
                 survivors=result["candidates"],
                 trials_count=len(result["trials"]),
+                # The review carries the search's own mode: it is the warmup rule the frozen
+                # panel is fetched with, and the survivors it judges were bred under that rule.
+                # Left to the engine's default, the tail would be fetched short of an evolved
+                # survivor's lookback and the out-of-sample window silently truncated.
+                search_mode=config.search_mode,
             )
             self._repository.upsert_candidates(
                 user_id=user_id, run_id=run_id, candidates=reviewed,

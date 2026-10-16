@@ -31,7 +31,7 @@ factor_mining_blp = Blueprint("factor_mining", __name__)
 _RUN_FIELDS = frozenset({
     "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio",
     "budget", "seed", "templateIds", "groups", "holdingPeriod", "commission", "slippage",
-    "neutralizeIndustry", "thresholds",
+    "neutralizeIndustry", "thresholds", "searchMode", "population", "generations", "eliteRatio",
 })
 
 
