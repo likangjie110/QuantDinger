@@ -32,7 +32,7 @@
 规格隐含、但最可能伤到使用者的输入/条件，按可能性排序。每行都已在对应任务里安排了钉住它的测试。
 
 1. **进化搜索重新引入前视偏差**：交叉/变异合成的新表达式绕开模板的既有保证（窗口被改成 0 或负数、窗口和越过 `MAX_LOOKBACK`）→ 因子值虚高且不可复现。钉住：任务 1 `test_mutation_never_emits_a_nonpositive_window` + 任务 3 `test_every_scored_individual_cleared_l1_first`。
-2. **试验台账漏记**：个体数上升后只记幸存者 → DSR 分母偏小、一切指标虚高。钉住：任务 2 `test_the_ledger_counts_every_individual_including_illegal_ones`。
+2. **试验台账漏记**：个体数上升后只记幸存者 → DSR 分母偏小、一切指标虚高。钉住：任务 3 `test_every_evolved_individual_gets_a_trial_row` + 任务 2 `test_rejected_children_are_counted_not_silently_dropped`。
 3. **指纹漂移**：本次改了校验上界，若误递增 `DSL_VERSION`，候选库既有行的 `expression_hash` 全部失效、旧候选被重复入库。钉住：任务 3 `test_the_fingerprint_is_unchanged_by_the_raised_depth_bound`（同一表达式在改动前后指纹逐字节相同）。
 4. **候选间数值去重口径错**：把本质不同的因子判为重复（误杀），或放行同一因子的仿射变换（漏杀）→ 候选库要么变窄要么被近亲灌满。钉住：任务 7 `test_numeric_dedup_rejects_an_affine_rescaled_twin` + `test_numeric_dedup_keeps_a_distinct_factor_with_low_correlation`。
 5. **协同价值评估读到冻结段**：用冻结段数据评估「加进池子后有无增量」→ 冻结段隔离被击穿，样本外证据失效。钉住：任务 8 `test_pool_gain_is_measured_without_the_freeze_segment`。
@@ -124,8 +124,8 @@ def test_evolution_is_byte_identical_for_the_same_seed():
     # 同 (初代, budget, seed) 两次调用，产出的表达式序列逐字节相同
 def test_evolution_respects_budget():
     # 产出的个体总数不超过 budget，且计数与实际产出条数一致
-def test_the_ledger_counts_every_individual_including_illegal_ones():
-    # 被 mutate/crossover 拒绝的非法子代仍然出现在计数里，不是静默丢弃
+def test_rejected_children_are_counted_not_silently_dropped():
+    # 被 mutate/crossover 拒绝的非法子代仍然计入产出预算，不是静默丢弃
 def test_elite_survives_across_generations():
     # 上一代适应度最高的个体必然出现在下一代（精英保留不可被随机淘汰）
 ```
@@ -135,9 +135,9 @@ def test_elite_survives_across_generations():
 运行：`.venv/Scripts/python.exe -m pytest tests/test_factor_mining_evolution.py -q`
 预期：FAIL，`ImportError: cannot import name 'evolve'`
 
-- [ ] **步骤 3：实现 `evolve(seeds, *, budget, seed, population, generations, elite_ratio) -> Iterator[Individual]`**
+- [ ] **步骤 3：实现 `evolve(seeds, *, budget, seed, population, generations, elite_ratio, fitness) -> Iterator[CandidateSeed]`**
 
-`seeds` 是初代（由 `templates.expand_candidates` 产出），`Individual` 是带 `expression` / `origin="evolution"` / `parents` 的记录。适应度来自回调 `fitness(expression) -> float | None`，由 `engine` 注入已有的 L2/L3 指标（`icir`），本模块不自己算指标也不碰数据。选择用确定性锦标赛（`rng` 决定比较对象，按 `(fitness, fingerprint)` 排序打破平局）。所有集合遍历前先 `sorted()`。
+`seeds` 是初代（由 `templates.expand_candidates` 产出，元素是 `templates.CandidateSeed`）。**`evolve` 直接产出 `CandidateSeed`**（`origin="evolution"`、`fingerprint` 取自 `dsl.normalize_expression`、`template_id` 记最初的来源模板或空串），**不引入新类型**——这样 `engine` 消费两种来源时无需分支。适应度来自回调 `fitness(expression) -> float | None`，由 `engine` 注入已有的 L2/L3 指标（`icir`），本模块不自己算指标也不碰数据。选择用确定性锦标赛（`rng` 决定比较对象，按 `(fitness, fingerprint)` 排序打破平局）。所有集合遍历前先 `sorted()`。
 
 - [ ] **步骤 4：运行测试验证通过**
 
@@ -172,6 +172,8 @@ def test_search_consumes_a_generator_source():
     # run 接受可迭代的候选来源，边产出边评估，进度总量为预算而非预先长度
 def test_every_scored_individual_cleared_l1_first():
     # 任何进入评分的个体都先过 dsl.normalize_expression，非法个体只能记为无效试验
+def test_every_evolved_individual_gets_a_trial_row():
+    # 进化模式下 qd_factor_trials 行数等于 budget，被拒个体同样入账（DSR 分母）
 def test_run_is_byte_identical_for_the_same_seed():
     # 同 seed 两次 run 的 trials 序列与顺序逐字节相同（含进化模式）
 def test_smoothed_template_seven_leaves_room_for_crossover():
@@ -212,9 +214,9 @@ def test_search_mode_defaults_to_enumeration():
     # 不传搜索模式时行为与 v1 完全一致（候选列表逐字节相同）
 def test_evolution_mode_requires_a_population_size():
     # searchMode="evolution" 而不给种群参数 → factorMining.invalidParameter
-def test_estimate_reports_the_mode_it_priced():
-    # /estimate 的返回新增 mode 字段，枚举模式仍只承诺 templateCount/candidateBudget
 ```
+
+`/estimate` 的两键契约**不新增测试**：v1 既有断言已在守着它，本任务只需保持它绿——那条断言就是不把 `mode` 塞进返回体的护栏。
 
 - [ ] **步骤 2：运行测试验证失败**
 
@@ -223,7 +225,7 @@ def test_estimate_reports_the_mode_it_priced():
 
 - [ ] **步骤 3：实现配置透传**
 
-`MiningConfig` 增加 `search_mode`（`"enumeration"` 默认 / `"evolution"`）、`population`、`generations`、`elite_ratio`；`_RUN_FIELDS` 同步放行；`estimate` 的返回体加 `mode`，**枚举模式的契约不变**（仍只承诺 `templateCount` 与 `candidateBudget`）。
+`MiningConfig` 增加 `search_mode`（`"enumeration"` 默认 / `"evolution"`）、`population`、`generations`、`elite_ratio`；`_RUN_FIELDS` 同步放行。**`estimate` 的返回体不动**：v1 已承诺它「只返回 `{templateCount, candidateBudget}` 这两项，没有别的」（`FACTOR_MINING_CN.md` §7），而客户端本来就知道自己提交的是哪个模式——回显 `mode` 是纯粹的契约破坏，没有换来任何信息。
 
 - [ ] **步骤 4：运行测试验证通过**
 
@@ -478,7 +480,7 @@ def test_the_fingerprint_does_not_depend_on_the_field_set():
 
 - [ ] **步骤 3：实现字段分组与贯通**
 
-`dsl.py` 把 `PRICE_VOLUME_FIELDS` 改为分组常量 `FIELD_GROUPS = {"price_volume": (...), "derivatives": (...)}` 并新增 `fields_for(market, capabilities)`；`PRICE_VOLUME_FIELDS` 保留为 `FIELD_GROUPS["price_volume"]` 的别名以免破坏既有导入。**5 个调用点全部显式传 `allowed_fields`**：`engine.py:424`（L1）、`engine.py:465`（L5）、`engine.py:836`（warmup）、`evaluator.py:56`（缓存 key）、`templates.py:242`（指纹）。指纹只依赖表达式本身，不依赖字段集（与任务 3 同一条理由）。
+`dsl.py` 把 `PRICE_VOLUME_FIELDS` 改为分组常量 `FIELD_GROUPS = {"price_volume": (...), "derivatives": (...)}` 并新增 `fields_for(market) -> tuple[str, ...]`（按市场返回该市场允许的字段组）。**不要在白名单层判可用性**：某个标的当天没有衍生品数据不是「字段非法」，而是缺列——沿用 `_field_panels` 的既有语义保留 NaN 列，由 L2 覆盖率门槛拦截。`PRICE_VOLUME_FIELDS` 保留为 `FIELD_GROUPS["price_volume"]` 的别名以免破坏既有导入。**5 个调用点全部显式传 `allowed_fields`**：`engine.py:424`（L1）、`engine.py:465`（L5）、`engine.py:836`（warmup）、`evaluator.py:56`（缓存 key）、`templates.py:242`（指纹）。指纹只依赖表达式本身，不依赖字段集（与任务 3 同一条理由）。
 
 - [ ] **步骤 4：运行测试验证通过**
 
@@ -518,7 +520,7 @@ def test_a_provider_failure_does_not_poison_the_other_fields():
 
 - [ ] **步骤 3：实现抓取与归一化**
 
-按交易所实现历史序列抓取（Binance `fapi/v1/fundingRate` 与 `futures/data/openInterestHist`、Gate `/futures/usdt/contract_stats`、OKX 对应端点），参考实现见 `app/services/market_data_collector.py:1840`（Gate）与 `:1965`（Binance）——但那些只取 `limit=1/2` 的最近值，本任务要按历史长度取序列。单位归一化沿用 `app/professional_report/features/crypto.py:547-570` 的 `_normalise_rate` / `_normalise_amount` 口径。单测用录制响应，不触网。
+按交易所实现两个函数，签名固定为 `fetch_funding_history(market, symbol, *, start, end) -> pd.Series` 与 `fetch_open_interest_history(market, symbol, *, start, end) -> pd.Series`（任务 12 按这两个签名消费，不要在这里换名字）。覆盖 Binance `fapi/v1/fundingRate` 与 `futures/data/openInterestHist`、Gate `/futures/usdt/contract_stats`、OKX 对应端点，参考实现见 `app/services/market_data_collector.py:1840`（Gate）与 `:1965`（Binance）——但那些只取 `limit=1/2` 的最近值，本任务要按历史长度取序列。单位归一化沿用 `app/professional_report/features/crypto.py:547-570` 的 `_normalise_rate` / `_normalise_amount` 口径。单测用录制响应，不触网。
 
 - [ ] **步骤 4：运行测试验证通过**
 
@@ -552,6 +554,8 @@ def test_a_symbol_without_derivatives_keeps_a_nan_column():
     # 没有衍生品数据的标的保留 NaN 列而不是掉出截面（沿用 _field_panels 的既有语义）
 def test_the_snapshot_fingerprint_covers_the_new_fields():
     # 数据指纹把新字段算进去，否则同一指纹下的两次运行数据其实不同
+def test_the_shared_strategy_v2_fingerprint_is_untouched():
+    # canonical_frame_bytes 对同一帧的返回值与升级前逐字节相同（跨模块零回归）
 ```
 
 - [ ] **步骤 2：运行测试验证失败**
@@ -561,7 +565,11 @@ def test_the_snapshot_fingerprint_covers_the_new_fields():
 
 - [ ] **步骤 3：实现装配与 enricher**
 
-`market_fields.py` 按 `fundamental_data.enrich_panel`（`:71`）的既有模式装配：按 `(market, symbol)` 取序列、按可知时点排序去重、`reindex(dates, method="ffill")`。接入点在 `engine._prepare_window` 的 `fetch_frames` 之后。**同时必须改 `snapshot.py:58` 的 `canonical_frame_bytes`**：它现在只哈希 OHLCV（`SNAPSHOT_COLUMNS`，`snapshot.py:15`），加列不会改变 `snapshot_id`，会让两次数据不同的运行共享指纹。日历口径按市场取交易日，修掉 v1 遗留的 `pd.bdate_range` 假设（Crypto 冻结段比例因此从约 21% 回到 30%）。
+`market_fields.py` 按 `fundamental_data.enrich_panel`（`:71`）的既有模式装配：按 `(market, symbol)` 取序列、按可知时点排序去重、`reindex(dates, method="ffill")`。接入点在 `engine._prepare_window` 的 `fetch_frames` 之后。
+
+**指纹必须覆盖新字段，但不能改共享函数。** `engine._data_digest`（`engine.py:888`）调用的是 `strategy_v2/snapshot.py:58` 的 `canonical_frame_bytes`，它只哈希 `SNAPSHOT_COLUMNS`（`snapshot.py:15`，五个价量列）——加列不会改变 `snapshot_id`，会让两次数据不同的运行共享指纹。但那个函数是 **Strategy V2 自己的数据版本原语**，改它会把回测与研究的既有数据版本一起改掉，属于全局约束禁止的跨模块行为变更。正确做法：在 `factor_mining` 内部自建一个**本地**摘要函数，对新增列按排序后的列名逐列折进摘要，`canonical_frame_bytes` 的输出与语义原样不动。
+
+日历口径按市场取交易日，修掉 v1 遗留的 `pd.bdate_range` 假设（Crypto 冻结段比例因此从约 21% 的日历日回到 30% 的交易日）。
 
 - [ ] **步骤 4：运行测试验证通过**
 
