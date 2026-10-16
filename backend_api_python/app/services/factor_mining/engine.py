@@ -3,7 +3,10 @@
 This layer owns what the rest of the mining pipeline reads. First the panel: bars come through
 the Strategy V2 data path -- ``compile_strategy_v2`` for the manifest, ``resolve_candidates``
 for the as-of universe, ``fetch_frames`` for the bars -- so mining never grows a second data
-layer with its own time semantics. Second the split: the requested range is cut into a search
+layer with its own time semantics, and the market's own non-price fields are assembled onto
+those bars over the same window (``market_fields``): a derivative column is indexed by the
+instant its value became known, so a bar reads the last of them published at or before it.
+Second the split: the requested range is cut into a search
 window and a frozen tail, and the tail is never fetched by the search; the out-of-sample review
 asks for it separately, once. Third the loop: every candidate the source produces -- the
 template expansion, or, in evolution, that expansion plus the stream bred from it -- is scored
@@ -29,8 +32,10 @@ before it expands them and asks for exactly what they need; evolution cannot -- 
 graft a 252-bar window onto any path -- so it takes the DSL's whole ceiling, which costs
 provider history on every evolved run and, where a policy caps the fetched range, shortens the
 window the run can search. The field panels are pinned to one shared index and column order
-with a missing field kept as a NaN column, which is what the evaluator assumes when it aligns a
-candidate to ``fields["close"]``.
+with a missing field kept as a NaN column, they carry the run's whole field set
+(``fields_for(market)``, derivative fields included where the market has them), and the data
+fingerprint covers every one of those columns -- which is what the evaluator assumes when it
+aligns a candidate to ``fields["close"]``.
 
 The search itself holds four things that are easy to lose. The panel carries warmup bars, so
 every evaluation re-cuts the frames to the search window; scoring the whole panel would fold
@@ -53,10 +58,11 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import math
 import re
 import statistics
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta
 from typing import Any
@@ -66,6 +72,7 @@ import pandas as pd
 from app.data_sources.asia_stock_kline import normalize_chart_timeframe
 from app.services.backtest_execution import parse_rate
 from app.services.backtest_limits import backtest_warmup_calendar_days
+from app.services.factor_mining import market_fields
 from app.services.factor_mining.dsl import (
     MAX_LOOKBACK,
     PRICE_VOLUME_FIELDS,
@@ -107,7 +114,7 @@ from app.services.strategy_v2.factor_research import FactorResearchEngine
 from app.services.strategy_v2.frequencies import periods_per_year
 from app.services.strategy_v2.models import StrategyManifest
 from app.services.strategy_v2.service import StrategyV2BacktestService, _enforce_backtest_range
-from app.services.strategy_v2.snapshot import canonical_frame_bytes
+from app.services.strategy_v2.snapshot import SNAPSHOT_COLUMNS, canonical_frame_bytes
 
 
 MINIMUM_SYMBOLS = 3
@@ -551,18 +558,21 @@ def _pool_increment_record(
 
 
 def split_periods(config: MiningConfig) -> PeriodSplit:
-    """Cut ``config``'s range by traded sessions: the last ``freeze_ratio`` of them freeze.
+    """Cut ``config``'s range by the market's own sessions: the last ``freeze_ratio`` of them.
 
-    Sessions come from the business-day calendar -- this module has no per-market calendar and
-    every supported market trades on weekdays -- and the frozen tail starts the day after the
-    last search session, so the two windows cannot share a bar.
+    Sessions come from the market's calendar (``market_fields.sessions``): a market that trades
+    every calendar day has ~40% more sessions than a business-day count finds, so counting it on
+    the week's calendar puts its frozen tail at the wrong boundary -- and every run is judged on
+    exactly that segment. Every other supported market trades on weekdays, which is what this
+    counted for all of them before the daily calendar existed. The frozen tail starts the day
+    after the last search session, so the two windows cannot share a bar.
     """
     ratio = _freeze_ratio(config.freeze_ratio)
-    sessions = pd.bdate_range(config.start_date, config.end_date)
-    if len(sessions) < 2:
+    calendar = market_fields.sessions(config.market, config.start_date, config.end_date)
+    if len(calendar) < 2:
         raise ValueError("factorMining.dateRangeTooShort")
-    search_sessions = min(len(sessions) - 1, max(1, int(len(sessions) * (1.0 - ratio))))
-    search_end = sessions[search_sessions - 1].to_pydatetime()
+    search_sessions = min(len(calendar) - 1, max(1, int(len(calendar) * (1.0 - ratio))))
+    search_end = calendar[search_sessions - 1].to_pydatetime()
     return PeriodSplit(
         search_start=config.start_date,
         search_end=search_end,
@@ -717,10 +727,16 @@ class MiningDataProvider:
         # instead of producing trials that dilute the selection-bias correction.
         if len(frames) < MINIMUM_SYMBOLS:
             raise ValueError("factorMining.usableUniverseTooSmall")
+        # The market's own fields, aligned to these bars. The window is the one just fetched --
+        # the search panel carries the warmup, the frozen panel starts at the tail -- so no
+        # series can reach past the panel's own end into another segment's readings.
+        frames = market_fields.enrich_frames(
+            frames, market=config.market, start=fetch_start, end=end_date,
+        )
         return PreparedPanel(
             frames=frames,
             members=list(candidates),
-            fields=_field_panels(frames),
+            fields=_field_panels(frames, fields_for(config.market)),
             snapshot_id=_data_digest(frames),
             frequency=config.timeframe,
             warnings=sorted(_skipped_warning(item) for item in skipped),
@@ -1594,11 +1610,18 @@ def _warmup_start(frequency: str, search_start: datetime, warmup_bars: int) -> d
     return search_start - timedelta(days=backtest_warmup_calendar_days(frequency, warmup_bars))
 
 
-def _field_panels(frames: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+def _field_panels(
+    frames: Mapping[str, pd.DataFrame],
+    fields: Collection[str] = PRICE_VOLUME_FIELDS,
+) -> dict[str, pd.DataFrame]:
     """Field name -> panel over every symbol, all panels sharing one index and column order.
 
     A symbol whose frame does not carry a field keeps a NaN column instead of dropping out of
-    that field's cross-section, so a candidate reading it stays comparable across symbols.
+    that field's cross-section, so a candidate reading it stays comparable across symbols. The
+    field list is the run's own (``fields_for(market)``): a field the run may name has to be in
+    the mapping as a column of nothing when nothing filled it, because a field missing from the
+    mapping altogether is answered as "no such field" -- the one reading that is wrong. What the
+    gap means is the coverage gate's call, not this function's.
     """
     index = pd.Index(sorted(set().union(*(frame.index for frame in frames.values()))))
     columns = list(frames)
@@ -1608,7 +1631,7 @@ def _field_panels(frames: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFrame]
             for key, frame in frames.items()
             if field in frame.columns
         }).reindex(index=index, columns=columns)
-        for field in PRICE_VOLUME_FIELDS
+        for field in fields
     }
 
 
@@ -1622,13 +1645,56 @@ def _data_digest(frames: Mapping[str, pd.DataFrame]) -> str:
 
     Hashing per symbol is what makes this a fingerprint of the data. The shared canonical
     encoder reads flat OHLCV columns only, so handing it a merged multi-symbol panel hashes the
-    calendar alone and reports two differently-priced runs as the same dataset. ``dropna`` is
-    required, not cosmetic: that encoder refuses NaN, and one symbol with a missing bar would
-    otherwise fail the run. Dropping rows stays deterministic, so the digest still moves when
-    the data does. v1 keeps this fingerprint only -- there is no replayable copy of the panel.
+    calendar alone and reports two differently-priced runs as the same dataset.
+
+    Two things this function owns rather than borrows. The rows handed to the encoder are the
+    panel's price-volume columns' rows, dropped where one of *those* is missing: once a market's
+    fields are assembled a frame also carries its derivative columns, and dropping rows on their
+    account would take price rows out of the digest for a reason that has nothing to do with the
+    prices -- a symbol whose derivative column is empty would contribute no price content at all,
+    which reports two differently-priced runs as one. And the remaining columns are folded in
+    here, because the shared encoder hashes a fixed price-volume tuple and knows nothing of them:
+    without that, two runs whose derivative data differs would share one fingerprint. That
+    encoder stays untouched in turn -- it versions Strategy V2's own backtest and research data,
+    and widening its column set would re-version panels this module never prepared.
+
+    ``dropna`` is required, not cosmetic: that encoder refuses NaN, and one symbol with a missing
+    bar would otherwise fail the run. Dropping rows stays deterministic, so the digest still moves
+    when the data does. v1 keeps this fingerprint only -- there is no replayable copy of the panel.
     """
     digest = hashlib.sha256()
     for symbol in sorted(frames):
         digest.update(symbol.encode("utf-8"))
-        digest.update(canonical_frame_bytes(frames[symbol].dropna()))
+        frame = frames[symbol]
+        digest.update(canonical_frame_bytes(frame[_shared_columns(frame)].dropna()))
+        digest.update(_extra_field_bytes(frame))
     return digest.hexdigest()
+
+
+def _shared_columns(frame: pd.DataFrame) -> list[str]:
+    """The frame's price-volume columns, spelled the way the shared encoder selects them."""
+    return [column for column in SNAPSHOT_COLUMNS if column in frame.columns]
+
+
+def _extra_field_bytes(frame: pd.DataFrame) -> bytes:
+    """The frame's columns outside the shared price-volume set, as canonical bytes.
+
+    The document shape ``canonical_frame_bytes`` writes -- column names sorted, one row per bar,
+    the bar's timestamp in nanoseconds -- with the two differences these columns need: they are
+    chosen here rather than fixed, and a missing value is ``null`` instead of refused, because a
+    derivative column of a symbol no source answered for is made of nothing else. Sorted rows and
+    column names are what make the bytes comparable across runs.
+    """
+    columns = sorted(set(frame.columns) - set(SNAPSHOT_COLUMNS))
+    if not columns:
+        return b""
+    normalized = frame.loc[:, columns].sort_index()
+    normalized = normalized[~normalized.index.duplicated(keep="last")]
+    rows = [
+        [int(pd.Timestamp(timestamp).value),
+         *[None if pd.isna(values[column]) else float(values[column]) for column in columns]]
+        for timestamp, values in normalized.iterrows()
+    ]
+    return json.dumps(
+        {"columns": columns, "rows": rows}, ensure_ascii=True, separators=(",", ":"),
+    ).encode("utf-8")
