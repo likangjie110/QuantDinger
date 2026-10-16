@@ -329,7 +329,7 @@ def test_prepare_freeze_fetches_the_frozen_tail_with_its_warmup():
     search = provider.prepare(user_id=1, code=_SOURCE, config=config)
     panel = provider.prepare_freeze(user_id=1, code=_SOURCE, config=config)
     split = split_periods(config)
-    warmup_days = backtest_warmup_calendar_days(config.timeframe, _warmup_bars(config))
+    warmup_days = backtest_warmup_calendar_days(config.timeframe, _warmup_bars())
 
     _, search_fetch_start, search_fetch_end = service.fetch_calls[0]
     _, freeze_fetch_start, freeze_fetch_end = service.fetch_calls[1]

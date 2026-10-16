@@ -18,6 +18,7 @@ assert the candidate list is non-empty, because a run that rejects everything ca
 whether the search works.
 """
 
+import json
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -25,6 +26,7 @@ import pandas as pd
 import pytest
 
 from app.services.factor_mining import engine as engine_module
+from app.services.factor_mining.dsl import MAX_LOOKBACK
 from app.services.factor_mining.engine import (
     FactorMiningEngine,
     MiningConfig,
@@ -33,8 +35,10 @@ from app.services.factor_mining.engine import (
     _fold_ic_signs,
     _metrics_payload,
     _resolved_members,
+    _warmup_bars,
     split_periods,
 )
+from app.services.factor_mining.evaluator import ExpressionEvaluator
 from app.services.factor_mining.gates import GateThresholds
 from app.services.factor_mining.templates import expand_candidates
 from app.services.strategy_v2.factor_research import FactorResearchEngine
@@ -111,9 +115,12 @@ _NO_DEDUPLICATION = GateThresholds(min_ic_observations=5, min_abs_rank_ic=0.0, m
 
 
 def _run(frames, members, **overrides):
+    """One run over ``frames``. ``search_mode`` picks the engine's source; the rest is config."""
+    search_mode = overrides.pop("search_mode", "enumeration")
     seen: list[dict] = []
     engine = FactorMiningEngine(data_provider=_FakeProvider(frames, members), on_progress=seen.append)
-    result = engine.run(user_id=1, code="PORTFOLIO = {}", config=_config(**overrides))
+    result = engine.run(user_id=1, code="PORTFOLIO = {}", config=_config(**overrides),
+                        search_mode=search_mode)
     return result, seen
 
 
@@ -799,3 +806,148 @@ def test_the_research_engine_is_told_the_runs_own_frequency(monkeypatch):
     calls.clear()
     _run(_fixture()[0], crypto)
     assert {call["annualization_periods"] for call in calls} == {365.25}
+
+
+# --- the candidate source: the template expansion, or a stream the engine breeds -----------
+
+
+def test_warmup_uses_the_dsl_lookback_budget(monkeypatch):
+    """The panel's warmup is the DSL's ceiling for every run, whatever its candidates are.
+
+    An evolved individual's longest lookback is not knowable before it has been bred -- a
+    crossover may graft a 252-bar window onto any path -- so the ceiling is the only bound that
+    stays correct for both sources, and reading it off the expanded candidates would under-fetch
+    for an evolved one. The panel is fetched once and every evaluation re-cuts it to the search
+    window, so the extra history costs provider history and nothing else.
+    """
+    monkeypatch.setattr(engine_module, "expand_candidates",
+                        lambda **kwargs: pytest.fail("the warmup must not pre-scan the candidates"))
+    assert _warmup_bars() == MAX_LOOKBACK == 504
+
+
+def _stream_run(monkeypatch, individuals, **overrides):
+    """One evolution pass over exactly ``individuals``: the stream a test wants it to consume."""
+    monkeypatch.setattr(engine_module, "evolve", lambda source, **kwargs: iter(individuals))
+    return _run(*_fixture(), search_mode="evolution", **overrides)
+
+
+def test_search_consumes_a_generator_source(monkeypatch):
+    """A stream source is pulled one individual at a time, and its progress is priced in budget.
+
+    Two properties in one run. The engine has to score what it already holds before the stream
+    is resumed: evolution ranks a generation by the caller's answer about its members, and that
+    answer exists only once the engine has evaluated them -- draining the stream first would
+    rank every generation on nothing. And the progress total is the budget, not the length of
+    what the stream produced: draws that yield nothing still spend budget, so the output is an
+    outcome, never a length a reporter may announce in advance.
+    """
+    seeds = _seeds(10)
+    scored_between_draws: list[float | None] = []
+
+    def stream(source, *, fitness, **_kwargs):
+        for index, seed in enumerate(seeds):
+            if index:
+                # Asked from inside the stream: the individual yielded before this point is only
+                # answerable if the consumer evaluated it before asking for the next one.
+                scored_between_draws.append(fitness(seeds[index - 1].expression))
+            yield seed
+
+    monkeypatch.setattr(engine_module, "evolve", stream)
+    result, seen = _run(*_fixture(), search_mode="evolution", budget=25)
+    assert scored_between_draws and all(value is not None for value in scored_between_draws), \
+        "the stream was drained before its individuals were scored"
+    assert len(result["trials"]) == 10
+    assert seen == [{"stage": "search", "evaluated": 10, "total": 25}]
+
+
+def test_every_scored_individual_cleared_l1_first(monkeypatch):
+    """An individual reaches the evaluator only after L1 validated it, whoever produced it.
+
+    A window perturbation can build a tree no template could -- three nested 252-bar windows,
+    whose lookback is 756 -- and every layer below L1 would compute it without complaint, so L1
+    is what keeps an evolved individual inside the lookback bound. The individual it refuses is
+    a rejected trial rather than a measurement, and the run carries on to the next one.
+    """
+    over_budget = {"op": "ts_mean", "args": [
+        {"op": "ts_mean", "args": [
+            {"op": "ts_mean", "args": ["close"], "params": {"n": 252}}], "params": {"n": 252}}],
+        "params": {"n": 252}}
+    healthy = {"op": "ts_pct_change", "args": ["close"], "params": {"n": 3}}
+    reached_the_evaluator: list = []
+    real_evaluate = ExpressionEvaluator.evaluate
+
+    def recording(self, node):
+        reached_the_evaluator.append(node)
+        return real_evaluate(self, node)
+
+    monkeypatch.setattr(ExpressionEvaluator, "evaluate", recording)
+    result, _ = _stream_run(monkeypatch, [_unvalidated_seed(over_budget), _seed_for(healthy)],
+                            thresholds=_NO_DEDUPLICATION)
+    invalid, scored = result["trials"]
+    assert (invalid["stage"], invalid["verdict"]) == ("L1", "reject")
+    assert invalid["reason"] == "factorMining.reject.invalid"
+    assert reached_the_evaluator == [healthy], "the individual L1 refused was evaluated anyway"
+    assert scored["verdict"] == "pass"
+
+
+def _unvalidated_seed(expression):
+    """A seed the DSL refuses, which ``_seed_for`` cannot build: it fingerprints through the DSL.
+
+    The fingerprint is spelled here because an individual L1 rejects never produces one -- which
+    is half of what the test above is about.
+    """
+    from app.services.factor_mining.templates import CandidateSeed
+
+    return CandidateSeed(expression=expression, fingerprint="0" * 64, template_id="evolution",
+                         origin="evolution", params={})
+
+
+def test_every_emitted_individual_gets_a_trial_row(monkeypatch):
+    """Every individual the stream yields is evaluated and written down; the budget bounds it.
+
+    The ledger is the denominator of the selection-bias correction, so an individual that was
+    evaluated may not be missing from it -- and one the stream never yielded has nothing to
+    record: a refused draw, and a draw that repeats an expression the run already holds, both
+    spend budget without being an individual at all. The budget caps the output; it does not
+    size it, because a generation with no legal child ends the stream early.
+    """
+    emitted: list = []
+    real_evolve = engine_module.evolve
+
+    def counting(source, **kwargs):
+        for individual in real_evolve(source, **kwargs):
+            emitted.append(individual)
+            yield individual
+
+    monkeypatch.setattr(engine_module, "evolve", counting)
+    result, _ = _run(*_fixture(), search_mode="evolution", budget=20, thresholds=_NO_DEDUPLICATION)
+    assert emitted, "the stream produced nothing, so this run says nothing about the ledger"
+    assert [item["fingerprint"] for item in result["trials"]] == [item.fingerprint for item in emitted]
+    assert len(emitted) <= 20
+
+
+@pytest.mark.parametrize("search_mode", ["enumeration", "evolution"])
+def test_run_is_byte_identical_for_the_same_seed(search_mode):
+    """Two runs of one mode and one seed produce the same ledger, byte for byte.
+
+    Evolution draws its randomness from ``random.Random(seed)`` alone and its fitness is the
+    engine's own measurement, so the bred population, its trials and their order are all
+    reproducible. Comparing serialized records rather than fingerprints is what makes this
+    byte-identical: a reordered metric or a changed float would pass a fingerprint comparison.
+    """
+    first, _ = _run(*_fixture(), search_mode=search_mode, thresholds=_NO_DEDUPLICATION)
+    second, _ = _run(*_fixture(), search_mode=search_mode, thresholds=_NO_DEDUPLICATION)
+    assert first is not second, "a memoized second run would compare a record with itself"
+    assert json.dumps(first["trials"], sort_keys=True) == json.dumps(second["trials"], sort_keys=True)
+    assert len(first["trials"]) > 1, "a single repeated trial would satisfy any equality"
+
+
+def test_an_unknown_search_mode_is_refused_rather_than_enumerated():
+    """A mode the engine does not know is a caller's bug, not a request for the default.
+
+    Enumerating anyway would search the templates and label the run with the mode it was asked
+    for -- two records disagreeing about what ran, and a caller who cannot see the difference.
+    """
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        engine.run(user_id=1, code="PORTFOLIO = {}", config=_config(), search_mode="genetic")

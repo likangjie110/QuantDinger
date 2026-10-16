@@ -5,20 +5,25 @@ the Strategy V2 data path -- ``compile_strategy_v2`` for the manifest, ``resolve
 for the as-of universe, ``fetch_frames`` for the bars -- so mining never grows a second data
 layer with its own time semantics. Second the split: the requested range is cut into a search
 window and a frozen tail, and the tail is never fetched by the search; the out-of-sample review
-asks for it separately, once. Third the loop: every expanded candidate is scored through
+asks for it separately, once. Third the loop: every candidate the source produces -- the
+template expansion, or the stream evolution breeds from it -- is scored through
 ``FactorResearchEngine`` and walked down the graded gate ladder, and every one of them -- pass
 or reject -- leaves a trial behind, carrying only the metrics a gate reads: the candidate keeps
 the whole measurement, but the ledger has one row per evaluation and would otherwise grow the
-run's record with the budget. Fourth the review: the frozen tail is fetched once, scored
-by that same research engine over its own window, and judged by the sign and selection-bias
+run's record with the budget. Only what the source produces is a candidate at all: a draw
+evolution refused, or dropped as a repeat, is never scored and never written down. Fourth the
+review: the frozen tail is fetched once, scored by that same research engine over its own
+window, and judged by the sign and selection-bias
 gates, which are told the run's whole trial count because that count is what prices the search.
 
-Decisions that are invisible in the signatures. The fetch carries enough history *before* the
-search window for the candidates this run will actually evaluate -- the same template
-selection, budget and seed the search loop expands -- because the panel is evaluated over the
-fetched window and only then cut to the search window; budgeting the DSL's ceiling instead
-would cost several times the provider history and, where a policy caps it, silently shorten the
-window the run can search. The field panels are pinned to one shared index and column order
+Decisions that are invisible in the signatures. The fetch carries the DSL's whole lookback
+ceiling *before* the search window, because the source may be an evolved stream whose longest
+lookback is not knowable until it has been bred -- a crossover can graft a 252-bar window onto
+any path -- and the panel is evaluated over the fetched window and only then cut to the search
+window. The ceiling costs provider history on every run, and where a policy caps the range,
+shortens the window the run can search; expanding the templates first to measure them would
+buy that history back at the price of a warmup that is wrong for a candidate evolution has not
+produced yet. The field panels are pinned to one shared index and column order
 with a missing field kept as a NaN column, which is what the evaluator assumes when it aligns a
 candidate to ``fields["close"]``.
 
@@ -30,8 +35,9 @@ scored by the same engine that scores the built-in factors, which is why ``Facto
 failure is recorded, never raised: ``ExpressionError`` is not the only way an expression dies
 (a scalar ``const`` divides by zero, overflows ``float``, or reaches a panel operator that
 cannot take it), so the whole evaluation is guarded and the trial says which stage gave up.
-And the expanded seeds are read-only shared data -- the base expression of a template is the
-same object as its two smoothing variants' inner argument -- so nothing here writes into them.
+And the candidates are read-only shared data -- the base expression of a template is the
+same object as its two smoothing variants' inner argument, and a bred individual shares every
+subtree its parents did not rewrite -- so nothing here writes into one.
 
 The provider falls back to the real services so the search and freeze stages can construct it
 without arguments; tests inject fakes. Nothing here opens a connection, reads a clock, or
@@ -44,7 +50,7 @@ import hashlib
 import math
 import re
 import statistics
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta
 from typing import Any
@@ -54,8 +60,14 @@ import pandas as pd
 from app.data_sources.asia_stock_kline import normalize_chart_timeframe
 from app.services.backtest_execution import parse_rate
 from app.services.backtest_limits import backtest_warmup_calendar_days
-from app.services.factor_mining.dsl import MAX_LOOKBACK, PRICE_VOLUME_FIELDS, normalize_expression
+from app.services.factor_mining.dsl import (
+    MAX_LOOKBACK,
+    PRICE_VOLUME_FIELDS,
+    ExpressionError,
+    normalize_expression,
+)
 from app.services.factor_mining.evaluator import ExpressionEvaluator
+from app.services.factor_mining.evolution import evolve
 from app.services.factor_mining.gates import (
     GateThresholds,
     GateVerdict,
@@ -65,7 +77,12 @@ from app.services.factor_mining.gates import (
     screen_redundancy,
     screen_stability,
 )
-from app.services.factor_mining.templates import DEFAULT_BUDGET, MAX_BUDGET, expand_candidates
+from app.services.factor_mining.templates import (
+    DEFAULT_BUDGET,
+    MAX_BUDGET,
+    CandidateSeed,
+    expand_candidates,
+)
 from app.services.strategy_v2.contract import StrategyV2ContractError, compile_strategy_v2
 from app.services.strategy_v2.factor_research import FactorResearchEngine
 from app.services.strategy_v2.frequencies import periods_per_year
@@ -75,12 +92,24 @@ from app.services.strategy_v2.snapshot import canonical_frame_bytes
 
 
 MINIMUM_SYMBOLS = 3
-MINIMUM_WARMUP_BARS = 40
-WARMUP_MARGIN_BARS = 5
 DEFAULT_FREEZE_RATIO = 0.3
 DEFAULT_SEED = 42
 PROGRESS_EVERY = 10
 INVALID_EXPRESSION_REASON = "factorMining.reject.invalid"
+
+SEARCH_MODE_ENUMERATION = "enumeration"
+SEARCH_MODE_EVOLUTION = "evolution"
+_SEARCH_MODES = (SEARCH_MODE_ENUMERATION, SEARCH_MODE_EVOLUTION)
+
+# The evolution search's own settings. The run's payload does not carry them yet, so they are
+# the engine's defaults rather than a caller's choice.
+EVOLUTION_POPULATION = 32
+EVOLUTION_GENERATIONS = 20
+EVOLUTION_ELITE_RATIO = 0.25
+
+# What evolution ranks a generation by: a metric every evaluated individual already carries, so
+# the fitness callback never computes anything and the evolution module never reads data.
+FITNESS_METRIC = "icir"
 
 
 @dataclass(frozen=True)
@@ -239,7 +268,7 @@ class MiningDataProvider:
         """One window's panel, through the one data path both callers share.
 
         The window is the only thing that differs between the search panel and the frozen one.
-        The manifest, the as-of universe, the candidate-derived warmup, the range check and the
+        The manifest, the as-of universe, the DSL's warmup ceiling, the range check and the
         data fingerprint are applied identically -- and the universe is resolved over the whole
         requested range rather than the window, so both panels carry the same members and the
         same point-in-time membership. A second copy of this method would be a second time
@@ -254,7 +283,7 @@ class MiningDataProvider:
         )
         if len(candidates) < MINIMUM_SYMBOLS:
             raise ValueError("factorMining.universeTooSmall")
-        warmup_bars = _warmup_bars(config)
+        warmup_bars = _warmup_bars()
         fetch_start = _warmup_start(config.timeframe, start_date, warmup_bars)
         # The same range check the factor-research entry runs before fetching, against the
         # window this call actually loads.
@@ -290,12 +319,12 @@ class MiningDataProvider:
 
 
 class FactorMiningEngine:
-    """Expand the templates, score every candidate, keep the ledger.
+    """Expand the templates or breed from them, score every candidate, keep the ledger.
 
     Determinism is a contract, not a property: the same panel plus the same
-    ``(template_ids, budget, seed)`` produce the same trials and the same candidates in the
-    same order, because the template expansion is seeded, the gate ladder is pure, and nothing
-    here iterates a set.
+    ``(template_ids, budget, seed, search_mode)`` produce the same trials and the same candidates
+    in the same order, because the template expansion is seeded, the evolution stream draws from
+    ``random.Random(seed)`` alone, the gate ladder is pure, and nothing here iterates a set.
     """
 
     def __init__(
@@ -307,13 +336,33 @@ class FactorMiningEngine:
         self._data_provider = data_provider
         self._on_progress = on_progress
 
-    def run(self, *, user_id: int, code: str, config: MiningConfig) -> dict[str, Any]:
+    def run(
+        self,
+        *,
+        user_id: int,
+        code: str,
+        config: MiningConfig,
+        search_mode: str = SEARCH_MODE_ENUMERATION,
+    ) -> dict[str, Any]:
         """Search ``code``'s universe over ``config`` and return the run record.
 
-        ``candidates`` are the survivors of the ladder, in expansion order; ``trials`` are every
+        ``search_mode`` picks the candidate source, and the mode is the caller's because the
+        sources need different things from this method: enumeration expands the templates, while
+        evolution needs a ``fitness`` callback that only the engine can build -- it answers with
+        the measurement this run wrote for an individual, and the evolution module must not read
+        data or compute a metric itself. Both sources are an ``Iterable[CandidateSeed]`` and the
+        loop pulls one individual at a time, because evolution consults that callback while it
+        streams: draining the source first would leave every generation ranked on nothing.
+
+        ``candidates`` are the survivors of the ladder, in production order; ``trials`` are every
         candidate the run evaluated, rejected ones included, because that count is what the
-        deflated-Sharpe benchmark needs to price the search itself.
+        deflated-Sharpe benchmark needs to price the search itself. Only what the source produced
+        is in either: a draw evolution refused, or skipped as one the run already holds, spends
+        budget and leaves nothing behind, so the budget bounds the trial count from above without
+        sizing it.
         """
+        if search_mode not in _SEARCH_MODES:
+            raise ValueError("factorMining.invalidParameter")
         panel = self._data_provider.prepare(user_id=user_id, code=code, config=config)
         split = split_periods(config)
         # The provider owns the field panels: they are pinned to one shared index and column
@@ -321,18 +370,34 @@ class FactorMiningEngine:
         # ``fields["close"]``. Recomputing them here would silently paper over a provider that
         # handed out nothing.
         evaluator = ExpressionEvaluator(panel.fields)
-        seeds = expand_candidates(
-            template_ids=config.template_ids or None,
-            budget=config.budget,
-            seed=config.seed,
-        )
         members = _resolved_members(panel.members)
+        measured: dict[str, float] = {}
+
+        def fitness(expression: Mapping[str, Any]) -> float | None:
+            """What this run measured for ``expression``, or ``None`` if it measured nothing.
+
+            Evolution asks about a whole generation at once, including individuals this run was
+            seeded with and never evaluated: those are the standing stock rather than a new
+            hypothesis, and an answer of ``None`` keeps them out of the elite set instead of
+            ranking them as a zero the caller never measured. Anything the DSL refuses is
+            unrankable for the same reason.
+            """
+            try:
+                fingerprint = normalize_expression(expression).fingerprint
+            except ExpressionError:
+                return None
+            return measured.get(fingerprint)
+
+        source, total = _candidate_source(config, search_mode, fitness)
         trials: list[dict[str, Any]] = []
         candidates: list[dict[str, Any]] = []
-        for evaluated, seed in enumerate(seeds, start=1):
+        for evaluated, seed in enumerate(source, start=1):
             verdict, metrics = self._evaluate(
                 seed.expression, evaluator, config, split, panel, members,
             )
+            value = metrics.get(FITNESS_METRIC)
+            if isinstance(value, float) and math.isfinite(value):
+                measured[seed.fingerprint] = value
             trials.append({
                 "fingerprint": seed.fingerprint,
                 "stage": verdict.stage,
@@ -351,7 +416,7 @@ class FactorMiningEngine:
                     "metrics": metrics,
                     "outOfSample": {},
                 })
-            self._progress(evaluated, len(seeds))
+            self._progress(evaluated, total)
         return {
             "config": self._config_payload(config),
             "split": self._split_payload(split),
@@ -816,27 +881,53 @@ def _portfolio_manifest(code: str) -> StrategyManifest:
     return manifest
 
 
-def _warmup_bars(config: MiningConfig) -> int:
-    """Bars of history the panel must carry before the search window.
+def _candidate_source(
+    config: MiningConfig,
+    search_mode: str,
+    fitness: Callable[[dict], float | None],
+) -> tuple[Iterable[CandidateSeed], int]:
+    """The candidates this run evaluates, and the count its progress is reported against.
 
-    The number follows the candidates this run will actually evaluate -- the same template
-    selection, budget and seed the search loop expands -- rather than the DSL's ceiling. The
-    longest template path is 145 bars, and budgeting the ceiling's 504 would spend 3.5x the
-    provider history for it: on a 1095-day daily policy that is the difference between a
-    four-month and a one-year search window. The margin covers the bar-to-calendar conversion,
-    which can undershoot on intraday timeframes, and per-symbol gaps inside the warmup. The
-    floor and ceiling stay as guards for degenerate runs and for templates that grow.
+    Enumeration knows its own length. Evolution does not: its budget counts draws, and the draws
+    that yield nothing leave no trace, so its progress is reported against the budget -- the
+    number of draws it may not exceed -- rather than a length it cannot know. The templates are
+    the stream's first generation either way, which is what keeps an evolved run's candidates
+    recognisable as variations of the library's hypotheses.
     """
-    candidates = expand_candidates(
+    seeds = expand_candidates(
         template_ids=config.template_ids or None,
         budget=config.budget,
         seed=config.seed,
     )
-    longest = max(
-        (normalize_expression(candidate.expression).lookback for candidate in candidates),
-        default=MAX_LOOKBACK,
+    if search_mode != SEARCH_MODE_EVOLUTION:
+        return seeds, len(seeds)
+    return (
+        evolve(
+            seeds,
+            budget=config.budget,
+            seed=config.seed,
+            population=EVOLUTION_POPULATION,
+            generations=EVOLUTION_GENERATIONS,
+            elite_ratio=EVOLUTION_ELITE_RATIO,
+            fitness=fitness,
+        ),
+        config.budget,
     )
-    return max(MINIMUM_WARMUP_BARS, min(MAX_LOOKBACK, longest + WARMUP_MARGIN_BARS))
+
+
+def _warmup_bars() -> int:
+    """Bars of history the panel must carry before the search window: the DSL's ceiling.
+
+    Evolution cannot know its longest lookback before it has bred anything -- a crossover grafts
+    an arbitrary subtree onto an arbitrary path, and the window it brings is any window the DSL
+    accepts -- so the ceiling is the only bound that stays correct for both sources. Measuring
+    the expanded templates instead would be an under-fetch for every candidate that was not
+    expanded from a template, and the shortfall would be silent: the first bars of a window
+    simply would not exist. The panel is fetched once and every evaluation re-cuts it to the
+    search window, so what the extra history costs is provider history -- and, where a policy
+    caps the fetched range, a shorter search window than the run asked for.
+    """
+    return MAX_LOOKBACK
 
 
 def _warmup_start(frequency: str, search_start: datetime, warmup_bars: int) -> datetime:

@@ -17,7 +17,9 @@ from dataclasses import dataclass
 from typing import Any
 
 DSL_VERSION = 1
-MAX_DEPTH = 6
+# The depth bound is a validation policy, not part of what an expression means, so it is not
+# folded into the fingerprint: raising it must not re-key the stored ``expression_hash`` rows.
+MAX_DEPTH = 8
 MAX_NODES = 24
 WINDOW_MIN = 1
 WINDOW_MAX = 252

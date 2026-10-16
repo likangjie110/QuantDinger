@@ -3,11 +3,13 @@
 import pytest
 
 from app.services.factor_mining.dsl import (
+    MAX_DEPTH,
     MAX_LOOKBACK,
     MAX_NODES,
     ExpressionError,
     normalize_expression,
 )
+from app.services.factor_mining.templates import MAX_BUDGET, expand_candidates
 
 
 def test_normalize_produces_stable_fingerprint_regardless_of_key_order():
@@ -44,6 +46,44 @@ def test_normalize_rejects_depth_and_node_budget():
         deep = {"op": "neg", "args": [deep], "params": {}}
     with pytest.raises(ExpressionError, match="tooDeep"):
         normalize_expression(deep)
+
+
+def _chain(depth: int):
+    """A unary chain of exactly ``depth`` nodes: the root is level 1."""
+    node: dict | str = "close"
+    for _ in range(depth - 1):
+        node = {"op": "neg", "args": [node], "params": {}}
+    return node
+
+
+def test_max_depth_bound_accepts_eight_and_rejects_nine():
+    """The bound is a maximum, not an exclusive one: 8 levels validate and the 9th is ``tooDeep``.
+
+    The room exists for evolution: a crossover or a subtree replacement can add an operator to
+    any path, and a library whose deepest template reaches level 6 says nothing about level 8.
+    """
+    assert MAX_DEPTH == 8
+    accepted = normalize_expression(_chain(MAX_DEPTH))
+    assert accepted.depth == MAX_DEPTH
+    assert accepted.node_count == MAX_DEPTH
+    with pytest.raises(ExpressionError, match="tooDeep"):
+        normalize_expression(_chain(MAX_DEPTH + 1))
+
+
+def test_the_fingerprint_is_unchanged_by_the_raised_depth_bound():
+    """Raising the bound is a validation change: an expression that already had a hash keeps it.
+
+    ``qd_factor_candidates`` is keyed on the expression fingerprint, so a moved hash makes every
+    stored candidate look like a new expression and re-enter the library. The literal below is
+    the deepest candidate the template library expands -- the smoothed conditional filter --
+    recorded while the bound was still 6, and its depth must not have moved with the bound.
+    """
+    deepest = max(
+        expand_candidates(template_ids=["conditional_filter"], budget=MAX_BUDGET),
+        key=lambda seed: normalize_expression(seed.expression).depth,
+    )
+    assert normalize_expression(deepest.expression).depth == 6
+    assert deepest.fingerprint == "76b8dc092e6897833b1c52a3291d2bd4086d6fcb0944b47e16f59cb8922f2082"
 
 
 def test_normalize_rejects_node_count_over_budget():

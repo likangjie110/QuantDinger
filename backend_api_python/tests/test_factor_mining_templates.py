@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.services.factor_mining.dsl import normalize_expression
+from app.services.factor_mining.dsl import MAX_DEPTH, normalize_expression
 from app.services.factor_mining.templates import MAX_BUDGET, TEMPLATES, expand_candidates, template_catalog
 
 
@@ -90,3 +90,18 @@ def test_conditional_filter_keeps_a_panel_truth_branch_and_constant_fallback():
     # A scalar truth branch would reach DataFrame.where as the receiver and crash.
     assert truth_branch["op"] == "ts_pct_change"
     assert fallback == {"op": "const", "args": [], "params": {"value": 0}}
+
+
+def test_smoothed_template_seven_leaves_room_for_crossover():
+    """The deepest variant the library expands still sits two levels below the depth bound.
+
+    That room is what evolution needs: a crossover grafts a fresh depth-2 subtree onto a path,
+    and a candidate already at the bound would have every such graft refused. The bound is what
+    moved, not the template -- evening out the skeleton here would change ``expand_candidates``
+    output, and the enumeration is a contract the plan keeps byte for byte.
+    """
+    deepest = max(
+        normalize_expression(seed.expression).depth
+        for seed in expand_candidates(template_ids=["conditional_filter"], budget=MAX_BUDGET)
+    )
+    assert MAX_DEPTH - deepest >= 2
