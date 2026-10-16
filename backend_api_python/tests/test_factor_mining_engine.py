@@ -761,7 +761,7 @@ def test_pool_members_are_namespaced_and_their_skips_are_reported():
     )
 
 
-def test_the_search_compares_a_candidate_against_the_registry_factors():
+def test_the_candidate_is_compared_against_registry_factors():
     """A mined candidate is measured against registry factors, not only the six proxies.
 
     The set the engine assembled is what the study used: the names it reports participating are
