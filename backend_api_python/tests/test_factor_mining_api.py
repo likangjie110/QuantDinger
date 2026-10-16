@@ -14,6 +14,7 @@ import pytest
 from flask import Flask, g
 
 from app.routes import factor_mining as mining_routes
+from app.services.factor_mining import service as mining_service
 from app.services.factor_mining.engine import MiningConfig
 
 
@@ -182,8 +183,15 @@ def test_run_and_estimate_pass_the_search_mode_and_pool_settings(app, service):
 
 def test_run_field_whitelist_matches_the_config_it_feeds():
     """The whitelist is a hand-copied key set, so a field added to ``MiningConfig`` and forgotten
-    here would drop the caller's value silently: the job would search the default instead."""
+    here would drop the caller's value silently: the job would search the default instead.
+
+    The service keeps a second hand-copied whitelist of its own -- the keys a run config is echoed
+    back under -- and the two have to name the same fields or a key the route lets through
+    disappears from the receipt. Asserting them against each other pins that, so the pair can only
+    drift together, which the first assertion would catch.
+    """
     assert {_camel(field.name) for field in dataclasses.fields(MiningConfig)} == mining_routes._RUN_FIELDS
+    assert set(mining_routes._RUN_FIELDS) == set(mining_service._JOB_CONFIG_KEYS)
 
 
 def test_estimate_prices_the_search_and_drops_unknown_keys(app, service):

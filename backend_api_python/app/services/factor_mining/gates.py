@@ -32,7 +32,10 @@ from app.services.strategy_evolution.statistics import deflated_sharpe, sample_s
 
 @dataclass(frozen=True)
 class GateThresholds:
-    """The L2-L5 bars. A run may override any of them from its payload."""
+    """The L2-L5 bars, plus ``min_abs_rank_ic``, which L6's pool increment reads too.
+
+    A run may override any of them from its payload.
+    """
 
     min_coverage: float = 0.60
     min_ic_observations: int = 30

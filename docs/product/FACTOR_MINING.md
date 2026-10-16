@@ -296,9 +296,12 @@ policy caps the fetched range, that ceiling gets the evolved run **refused outri
 backtest range check raises before a bar is requested, and the job fails with
 `strategyV2.backtestRangeLimit` -- rather than searched over a shorter window.
 
-**Determinism and reproducibility.** The same panel plus the same `(templateIds, budget, seed)`
-produces the same trials and the same candidates in the same order: template expansion is seeded,
-the gate ladder is pure, and nothing iterates a set.
+**Determinism and reproducibility.** The same panel plus the same run config -- every field of the
+request, `searchMode` included -- produces the same trials and the same candidates in the same
+order. `(templateIds, budget, seed)` is only part of it: the mode decides which sources contribute
+candidates and how much history is fetched, and in evolution `population`, `generations` and
+`eliteRatio` decide what it breeds from. Template expansion is seeded, the evolution stream draws
+from `random.Random(seed)` alone, the gate ladder is pure, and nothing iterates a set.
 
 ## 7. HTTP surface
 

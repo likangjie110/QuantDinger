@@ -927,6 +927,13 @@ class FactorMiningEngine:
         split = split_periods(config)
         # The tail's own comparison set: the same rule as the search's, over the window this
         # panel covers, so a survivor's frozen measurement is priced like its in-sample one.
+        # Kept although no gate reads what it feeds: L5 takes ``rankIc`` and ``longShortCurve``,
+        # and the correlation study this widens is written into ``outOfSample`` for a reader
+        # rather than for a decision. Handing the review a bare ``ComparisonSet()`` would fall back
+        # to the six built-in proxies -- cheaper by one point-in-time panel rebuild and by the
+        # width of every survivor's block -- and would leave a stored block naming a comparison set
+        # the survivor was never measured against, which is the plausible-but-wrong shape this
+        # module refuses elsewhere. The rebuild is once per review, not once per survivor.
         comparison = self._data_provider.comparison_set(
             panel=panel, config=config, user_id=user_id,
             start_date=split.freeze_start, end_date=split.freeze_end,
