@@ -245,6 +245,15 @@ def _saturated_cohort():
     ]
 
 
+def _tiny_cohort():
+    """Small trees, where a rewrite's shortest way out is a leaf at the root."""
+    return [
+        _seed(_chain(2)),
+        _seed({"op": "abs", "args": ["volume"], "params": {}}),
+        _seed({"op": "neg", "args": ["open"], "params": {}}),
+    ]
+
+
 def _shorter_wins(expression):
     """A deterministic stand-in for the injected metric: the smaller tree scores higher."""
     return -float(normalize_expression(expression).node_count)
@@ -278,28 +287,83 @@ def test_evolution_respects_budget():
         assert row.template_id, "a child keeps the template of the lineage it grew out of"
         assert row.fingerprint == normalize_expression(row.expression).fingerprint
     # A smaller budget buys a prefix of a larger one, never a different search.
-    longer = _evolve(cohort, budget=31, seed=23, generations=1000)
+    longer = _evolve(cohort, budget=40, seed=23, generations=1000)
+    assert len(longer) > len(rows), "the larger budget bought nothing, so the prefix would prove nothing"
     assert longer[:len(rows)] == rows
 
 
 def test_rejected_children_are_counted_not_silently_dropped(monkeypatch):
     """A refused draw spends a unit of budget: the search pays for every attempt, not every child."""
-    attempts = []
+    draws = []
 
     def counted(operator):
         def spy(*arguments):
-            attempts.append(arguments[0])
-            return operator(*arguments)
+            child = operator(*arguments)
+            draws.append(child)
+            return child
         return spy
 
     for name in ("mutate", "crossover"):
         monkeypatch.setattr(evolution, name, counted(getattr(evolution, name)))
 
     rows = _evolve(_saturated_cohort(), budget=120, seed=29, population=6, generations=1000)
-    assert attempts, "the run drew nothing, so no refusal could be counted"
-    assert len(rows) < len(attempts), "nothing was refused, so this test proved nothing"
-    assert len(attempts) <= 120, "a refused draw was retried for free instead of spending the budget"
+    refused = [child for child in draws if child is None]
+    assert refused, "no draw was refused, so nothing about refusals was tested"
+    assert len(draws) <= 120, "a refused draw was retried for free instead of spending the budget"
     assert len(rows) < 120, "the run filled a quota of children, which is what refusals must prevent"
+
+
+def test_a_duplicate_expression_is_never_produced_twice(monkeypatch):
+    """One expression is one trial, so the caller is never handed the same candidate again.
+
+    The spy counts the rewrites that came back as a mapping, which is the only thing
+    deduplication decides on: each of those either reaches the caller or is dropped for
+    repeating an expression the run already has. Nothing else can stand between the two, so
+    the shortfall is the deduplication itself -- and it is budget the run still paid.
+    """
+    produced = []
+
+    def counted(operator):
+        def spy(*arguments):
+            child = operator(*arguments)
+            if isinstance(child, dict):
+                produced.append(child)
+            return child
+        return spy
+
+    for name in ("mutate", "crossover"):
+        monkeypatch.setattr(evolution, name, counted(getattr(evolution, name)))
+
+    rows = _evolve(_cohort(), budget=200, seed=41, generations=1000)
+    fingerprints = [row.fingerprint for row in rows]
+    assert fingerprints, "the run produced nothing, so it cannot have repeated anything"
+    assert len(set(fingerprints)) == len(fingerprints), "the stream handed out one expression twice"
+    assert len(produced) > len(rows), "no draw repeated an expression, so nothing was skipped"
+
+
+def test_a_bare_field_child_is_never_produced(monkeypatch):
+    """The DSL lets a leaf sit at the root; a candidate this pipeline passes on is a mapping.
+
+    The spy is what keeps this honest: it holds the rewrites that came back as a bare field
+    name, the exact answer that must not reach the caller.
+    """
+    drawn = []
+
+    def counted(operator):
+        def spy(*arguments):
+            child = operator(*arguments)
+            drawn.append(child)
+            return child
+        return spy
+
+    for name in ("mutate", "crossover"):
+        monkeypatch.setattr(evolution, name, counted(getattr(evolution, name)))
+
+    rows = _evolve(_tiny_cohort(), budget=120, seed=43, generations=1000)
+    assert any(isinstance(child, str) for child in drawn), (
+        "no rewrite ever returned a leaf, so the refusal was never exercised")
+    assert rows, "the run produced nothing"
+    assert all(isinstance(row.expression, dict) for row in rows), "a bare field name reached the caller"
 
 
 def test_elite_survives_across_generations():

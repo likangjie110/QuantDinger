@@ -118,12 +118,15 @@ def evolve(
     never be an elite, because a generation's elites are the head of a ranking and an
     unranked expression has no place in one, but it stays eligible to breed.
 
-    ``budget`` counts draws, not survivors. A refused draw -- an illegal rewrite, or one that
-    only re-spelled its parent -- yields nothing and still spends one unit, because a caller
-    pricing its own search has to account for the attempts it paid for and not only for the
-    children that came back. The stream ends when the budget is spent, when the generations
-    run out, or when a generation produces no legal child at all; the last one ends the search
-    rather than repeating a generation that has nothing to draw from.
+    ``budget`` counts draws, not survivors. A draw that comes back refused -- an illegal
+    rewrite, one that only re-spelled its parent, or one whose root is a bare field name --
+    yields nothing and still spends one unit, and so does a draw that reproduces an expression
+    the run already has: one expression is one trial, so a caller must not be handed the same
+    candidate twice, while asking for a quota of distinct children instead would spin once the
+    neighbourhood of a population is used up and would take the budget's job of ending the
+    search. The stream ends when the budget is spent, when the generations run out, or when a
+    generation produces no legal child at all; the last one ends the search rather than
+    repeating a generation that has nothing to draw from.
 
     Determinism is the whole point: the only source of randomness is ``seed``, every
     collection is ordered before it is walked, and the same
@@ -135,6 +138,10 @@ def evolve(
     rng = random.Random(seed)
     elite_slots = int(population * elite_ratio)
     members = list(seeds)
+    # Fingerprints this run carries: the ones it was seeded with and the ones it has already
+    # bred. Deduplication is a filter on what is yielded and nothing else -- a skipped draw
+    # spends budget like a refused one and never joins a generation.
+    known = {member.fingerprint for member in members}
     for _ in range(generations):
         if budget <= 0:
             return
@@ -144,8 +151,9 @@ def evolve(
         while len(children) < population - len(elites) and budget > 0:
             budget -= 1
             child = _child(scored, rng)
-            if child is None:
+            if child is None or child.fingerprint in known:
                 continue
+            known.add(child.fingerprint)
             children.append(child)
             yield child
         if not children:
@@ -190,7 +198,7 @@ def _child(
     scored: Sequence[tuple[float | None, CandidateSeed]],
     rng: random.Random,
 ) -> CandidateSeed | None:
-    """One draw against the budget: a new individual, or ``None`` if the operator refused it."""
+    """One draw against the budget: an individual, or ``None`` if nothing usable came back."""
     if rng.random() < _CROSSOVER_SHARE:
         left = _tournament(scored, rng)
         right = _tournament(scored, rng)
@@ -200,10 +208,12 @@ def _child(
         parent = _tournament(scored, rng)
         expression = mutate(parent.expression, rng)
         template_id = parent.template_id
-    if expression is None:
+    if not isinstance(expression, dict):
+        # A refused draw -- and a bare field name is refused with it. The DSL allows a leaf at
+        # the root, but every candidate this pipeline passes on is a mapping (the templates
+        # never build one), and a candidate that is sometimes a name and sometimes a mapping
+        # would push that difference onto everything downstream.
         return None
-    # The child may be a bare field: the DSL's leaves are field names, and a rewrite can put
-    # one at the root. It is a legal expression, and the evaluator reads it like any other.
     return CandidateSeed(
         expression=expression,
         fingerprint=normalize_expression(expression).fingerprint,
