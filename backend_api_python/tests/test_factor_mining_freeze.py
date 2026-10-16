@@ -22,14 +22,18 @@ probability.
 import math
 from datetime import timedelta
 
+import pandas as pd
 import pytest
 
 from app.services.backtest_limits import backtest_warmup_calendar_days
 from app.services.factor_mining import engine as engine_module
 from app.services.factor_mining.engine import (
+    ComparisonSet,
     FactorMiningEngine,
     MiningDataProvider,
     PeriodSplit,
+    PreparedPanel,
+    _field_panels,
     _warmup_bars,
     split_periods,
 )
@@ -42,12 +46,15 @@ from tests.test_factor_mining_data import (
     _config as _provider_config,
 )
 from tests.test_factor_mining_engine import (
+    _MOMENTUM_5,
     _FakeProvider,
     _config,
+    _evaluator,
     _frames_and_members,
     _fixture,
     _run,
     _seed_for,
+    _unrelated_panel,
 )
 
 _CODE = "PORTFOLIO = {}"
@@ -360,3 +367,275 @@ def test_prepare_freeze_refuses_a_split_that_overlaps_the_search(monkeypatch):
         MiningDataProvider(backtest_service=service).prepare_freeze(
             user_id=1, code=_SOURCE, config=config)
     assert service.fetch_calls == []
+
+
+# --- L6: what a survivor adds to the pool the run compared it against ----------------------
+
+# One pool member's comparison name, spelled the way ``_comparison_set`` spells it: the pool
+# namespace plus the first ``POOL_NAME_LENGTH`` characters of the member's fingerprint.
+_MEMBER = "pool:deadbeef"
+
+
+def _pool(panels, skipped=()):
+    """A comparison set holding a pool and nothing else: the half L6 measures against."""
+    return ComparisonSet(pool=tuple(panels), panels=dict(panels), skipped=tuple(skipped))
+
+
+def _search_panel(panel):
+    """One fixture's frames as a ``PreparedPanel``, the way ``_FakeProvider`` builds its own."""
+    frames, members = panel
+    return PreparedPanel(frames=frames, members=members, fields=_field_panels(frames),
+                         snapshot_id="b" * 64, frequency="1d", warnings=[])
+
+
+class _SplitProvider(_FakeProvider):
+    """A fake whose search panel and frozen tail are different frames.
+
+    ``_FakeProvider`` serves one panel for both calls, so it cannot show a review reading a
+    window the search never loaded, nor two reviews of one search that differ only in the tail.
+    The tail is an attribute rather than a constructor argument for the second of those: L6's
+    inputs are assembled by the search and live on the engine that ran it, so a test that moves
+    the tail between two reviews has to move it under that one engine.
+    """
+
+    def __init__(self, search, frozen=None):
+        super().__init__(*search)
+        self.frozen = _search_panel(frozen or search)
+
+    def prepare_freeze(self, *, user_id, code, config, search_mode=None):
+        self.search_modes.append(search_mode)
+        return self.frozen
+
+
+def _searched(panel, comparison):
+    """``(engine, provider, config)`` for an engine that has run over ``panel``.
+
+    Every L6 reading is taken from the search that produced the survivors, so a test has to run
+    one: the review alone holds no search window, and a review with no search behind it has
+    nothing to measure an increment on. The budget is one template because the count of
+    candidates a run evaluates is not what L6 reads.
+    """
+    config = _config(budget=1, seed=_SEED)
+    provider = _SplitProvider(panel)
+    provider.comparison = comparison
+    engine = FactorMiningEngine(data_provider=provider)
+    engine.run(user_id=1, code=_CODE, config=config)
+    return engine, provider, config
+
+
+def _review(engine, config, survivors):
+    return engine.review_frozen(
+        user_id=1, code=_CODE, config=config, survivors=survivors, trials_count=12)
+
+
+def _drifted(panel):
+    """Another shipment of the same data: every price row given a compounding per-symbol drift.
+
+    The frozen panel a review hands over has to *really* differ from the search panel for the
+    isolation test to mean anything, and a constant factor is not enough -- it leaves every ratio
+    inside the scaled block alone, so most of the window's forward returns would not move.
+    Compounding a different rate per symbol re-ranks the cross-sections, and the drift runs over
+    the whole panel rather than the frozen tail alone on purpose: a review that read the frozen
+    panel where it should have read the search window would otherwise still agree with itself on
+    the search-period stretch. It moves L5's reading, which is measured inside the frozen tail,
+    and it is invisible to every bar L6 is allowed to read.
+    """
+    frames, members = panel
+    drifted: dict[str, pd.DataFrame] = {}
+    for offset, key in enumerate(sorted(frames)):
+        frame = frames[key].copy()
+        rates = pd.Series([(1.0 + 0.01 * (offset + 1)) ** step for step in range(len(frame))],
+                          index=frame.index)
+        drifted[key] = frame.mul(rates, axis=0)
+    return drifted, members
+
+
+def test_a_frozen_survivor_carries_its_pool_increment():
+    """A survivor that clears L5 is then asked what it adds to the library the run compared to.
+
+    The member is a panel unrelated to the candidate, so taking it out leaves the candidate's own
+    reading standing: the increment is a measured clearance rather than a missing measurement.
+    The pool's size and the names that were really compared travel with it, and the verdict is
+    the three-state flag -- ``True`` here, which is the only state that says "adds information".
+    """
+    panel = _oscillating_fixture()
+    survivor = _survivors(panel=panel)[0]
+    engine, _provider, config = _searched(panel, _pool({_MEMBER: _unrelated_panel(panel[0])}))
+
+    reviewed = _review(engine, config, [survivor])
+
+    assert [item["status"] for item in reviewed] == ["frozen"]
+    increment = reviewed[0]["outOfSample"]["poolIncrement"]
+    assert increment["hasIncrementalValue"] is True
+    assert increment["reason"] == ""
+    assert increment["residualIc"] * increment["rawIc"] > 0, "the sign rule is what passed"
+    assert abs(increment["residualIc"]) >= increment["minAbsRankIc"]
+    # The increment's own grid and nothing wider: the search window of this fixture is 31
+    # cross-sections (200 bars, every fifth one, 70% of them searched) and five of them have no
+    # complete forward return yet. Reading the fetched panel instead of that grid would count the
+    # warmup and the rest of the tail as sessions the pool could not be measured on.
+    assert increment["usedCrossSections"] == 26
+    assert increment["skippedCrossSections"] == 5
+    assert increment["poolSize"] == 1 and increment["complete"] is True
+    assert increment["compared"] == [_MEMBER] and increment["skipped"] == []
+
+
+def test_a_candidate_without_increment_is_rejected_at_l6():
+    """A member that reproduces the candidate leaves nothing of it, and L6 retires it by its key.
+
+    The member is the survivor's own expression, so the orthogonalization removes the candidate
+    exactly: the residual's mean is zero to the last bit while the candidate's own rank IC is a
+    strong one, which is what makes this the residual's doing rather than a weak signal's. L5's
+    frozen measurement stays on the record -- L6 adds a verdict, it does not erase the one before
+    it -- and the reason is L6's own key, never an L5 or L4 one.
+    """
+    panel = _oscillating_fixture()
+    survivor = _survivors(panel=panel)[0]
+    member = _evaluator(panel[0], survivor["expression"])
+    engine, _provider, config = _searched(panel, _pool({_MEMBER: member}))
+
+    reviewed = _review(engine, config, [survivor])
+
+    assert [item["status"] for item in reviewed] == ["rejected"]
+    assert [item["reason"] for item in reviewed] == ["factorMining.reject.noIncrementalValue"]
+    out_of_sample = reviewed[0]["outOfSample"]
+    assert out_of_sample["icSeries"], "L5 measured this survivor before L6 retired it"
+    increment = out_of_sample["poolIncrement"]
+    assert increment["hasIncrementalValue"] is False
+    assert increment["residualIc"] == 0.0
+    assert abs(increment["rawIc"]) > 0.0, "a candidate with no signal of its own would prove nothing"
+
+
+def test_l6_runs_after_l5_and_never_reads_the_freeze_segment():
+    """The increment is a search-period judgment, asked only of a survivor L5 has cleared.
+
+    Two pins in one. Isolation: one search, two frozen panels that disagree everywhere, and L6
+    comes back byte for byte the same while L5's reading moves with the panel it was handed. The
+    increment is measured on the search window, which is the only panel the run left behind, and
+    the reading asserted non-empty below is what keeps the equality from being the trivial one of
+    two unmeasured candidates. Order: a survivor L5 refuses carries no increment at all -- not an
+    empty one, no key -- because the stage that asks whether the candidate is worth the pool is
+    only reached by the candidates the stage before it kept.
+    """
+    panel = _oscillating_fixture()
+    survivor = _survivors(panel=panel)[0]
+    engine, provider, config = _searched(panel, _pool({_MEMBER: _unrelated_panel(panel[0])}))
+
+    first = _review(engine, config, [survivor])
+    refused = _review(engine, _config(thresholds=_STRICT_OOS), [survivor])
+    provider.frozen = _search_panel(_drifted(panel))
+    second = _review(engine, config, [survivor])
+
+    assert [item["status"] for item in first] == ["frozen"] == [item["status"] for item in second]
+    assert first[0]["outOfSample"]["poolIncrement"]["hasIncrementalValue"] is True, \
+        "an unmeasured increment would satisfy the equality below without measuring anything"
+    assert first[0]["outOfSample"]["rankIc"] != second[0]["outOfSample"]["rankIc"], \
+        "the rewritten tail must move L5's reading for the equality below to mean anything"
+    assert first[0]["outOfSample"]["poolIncrement"] == second[0]["outOfSample"]["poolIncrement"]
+
+    assert [item["reason"] for item in refused] == ["factorMining.reject.weakOutOfSample"]
+    assert "poolIncrement" not in refused[0]["outOfSample"]
+
+
+def test_an_empty_pool_leaves_candidates_frozen():
+    """An empty library is a question that was never asked: nothing is measured, nothing is retired.
+
+    The increment is ``None`` here, not ``False``, and the two are not interchangeable: a review
+    branching on the flag's truthiness retires every candidate it never measured, under a reason
+    key that is not even a rejection. Nothing is measured, so nothing is retired -- and the reason
+    names the empty pool rather than one of the rejections.
+    """
+    panel = _oscillating_fixture()
+    survivor = _survivors(panel=panel)[0]
+    engine, _provider, config = _searched(panel, ComparisonSet())
+
+    reviewed = _review(engine, config, [survivor])
+
+    assert [item["status"] for item in reviewed] == ["frozen"]
+    assert [item["reason"] for item in reviewed] == [""]
+    increment = reviewed[0]["outOfSample"]["poolIncrement"]
+    assert increment["hasIncrementalValue"] is None
+    assert increment["residualIc"] is None and increment["rawIc"] is None
+    assert increment["reason"] == "factorMining.poolIncrement.noPool"
+    assert not increment["reason"].startswith("factorMining.reject.")
+    assert increment["poolSize"] == 0 and increment["compared"] == [] and increment["skipped"] == []
+
+
+def test_a_pool_the_run_could_only_partly_rebuild_says_so():
+    """A member nothing could be rebuilt for is a hole in the comparison, and the record shows it.
+
+    ``pool_panels`` hands such a member back as a skip, outside the panels the measurement reads
+    at all, so the reading below is taken against one member of a pool of two. A reader has to be
+    able to see that: the count next to the names is what tells a clearance of a pool of two that
+    was compared whole from one of a pool of two that was compared by half, and ``complete`` is
+    the same fact said outright instead of left to whoever counts the list.
+    """
+    panel = _oscillating_fixture()
+    survivor = _survivors(panel=panel)[0]
+    comparison = _pool(
+        {_MEMBER: _unrelated_panel(panel[0])},
+        skipped=({"fingerprint": "a" * 64, "reason": "factorMining.reject.invalid"},),
+    )
+    engine, _provider, config = _searched(panel, comparison)
+
+    reviewed = _review(engine, config, [survivor])
+
+    increment = reviewed[0]["outOfSample"]["poolIncrement"]
+    assert increment["poolSize"] == 2, "the pool the caller holds, not the part that rebuilt"
+    assert increment["compared"] == [_MEMBER]
+    assert increment["skipped"] == ["pool:aaaaaaaa"]
+    assert increment["complete"] is False
+    assert increment["hasIncrementalValue"] is True
+
+
+def test_a_pool_that_could_not_be_rebuilt_at_all_is_not_reported_as_an_empty_library():
+    """Every member unreadable is a library nothing could be read off, not a caller without one.
+
+    The whole pool travels as skips, so the measurement is handed an empty mapping and answers
+    with ``noPool`` -- the key that sends an operator looking for a library that is right there,
+    full, and unreadable. The size and the skipped names are what say which of the two facts this
+    is, and the reason is the other unmeasured key: the question was asked and could not be
+    answered, which is not a rejection either.
+    """
+    panel = _oscillating_fixture()
+    survivor = _survivors(panel=panel)[0]
+    comparison = ComparisonSet(skipped=tuple(
+        {"fingerprint": fingerprint * 64, "reason": "factorMining.reject.invalid"}
+        for fingerprint in "ab"
+    ))
+    engine, _provider, config = _searched(panel, comparison)
+
+    reviewed = _review(engine, config, [survivor])
+
+    assert [item["status"] for item in reviewed] == ["frozen"]
+    increment = reviewed[0]["outOfSample"]["poolIncrement"]
+    assert increment["poolSize"] == 2
+    assert increment["compared"] == []
+    assert increment["skipped"] == ["pool:aaaaaaaa", "pool:bbbbbbbb"]
+    assert increment["hasIncrementalValue"] is None
+    assert increment["reason"] == "factorMining.poolIncrement.unmeasured"
+    assert increment["reason"] != "factorMining.poolIncrement.noPool"
+
+
+def test_a_pool_nothing_can_be_measured_off_never_retires_a_candidate():
+    """A member that rebuilt and carries no values is a missing measurement, not a failed one.
+
+    The pool is there and was compared against, and no session of the search window could be read
+    off it, so the increment comes back unmeasured a second way -- with the member named, which is
+    what tells this apart from the empty library above. Only a measured ``False`` retires: the
+    candidate keeps the status L5 gave it.
+    """
+    panel = _oscillating_fixture()
+    survivor = _survivors(panel=panel)[0]
+    blank = _evaluator(panel[0], _MOMENTUM_5) * float("nan")
+    engine, _provider, config = _searched(panel, _pool({_MEMBER: blank}))
+
+    reviewed = _review(engine, config, [survivor])
+
+    assert [item["status"] for item in reviewed] == ["frozen"]
+    increment = reviewed[0]["outOfSample"]["poolIncrement"]
+    assert increment["poolSize"] == 1 and increment["compared"] == [_MEMBER]
+    assert increment["hasIncrementalValue"] is None
+    assert increment["residualIc"] is None
+    assert increment["reason"] == "factorMining.poolIncrement.unmeasured"
+    assert increment["usedCrossSections"] == 0 and increment["skippedCrossSections"] > 0

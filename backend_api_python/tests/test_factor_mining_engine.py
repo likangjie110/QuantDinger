@@ -970,6 +970,45 @@ def test_the_run_reports_the_names_it_compared_and_those_it_could_not():
     assert names == ["expression", "rsi", "pool:deadbeef"]
 
 
+def test_a_run_keeps_the_increment_inputs_of_its_own_search_window():
+    """L6's inputs are assembled by the search, out of the search window, out of the pool's half.
+
+    The increment is a search-period judgment -- what this candidate adds to the library the run
+    compared it against -- so the run assembles the evidence while it holds both: the search
+    panel's own field panels, the search window's research dates, and the returns over them. The
+    registry's factors are left out (they are the comparison L4 already made, not the library a
+    candidate is added to), and the frozen tail is not in the panel to begin with, because the
+    search's own fetch stops at ``search_end``. A member the comparison could not rebuild travels
+    as a skip, under the name L4 would have asked about it by.
+    """
+    frames, members = _fixture()
+    config = _config(budget=1)
+    split = split_periods(config)
+    provider = _FakeProvider(frames, members)
+    provider.comparison = ComparisonSet(
+        factors=("rsi",),
+        pool=("pool:deadbeef",),
+        panels={
+            "rsi": _evaluator(frames, _MOMENTUM_5),
+            "pool:deadbeef": _unrelated_panel(frames),
+        },
+        skipped=({"fingerprint": "f" * 64, "reason": "factorMining.reject.invalid"},),
+    )
+
+    engine = FactorMiningEngine(data_provider=provider)
+    engine.run(user_id=1, code="PORTFOLIO = {}", config=config)
+
+    evidence = engine._pool_increment
+    assert evidence is not None, "the run is what assembles L6's inputs; the review reads them"
+    assert set(evidence.members) == {"pool:deadbeef"}, "the registry's factors are not the library"
+    assert evidence.skipped == ("pool:ffffffff",)
+    assert evidence.fields is provider.panel.fields, "the candidates' own panels, not a copy"
+    # One grid for all three sides of the regression, inside the search window and nowhere else.
+    assert evidence.members["pool:deadbeef"].index.equals(evidence.returns.index)
+    assert evidence.returns.index.min() >= pd.Timestamp(split.search_start)
+    assert evidence.returns.index.max() <= pd.Timestamp(split.search_end)
+
+
 def test_an_empty_comparison_set_keeps_the_builtin_proxies():
     """Nothing assembled is not the same as comparing against nothing.
 

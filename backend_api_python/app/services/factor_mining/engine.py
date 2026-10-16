@@ -16,6 +16,11 @@ refused, or dropped as a repeat, is never scored and never written down. Fourth 
 review: the frozen tail is fetched once, scored by that same research engine over its own
 window, and judged by the sign and selection-bias
 gates, which are told the run's whole trial count because that count is what prices the search.
+Fifth the increment: a survivor that cleared the tail is asked, last of all, what it still
+predicts once the caller's own frozen library is taken out of it. That reading is the search
+window's -- the run assembles its panels while it holds them -- because an increment is a
+search-period judgment and the tail is the evidence that judges the candidate, not evidence for
+it.
 
 Decisions that are invisible in the signatures. The fetch carries enough history *before* the
 search window for the candidates the mode can know about, because the panel is evaluated over
@@ -78,6 +83,12 @@ from app.services.factor_mining.gates import (
     screen_out_of_sample,
     screen_redundancy,
     screen_stability,
+)
+from app.services.factor_mining.incremental import (
+    NO_POOL_REASON,
+    UNMEASURED_REASON,
+    PoolGain,
+    residual_ic,
 )
 from app.services.factor_mining.pool import (
     DEFAULT_POOL_LIMIT,
@@ -271,6 +282,41 @@ class ComparisonSet:
         }
 
 
+@dataclass(frozen=True)
+class PoolIncrementEvidence:
+    """L6's inputs: the search window one candidate's increment is measured on.
+
+    Assembled by the search, out of the panel and the comparison set it already holds, and read by
+    the review -- which is the other side of the split: the review's own panel is the frozen tail,
+    and a tail is not evidence for a search-period judgment. It carries the pool's half of the
+    comparison and not the registry's, because the question L6 asks is what the candidate adds to
+    the *caller's* library, and the frozen tail is not in this panel at all: the search's fetch
+    stops at ``search_end``.
+
+    ``members`` are the rebuilt pool members by comparison name (the mapping
+    :func:`~app.services.factor_mining.incremental.residual_ic` orthogonalizes against), and
+    ``skipped`` is what the pool could not rebuild -- members the measurement never sees, so the
+    review is the only place that knows the pool was bigger than what was compared.
+    """
+
+    fields: Mapping[str, pd.DataFrame]
+    returns: pd.DataFrame
+    members: Mapping[str, pd.DataFrame]
+    skipped: tuple[str, ...] = ()
+
+
+def _pool_name(fingerprint: Any) -> str:
+    """The comparison name a pool member's fingerprint travels under.
+
+    One spelling, because the name is how three places refer to the same member: the assembly that
+    builds its panel, the de-duplication gate that correlates against it, and the increment's
+    record that reports it as compared or as skipped. Two spellings would let a member be
+    measured under one name and reported under another, which reads as a member that was never
+    asked about.
+    """
+    return f"{POOL_NAMESPACE}{str(fingerprint or '')[:POOL_NAME_LENGTH]}"
+
+
 def _computable_factor_ids(frames: Mapping[str, pd.DataFrame]) -> list[str]:
     """The registry factor ids this panel can measure, in the registry's deterministic order.
 
@@ -372,7 +418,7 @@ def _comparison_set(
         # every insert writes that column, so this drops only a hand-edited row.
         if not member.fingerprint or member_panel is None:
             continue
-        name = f"{POOL_NAMESPACE}{member.fingerprint[:POOL_NAME_LENGTH]}"
+        name = _pool_name(member.fingerprint)
         pooled.append(name)
         panels[name] = member_panel
     return ComparisonSet(
@@ -381,6 +427,119 @@ def _comparison_set(
         panels=panels,
         skipped=tuple(skipped),
     )
+
+
+def _pool_increment_evidence(
+    *,
+    panel: PreparedPanel,
+    config: MiningConfig,
+    split: PeriodSplit,
+    comparison: ComparisonSet,
+) -> PoolIncrementEvidence:
+    """L6's inputs, cut from the search window the candidates of ``panel`` were scored on.
+
+    The window is ``split``'s search half, and the dates are the research engine's own
+    cross-sections (:meth:`FactorResearchEngine.research_window`) -- the grid the candidate's
+    in-sample IC was read on -- because the increment is a question about that measurement: does
+    this candidate still predict once the pool is taken out of it. The calendar year's other
+    panel, the tail ``split`` freezes, is not reachable from here: these frames stop at
+    ``search_end``. The panel's own warmup is excluded the same way every other reading excludes
+    it, by measuring on the window's dates rather than on the fetched index.
+
+    The returns are the research engine's forward return, spelled the way ``run`` spells it (entry
+    at the next bar's open, exit ``holding_period`` bars later) so the raw IC the increment is
+    compared against is read on the same side of the trade the candidate's own metrics were.
+    Restated rather than imported because it is one expression over a panel both callers hold,
+    and the module that owns it is the entry the candidate is scored through.
+
+    Only the pool's half of ``comparison`` travels: the registry's factors are the comparison L4
+    has already made, not the library a candidate is added to.
+    """
+    frames, dates = FactorResearchEngine.research_window(
+        frames=panel.frames,
+        start_date=split.search_start,
+        end_date=split.search_end,
+        holding_period=config.holding_period,
+    )
+    index = pd.Index(dates)
+    opening = panel.fields["open"]
+    returns = (
+        opening.shift(-(config.holding_period + 1)) / opening.shift(-1) - 1.0
+    ).reindex(index=index)
+    members = {
+        name: comparison.panels[name].reindex(index=index)
+        for name in comparison.pool
+        if name in comparison.panels
+    }
+    skipped = tuple(
+        _pool_name(item.get("fingerprint"))
+        for item in comparison.skipped
+        if item.get("fingerprint")
+    )
+    return PoolIncrementEvidence(
+        fields=panel.fields, returns=returns, members=members, skipped=skipped,
+    )
+
+
+# The two "nothing was measured" readings the review can reach on its own, spelled here rather
+# than built at the call site: neither is a verdict, both must carry the increment's own reason
+# keys rather than one of the rejections, and the third state of the flag is the whole reason
+# ``PoolGain`` has one.
+_NOT_COMPARED = PoolGain(
+    measured=False, has_incremental_value=None, residual_ic=None, raw_ic=None,
+    used_cross_sections=0, skipped_cross_sections=0, reason=NO_POOL_REASON,
+)
+_UNREADABLE_CANDIDATE = PoolGain(
+    measured=False, has_incremental_value=None, residual_ic=None, raw_ic=None,
+    used_cross_sections=0, skipped_cross_sections=0, reason=UNMEASURED_REASON,
+)
+
+
+def _pool_increment_record(
+    gain: PoolGain,
+    *,
+    compared: Sequence[str],
+    skipped: Sequence[str],
+    min_abs_rank_ic: float,
+) -> dict[str, Any]:
+    """One survivor's ``poolIncrement`` block: the reading, the pool behind it, and the verdict.
+
+    Both sizes are written down because they are not the same number. ``poolSize`` is the pool the
+    run's own cap and self-exclusion left, and ``compared`` is what a panel could be rebuilt for;
+    a member in ``skipped`` never reached the measurement at all, so a reading taken with one
+    missing is a reading of a truncated pool. ``complete`` says that outright instead of leaving it
+    to whoever counts a list against a number -- a clearance of a pool that was compared by half
+    can still be read, but not as if it were the whole library.
+
+    A truncated pool still judges, and that is a decision rather than an oversight: the alternative
+    is a stage that goes silent the moment one member's stored expression stops rebuilding, and a
+    ``False`` here is decided by members that were measured, not by the ones that were not. What
+    may not happen is the truncation going unmentioned, which is what the counts are for.
+
+    ``noPool`` -- "this caller has no library yet" -- is reported only when the pool itself was
+    empty. A pool that exists and could not be read (every member in ``skipped``, so the
+    measurement is handed an empty mapping) is ``unmeasured``: the two facts send an operator to
+    different places, and the size and the skipped names in the same block are what tell them
+    apart. ``minAbsRankIc`` is the run's own bar, restated like every other execution assumption
+    so a stored reading explains the verdict it produced.
+    """
+    pool_size = len(compared) + len(skipped)
+    reason = gain.reason
+    if gain.measured is False and not compared and pool_size:
+        reason = UNMEASURED_REASON
+    return {
+        "poolSize": pool_size,
+        "compared": list(compared),
+        "skipped": list(skipped),
+        "complete": not skipped,
+        "hasIncrementalValue": gain.has_incremental_value,
+        "reason": reason,
+        "residualIc": gain.residual_ic,
+        "rawIc": gain.raw_ic,
+        "usedCrossSections": gain.used_cross_sections,
+        "skippedCrossSections": gain.skipped_cross_sections,
+        "minAbsRankIc": min_abs_rank_ic,
+    }
 
 
 def split_periods(config: MiningConfig) -> PeriodSplit:
@@ -567,6 +726,12 @@ class FactorMiningEngine:
     search_mode)`` produce the same trials and the same candidates in the same order, because the
     template expansion is seeded, the evolution stream draws from ``random.Random(seed)`` alone,
     the gate ladder is pure, and nothing here iterates a set.
+
+    One instance serves one run's two halves: ``run`` assembles the search window's increment
+    evidence and ``review_frozen`` reads it, because the review is a later call that no longer
+    holds the search panel -- and re-fetching the search window to measure an increment would be
+    a second read of data the run already had. An engine that never searched reviews without it,
+    which is a review with nothing to measure an increment on rather than a wrong one.
     """
 
     def __init__(
@@ -577,6 +742,7 @@ class FactorMiningEngine:
     ) -> None:
         self._data_provider = data_provider
         self._on_progress = on_progress
+        self._pool_increment: PoolIncrementEvidence | None = None
 
     def run(
         self,
@@ -617,6 +783,12 @@ class FactorMiningEngine:
         comparison = self._data_provider.comparison_set(
             panel=panel, config=config, user_id=user_id,
             start_date=split.search_start, end_date=split.search_end,
+        )
+        # L6's inputs, assembled here because this is the last place both are held: the search
+        # panel, and the comparison set built over the window it covers. The review runs in a
+        # later call, on the frozen tail's panel, and has neither.
+        self._pool_increment = _pool_increment_evidence(
+            panel=panel, config=config, split=split, comparison=comparison,
         )
         # The provider owns the field panels: they are pinned to one shared index and column
         # order, which is what keeps a candidate's dates and symbols aligned with
@@ -706,6 +878,13 @@ class FactorMiningEngine:
         review that never reported would let a cancelled job keep writing candidates into its
         run and close it as a success, so the two records would disagree about one event.
 
+        A survivor that clears L5 is then asked L6's question -- what is left of it once the
+        caller's pool is taken out -- on the search window this engine's own ``run`` left behind.
+        The tail this method just fetched is deliberately not what that reads: the segment that
+        judges a candidate cannot also be the segment that prices its value to the pool. The
+        increment can only retire a candidate (``False``); an unmeasured one, or none at all
+        because no search was run here, leaves the frozen status L5 gave it.
+
         The mode is refused here by the same rule ``run`` applies, and before the no-survivors
         shortcut: both entries read one config, and a mode one of them refused cannot be one the
         other quietly reads as enumeration.
@@ -731,11 +910,74 @@ class FactorMiningEngine:
         reviewed: list[dict[str, Any]] = []
         for evaluated, survivor in enumerate(survivors, start=1):
             self._report({"stage": "review", "evaluated": evaluated, "total": len(survivors)})
-            reviewed.append(
-                self._review(survivor, evaluator, config, split, panel, members, trials_count,
-                             comparison)
-            )
+            record = self._review(survivor, evaluator, config, split, panel, members, trials_count,
+                                  comparison)
+            if record["status"] == "frozen":
+                record = self._increment(record, config)
+            reviewed.append(record)
         return reviewed
+
+    def _increment(self, record: dict[str, Any], config: MiningConfig) -> dict[str, Any]:
+        """L6 on one survivor L5 has cleared: what it adds to the caller's already-frozen pool.
+
+        The reading comes from ``self._pool_increment`` -- the search window's panels -- and not
+        from the tail's comparison set two methods up, which is the trap this stage exists beside:
+        a survivor's frozen measurement is judged on the tail, and pricing it there too would make
+        the segment that decides the outcome also decide the payoff. The panel that travels to the
+        measurement is this candidate's own, re-evaluated on the search window's fields, cut to
+        the grid the pool members and the returns were built on.
+
+        An unmeasured increment keeps the candidate, which is the opposite of what L4 does with a
+        pool section it can neither measure nor clear. The asymmetry is deliberate and is the one
+        thing about this stage worth stating twice: at L4 a candidate let through joins the pool
+        every later run compares against, and a duplicate there compounds; here a candidate let
+        through is one name that already cleared L2-L5, and a reader can retire it later on
+        evidence. So only a *measured* ``False`` -- read with ``is False``, never for its
+        truthiness, since ``None`` is "not measured" and not "no value" -- retires a candidate,
+        and the reason key it retires under is the increment's own.
+        """
+        evidence = self._pool_increment
+        if evidence is None:
+            # No search on this engine, so no search window to measure on: nothing was compared
+            # against, which is the empty pool's answer rather than a rejection or a clearance.
+            gain, compared, skipped = _NOT_COMPARED, (), ()
+        else:
+            gain = self._pool_gain(record["expression"], evidence, config)
+            compared, skipped = tuple(evidence.members), evidence.skipped
+        record["outOfSample"]["poolIncrement"] = _pool_increment_record(
+            gain,
+            compared=compared,
+            skipped=skipped,
+            min_abs_rank_ic=config.thresholds.min_abs_rank_ic,
+        )
+        if gain.has_incremental_value is False:
+            record["status"] = "rejected"
+            record["reason"] = gain.reason
+        return record
+
+    @staticmethod
+    def _pool_gain(
+        expression: Mapping[str, Any],
+        evidence: PoolIncrementEvidence,
+        config: MiningConfig,
+    ) -> PoolGain:
+        """The increment itself: the candidate's search-window panel against the pool's.
+
+        The whole body sits under one guard, for the reason every other evaluation in this module
+        does: an expression can die past the DSL on a value the operator layer refuses, and one
+        candidate that cannot be measured is a missing measurement -- ``None``, which retires
+        nobody -- rather than the end of a review that has already judged the candidates before it.
+        """
+        try:
+            panel = ExpressionEvaluator(evidence.fields).evaluate(expression)
+        except Exception:
+            return _UNREADABLE_CANDIDATE
+        return residual_ic(
+            panel.reindex(index=evidence.returns.index),
+            evidence.members,
+            evidence.returns,
+            min_abs_rank_ic=config.thresholds.min_abs_rank_ic,
+        )
 
     def _evaluate(
         self,
@@ -939,7 +1181,7 @@ class FactorMiningEngine:
             # does not carry it -- the assembly drops a row with no fingerprint for the same
             # reason it is dropped here: it has no name to be asked about under.
             skipped = [
-                f"{POOL_NAMESPACE}{str(item.get('fingerprint') or '')[:POOL_NAME_LENGTH]}"
+                _pool_name(item.get("fingerprint"))
                 for item in comparison.skipped if item.get("fingerprint")
             ]
             for name in (*comparison.names(), *skipped):
