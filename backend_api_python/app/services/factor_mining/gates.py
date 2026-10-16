@@ -1,10 +1,10 @@
 """Graded screening gates: one metrics mapping in, one verdict out.
 
 Four pure functions walk the L2-L5 ladder of the factor mining spec -- data quality and signal
-strength (L2), stability (L3), redundancy against the built-in factor pool (L4), and the frozen
-window out-of-sample review (L5). Each returns the first check a candidate fails, paired with a
-closed reason key, so every rejection stays explainable; the caller owns the ordering and the
-trial ledger.
+strength (L2), stability (L3), redundancy against the built-in factors and the caller's own pool
+(L4), and the frozen window out-of-sample review (L5). Each returns the first check a candidate
+fails, paired with a closed reason key, so every rejection stays explainable; the caller owns the
+ordering and the trial ledger.
 
 An unreadable metric is read as 0.0, which fails a minimum; an infinite reading is kept, so it fails
 exactly the gates where more of that quantity is worse. The two limits that punish excess -- turnover
@@ -40,7 +40,11 @@ class GateThresholds:
     min_icir: float = 0.30
     min_fold_consistency: float = 0.60
     max_turnover: float = 0.70
+    # One bar per L4 section. Both answer "does this candidate carry anything the comparison set
+    # does not already hold", so both default to the same number -- but a run may weigh its own
+    # library differently from the registry's factors, and the two overrides are read apart.
     max_builtin_correlation: float = 0.85
+    max_pool_correlation: float = 0.85
     min_oos_abs_rank_ic: float = 0.01
     min_deflated_sharpe_probability: float = 0.95
 
@@ -193,21 +197,47 @@ def screen_stability(metrics: Mapping[str, Any], thresholds: GateThresholds) -> 
     return _passed("L3")
 
 
+# The prefix a pooled candidate's name carries, so L4 can tell the caller's own library apart from
+# the registry's factor ids. It lives here, with the gate that reads it, and the engine imports it
+# from here: two literals spelling the same prefix could drift apart, and that drift is silent --
+# a pool member judged as a built-in, rejected under the wrong key.
+POOL_NAMESPACE = "pool:"
+
+
 def screen_redundancy(correlations: Mapping[str, float], thresholds: GateThresholds) -> GateVerdict:
-    """L4: reject when any built-in factor correlates at or above the bar, in either direction.
+    """L4: reject when any comparison factor correlates at or above its own section's bar.
+
+    Two sections, one question each. A name carrying :data:`POOL_NAMESPACE` is a member of the
+    caller's own pool and is measured against ``max_pool_correlation``; every other name is a
+    registry factor id and is measured against ``max_builtin_correlation``. Both readings are
+    magnitudes, so a mirrored twin is a duplicate too. The keys stay apart because the findings
+    are: duplicating a built-in and duplicating what the caller already mined send a reader to
+    different places. Built-ins are judged first, so a candidate that duplicates both is reported
+    as the built-in duplicate it also is.
 
     Only finite correlations count as evidence. A NaN pair is one the engine could not compare --
     the fundamental factors carry no data on a price-volume run -- and skipping it is not the same
-    as clearing the candidate. So when nothing finite was measured the gate cannot run at all, and
-    an unrun de-duplication check rejects rather than waves a candidate past the ladder's only
-    redundancy checkpoint.
+    as clearing the candidate. So the fail-closed rule covers the comparison as a whole: when
+    nothing finite was measured in either section the gate cannot run at all, and an unrun
+    de-duplication check rejects rather than waves a candidate past the ladder's only redundancy
+    checkpoint. A section that yielded nothing finite while the other did is not a rejection of
+    its own -- an empty pool, or one whose members could not be rebuilt, is a comparison that still
+    ran, and rejecting on it would fail every run made outside the pool.
     """
-    measured = [abs(value) for value in (_finite(value) for value in correlations.values())
-                if value is not None]
-    if not measured:
+    builtin: list[float] = []
+    pooled: list[float] = []
+    for name, value in correlations.items():
+        reading = _finite(value)
+        if reading is None:
+            continue
+        section = pooled if str(name).startswith(POOL_NAMESPACE) else builtin
+        section.append(abs(reading))
+    if not builtin and not pooled:
         return _failed("L4", "factorMining.reject.unverifiableRedundancy")
-    if max(measured) >= thresholds.max_builtin_correlation:
+    if builtin and max(builtin) >= thresholds.max_builtin_correlation:
         return _failed("L4", "factorMining.reject.duplicateBuiltin")
+    if pooled and max(pooled) >= thresholds.max_pool_correlation:
+        return _failed("L4", "factorMining.reject.duplicateInPool")
     return _passed("L4")
 
 

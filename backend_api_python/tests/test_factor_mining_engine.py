@@ -124,10 +124,11 @@ def _config(**overrides):
 # The fixture ranks the symbols identically for every candidate, so L4 is the gate that
 # decides this fixture's runs. A bar of 1.1 is above every possible correlation, so the
 # de-duplication gate can never fire and the run has a genuine end-to-end pass path; every
-# other gate is turned off for the same reason.
+# other gate is turned off for the same reason. Both L4 bars are raised: the fixture's pool
+# panels are the candidates' own twins, so a run that compares against one is a duplicate of it.
 _NO_DEDUPLICATION = GateThresholds(min_ic_observations=5, min_abs_rank_ic=0.0, min_icir=0.0,
                                    min_fold_consistency=0.0, max_turnover=1.0, min_coverage=0.0,
-                                   max_builtin_correlation=1.1)
+                                   max_builtin_correlation=1.1, max_pool_correlation=1.1)
 
 
 def _run(frames, members, **overrides):
@@ -759,6 +760,33 @@ def test_pool_members_are_namespaced_and_their_skips_are_reported():
     assert assembled.skipped == (
         {"fingerprint": "b" * 64, "reason": "factorMining.reject.invalid"},
     )
+
+
+def test_the_pool_section_follows_the_order_the_pool_loader_returned():
+    """The pool half keeps the loader's order; nothing here re-sorts or de-duplicates by name.
+
+    ``load_pool`` hands its members back newest first, and that order is what the cap keeps, so
+    it is the order the comparison set is built in. The study's correlation matrix follows the
+    name list it was handed, and L4 reads its columns by name: an assembly that sorted the pool
+    -- or dropped it through a set -- would move those columns between two runs over the same
+    pool, and a stored run's ``factorCorrelation`` would no longer line up with one taken again.
+    The fingerprints are picked so id-descending and fingerprint-ascending disagree, which is
+    what makes a ``sorted()`` visible here rather than a coincidence.
+    """
+    from app.services.factor_mining.pool import PoolMember
+
+    frames, members = _frames_and_members(periods=80)
+    pooled = [
+        PoolMember(candidate_id=9, fingerprint="f" * 64, expression=_POOL_MEMBER),
+        PoolMember(candidate_id=4, fingerprint="a" * 64, expression=_POOL_MEMBER),
+        PoolMember(candidate_id=2, fingerprint="b" * 64, expression=_POOL_MEMBER),
+    ]
+
+    assembled = _assembly(frames, members, pool_loader=_recording_pool(pooled, []),
+                          factor_limit=0, pool_limit=5)
+
+    assert assembled.pool == ("pool:ffffffff", "pool:aaaaaaaa", "pool:bbbbbbbb")
+    assert set(assembled.panels) == set(assembled.pool)
 
 
 def test_the_candidate_is_compared_against_registry_factors():

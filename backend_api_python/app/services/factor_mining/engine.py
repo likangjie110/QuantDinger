@@ -70,6 +70,7 @@ from app.services.factor_mining.dsl import (
 from app.services.factor_mining.evaluator import ExpressionEvaluator
 from app.services.factor_mining.evolution import evolve
 from app.services.factor_mining.gates import (
+    POOL_NAMESPACE,
     GateThresholds,
     GateVerdict,
     net_return_series,
@@ -115,13 +116,12 @@ INVALID_EXPRESSION_REASON = "factorMining.reject.invalid"
 DEFAULT_BUILTIN_COMPARISON_LIMIT = 61
 
 # A pooled candidate is namespaced, because a fingerprint is not a name a reader can tell apart
-# from a registry factor id, and the gate reading the two sections is going to treat them
-# differently.
+# from a registry factor id, and the gate reading the two sections treats them differently. The
+# prefix itself is ``gates.POOL_NAMESPACE``, defined beside that gate so the two cannot drift.
 # shortcut: two members whose fingerprints share an 8-character prefix would merge into one
 # comparison column, which the study's name de-duplication would then do silently. At the pool's
 # cap of 20 that is a one-in-45-million draw; widen the prefix if the cap ever grows past a few
 # hundred.
-POOL_NAMESPACE = "pool:"
 POOL_NAME_LENGTH = 8
 
 SEARCH_MODE_ENUMERATION = "enumeration"
