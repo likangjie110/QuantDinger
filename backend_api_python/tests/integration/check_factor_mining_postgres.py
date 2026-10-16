@@ -223,6 +223,40 @@ def main():
                       (candidate_id,)) is None, "a dead run_id was left behind"
         ok("candidate_outlives_its_run")
 
+        # L6's reading is stored as JSON inside the candidate's out_of_sample_json, and its
+        # ``complete`` flag and the two counts beside it have no consumer anywhere yet -- so
+        # nothing but a round trip keeps them from being dropped between ``upsert_candidates``
+        # and ``get_candidate``. A reader that cannot see "the pool was compared by half" reads
+        # half a comparison as a clearance, which is the one reading the measurement forbids.
+        pooled_run = run(1, budget=10)
+        increment = {
+            "poolSize": 3,
+            "compared": ["pool:11111111", "pool:22222222"],
+            "skipped": ["pool:33333333"],
+            "complete": False,
+            "hasIncrementalValue": None,
+            "reason": "factorMining.poolIncrement.unmeasured",
+            "residualIc": None,
+            "rawIc": None,
+            "usedCrossSections": 0,
+            "skippedCrossSections": 0,
+            "minAbsRankIc": 0.02,
+        }
+        # The column is only checked for a 64-character hex digest here, so the fingerprint of an
+        # expression is as good a well-formed value as any other.
+        pooled_hash = hashlib.sha256(b"ts_mean(close, 5)").hexdigest()
+        pooled = dict(entry[0])
+        pooled.update(
+            expression={"op": "ts_mean", "args": ["close"], "params": {"n": 5}},
+            fingerprint=pooled_hash, status="frozen", outOfSample={"poolIncrement": increment},
+        )
+        assert repository.upsert_candidates(user_id=1, run_id=pooled_run, candidates=[pooled]) == 1
+        pooled_id = scalar("SELECT id FROM qd_factor_candidates WHERE expression_hash = %s",
+                           (pooled_hash,))
+        stored = repository.get_candidate(pooled_id, user_id=1)["outOfSample"]["poolIncrement"]
+        assert stored == increment, f"the pool increment did not round-trip: {stored}"
+        ok("pool_increment_round_trips")
+
         print(json.dumps({"passed": passed, "count": len(passed)}))
         return 0
     finally:

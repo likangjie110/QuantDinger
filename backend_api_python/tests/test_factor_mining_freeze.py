@@ -20,7 +20,7 @@ probability.
 """
 
 import math
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pandas as pd
 import pytest
@@ -38,6 +38,7 @@ from app.services.factor_mining.engine import (
     split_periods,
 )
 from app.services.factor_mining.gates import GateThresholds, GateVerdict, net_return_series
+from app.services.factor_mining.pool import PoolMember
 from app.services.factor_mining.templates import expand_candidates
 from app.utils import agent_jobs
 from tests.test_factor_mining_data import (
@@ -722,6 +723,106 @@ def test_a_holding_period_that_cannot_go_forward_is_clamped_like_the_research_en
 
     assert first["hasIncrementalValue"] is True, "a reading, so the equality below is not vacuous"
     assert first == second
+
+
+# The pool member the provider-path test loads. Its name is the ``pool:<fingerprint[:8]>`` the
+# engine builds from a stored row's hash, so the reading's ``compared`` list is this.
+_POOL_MEMBER_HASH = "deadbeef" + "0" * 56
+_POOL_MEMBER = "pool:deadbeef"
+
+
+class _OverReturningSource(_FakeBacktestService):
+    """A source that keeps sending bars past the end it was asked for -- or one that stops there.
+
+    ``_FakeBacktestService`` builds its index from ``[start_date, end_date]``, so it cannot show
+    this shape at all: a real source is not obliged to stop at the end it was asked for (the loader
+    hands back the range it has closed), and ``MiningDataProvider`` passes on whatever it is given
+    -- ``_prepare_window`` does not clip. Everything that keeps those bars out of the increment
+    therefore lives below the provider, in the search window's prepared frames, and a panel a test
+    trimmed itself (the engine tests) never travels that path. ``clip`` is the only difference
+    between the two runs, so the readings are comparable by construction.
+    """
+
+    def __init__(self, frames, *, clip: bool):
+        super().__init__()
+        self.frames = frames
+        self.clip = clip
+
+    def resolve_candidates(self, *, user_id, manifest, start_date, end_date):
+        return ([{"key": key, "market": "USStock", "symbol": key.split(":", 1)[1],
+                  "effectiveFrom": None} for key in sorted(self.frames)], 42)
+
+    def fetch_frames(self, candidates, frequency, start_date, end_date):
+        self.fetch_calls.append((frequency, start_date, end_date))
+        frames = {}
+        for key, frame in self.frames.items():
+            index = frame.index
+            window = (index >= start_date) & (index <= end_date) if self.clip else index >= start_date
+            frames[key] = frame.loc[window]
+        return frames, []
+
+
+def _review_through_the_provider(frames, *, clip):
+    """One reviewed survivor, with the search panel built by the real provider.
+
+    The pool is injected into the provider rather than handed to the engine as a
+    ``ComparisonSet``, because travelling the production path is the point: ``prepare`` builds the
+    panel from what the source sent, ``comparison_set`` rebuilds the stored member against those
+    very field panels, and the review's L6 reads them. The member is a real factor shape over the
+    fixture's own columns and it explains the candidate only partly, so the reading below is a
+    measurement rather than the pool reproducing the candidate exactly; everything but the
+    de-duplication bars keeps the fixture's default thresholds, and both L4 bars are raised so the
+    run has a genuine pass path into L6 (``_NO_DEDUPLICATION``'s rule, on the other side of the
+    provider).
+    """
+    provider = MiningDataProvider(
+        backtest_service=_OverReturningSource(frames, clip=clip),
+        pool_loader=lambda *_args, **_kwargs: [
+            PoolMember(candidate_id=1, fingerprint=_POOL_MEMBER_HASH,
+                       expression={"op": "div", "args": ["close", "volume"], "params": {}}),
+        ],
+    )
+    config = _provider_config(
+        start_date=datetime(2024, 1, 1), end_date=datetime(2024, 9, 30), budget=1, seed=_SEED,
+        thresholds=GateThresholds(
+            min_coverage=0.0, min_ic_observations=5, min_abs_rank_ic=0.0, min_icir=0.0,
+            min_fold_consistency=0.0, max_turnover=1.0, max_builtin_correlation=1.1,
+            max_pool_correlation=1.1, min_oos_abs_rank_ic=0.0,
+            min_deflated_sharpe_probability=0.0,
+        ),
+    )
+    engine = FactorMiningEngine(data_provider=provider)
+    result = engine.run(user_id=1, code=_SOURCE, config=config)
+    survivors = _survivor_records(result["trials"], expand_candidates(budget=1, seed=_SEED))
+    return engine.review_frozen(user_id=1, code=_SOURCE, config=config, survivors=survivors,
+                                trials_count=len(result["trials"]))[0]
+
+
+def test_a_source_that_over_returns_cannot_move_the_increment():
+    """The trim that keeps the frozen tail out of L6 has to hold at the provider's own seam.
+
+    The engine tests hand L6 a panel they trimmed themselves, which pins the *contract*. In
+    production the bars arrive through ``MiningDataProvider``, which does not trim what a source
+    sent, so the panel carries the tail even though every caller asked for the search window
+    alone -- the defensive layer worth pinning on its own. One run's source stops at the end it
+    was asked for, the other's keeps going into the fixture's frozen tail, and the two increments
+    have to be the same block: same residual IC, same counts, same verdict. Delete the trim the
+    increment reads its frames through and only the second run moves.
+    """
+    frames, _members = _oscillating_fixture()
+
+    stopped = _review_through_the_provider(frames, clip=True)
+    carried_on = _review_through_the_provider(frames, clip=False)
+
+    assert stopped["outOfSample"]["icSeries"], "L5 measured this candidate, so L6 ran"
+    stopped_increment = stopped["outOfSample"]["poolIncrement"]
+    carried_on_increment = carried_on["outOfSample"]["poolIncrement"]
+    assert stopped_increment["compared"] == [_POOL_MEMBER], \
+        "the pool member really was measured, not skipped"
+    assert stopped_increment["complete"] is True and stopped_increment["usedCrossSections"] > 0
+    assert stopped_increment["hasIncrementalValue"] is True, \
+        "a reading, so the equality below is not vacuous"
+    assert carried_on_increment == stopped_increment
 
 
 def test_an_increment_that_cannot_be_measured_never_ends_the_review(monkeypatch):
