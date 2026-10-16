@@ -228,6 +228,8 @@ def test_the_field_set_of_a_market_is_its_groups_in_order():
     assert "funding_rate" in fields_for("Crypto")
     assert fields_for("USStock") == PRICE_VOLUME_FIELDS
     assert fields_for("") == PRICE_VOLUME_FIELDS
+    assert fields_for("crypto") == PRICE_VOLUME_FIELDS, \
+        "market keys are matched exactly, never folded -- the fallback refuses rather than admits"
 
 
 def test_a_derivatives_field_is_accepted_when_the_market_allows_it():

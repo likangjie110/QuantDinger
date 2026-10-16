@@ -82,11 +82,15 @@ _CLIP_PARAMS = ("lo", "hi")
 def fields_for(market: str) -> tuple[str, ...]:
     """The fields a candidate in ``market`` may name, in group order.
 
-    An unknown or empty market falls back to the price-volume group alone, which is the
-    conservative direction: a field no source can fill is refused at L1 rather than measured as a
-    column of nothing. That the panel may still be missing a column for an allowed field is a
-    separate question -- a symbol with no derivative data keeps a NaN column (``_field_panels``),
-    and the coverage gate decides what the gap means.
+    ``market`` is matched exactly as the run spells it (``"Crypto"``, ``"USStock"``), the way the
+    rest of the repository compares market keys. There is no case folding and no alias resolution,
+    so ``"crypto"`` silently gets the price-volume group alone -- a fallback in the refusing
+    direction, and the reason a misspelled market loses fields rather than admitting them.
+
+    An unknown or empty market takes the same fallback: a field no source can fill is refused at L1
+    rather than measured as a column of nothing. That the panel may still be missing a column for an
+    allowed field is a separate question -- a symbol with no derivative data keeps a NaN column
+    (``_field_panels``), and the coverage gate decides what the gap means.
     """
     groups = ("price_volume", "derivatives") if market in _DERIVATIVES_MARKETS else ("price_volume",)
     return tuple(field for group in groups for field in FIELD_GROUPS[group])
