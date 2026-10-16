@@ -1185,32 +1185,47 @@ class FactorMiningEngine:
         Read out of the correlation study the research engine already ran, which puts the
         selected factor first and every factor it could compare after it. The names are the
         comparison set's own, so a pooled member arrives carrying ``POOL_NAMESPACE`` and the gate
-        below partitions on that prefix. A name the study could not measure is absent from the
-        study, and ``comparison`` is where it is recovered: every name that was *asked about* is
-        put in the mapping, an unmeasured one as a NaN -- including the pool members that could
-        not be rebuilt at all, which the assembly reports as skips rather than comparison names
-        and which travel here under the name the member would have had. That presence is the
-        whole point -- the gate tells "never asked about" from "asked about and unmeasurable" by
-        the name being there, and fails closed on the second. A zero invented here would instead
-        read as a measurement that cleared a duplicate, and dropping the name would read as a pool
-        that never held it. A caller passing no ``comparison`` (a unit test of this method, or the
-        proxies the study falls back to) gets exactly what the study reported.
+        below partitions on that prefix. A name the study could not measure reaches here in one of
+        two shapes: absent from the study, and recovered from ``comparison``, which puts every name
+        that was *asked about* in the mapping, an unmeasured one as a NaN -- including the pool
+        members that could not be rebuilt at all, which the assembly reports as skips rather than
+        comparison names and which travel here under the name the member would have had; or present
+        with the study's own ``0.0`` placeholder and no pairs behind it, read as a NaN below from
+        the count the study writes beside each cell. That presence is the whole point -- the gate
+        tells "never asked about" from "asked about and unmeasurable" by the name being there, and
+        fails closed on the second. A zero invented here would instead read as a measurement that
+        cleared a duplicate, and dropping the name would read as a pool that never held it. A
+        caller passing no ``comparison`` (a unit test of this method, or the proxies the study
+        falls back to) gets what the study reported.
 
         The selected factor is named ``"expression"``, and the guard against reading the row
         below it as the candidate's own is deliberate: the study only lists a factor it could
         compare, so the candidate's row can be missing while the matrix still holds comparison
         factors. Trimming the names list by position would then measure the candidate against
         another factor's correlations -- one factor short, and silently.
+
+        A name the study kept but could not *pair* on any cross-section is the state the counts
+        read below exist for. The study reports it as a ``0.0`` placeholder beside a zero
+        observation count -- "not measured" spelled as a number, because a ragged matrix is a
+        shape every reader would have to reconcile -- and a name whose values sit on symbols the
+        run never holds stays in the name list while pairing on nothing. Read as a reading, that
+        zero clears the candidate as a duplicate-free measurement nobody took. The count tells the
+        two apart: a real zero correlation was paired on, and a cell is reported at all only once
+        three names paired, so a zero count is the absence the placeholder means and not a value.
         """
         block = metrics.get("factorCorrelation") or {}
         names = list(block.get("factors") or ())
         matrix = list(block.get("matrix") or ())
         if not names or not matrix or names[0] != "expression":
             return {}
-        measured = {
-            name: value
-            for name, value in zip(names[1:], matrix[0][1:])
-        }
+        observations = list(block.get("observations") or ())
+        counts = list(observations[0][1:]) if observations else ()
+        measured: dict[str, float] = {}
+        for index, (name, value) in enumerate(zip(names[1:], matrix[0][1:])):
+            # A block without the count -- a hand-built mapping, or a caller of this method on
+            # its own -- has nothing to read a placeholder by, so it keeps what it reported.
+            count = counts[index] if index < len(counts) else None
+            measured[name] = float("nan") if count == 0 else value
         if comparison is not None:
             # A member the pool could not rebuild is a skip, not a comparison name, so ``names()``
             # does not carry it -- the assembly drops a row with no fingerprint for the same
@@ -1222,6 +1237,7 @@ class FactorMiningEngine:
             for name in (*comparison.names(), *skipped):
                 measured.setdefault(name, float("nan"))
         return measured
+
     def _progress(self, evaluated: int, total: int) -> None:
         """Report every ``PROGRESS_EVERY``th candidate, so a long run is not a black box."""
         if evaluated % PROGRESS_EVERY == 0:

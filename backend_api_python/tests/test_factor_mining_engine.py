@@ -886,6 +886,38 @@ def test_a_pool_member_that_could_not_be_measured_rejects_the_candidate():
     assert result["trials"][0]["reason"] == "factorMining.reject.unverifiableRedundancy"
 
 
+def test_a_pool_member_with_no_correlatable_cross_section_rejects_the_candidate():
+    """A member the study could name but never *pair* is not a clearance either.
+
+    The member's panel is not empty -- it holds a full column of values, so the study's
+    observation filter keeps its name and reports it as measured -- but every one of its cells
+    sits on a symbol outside the run's universe, so no cross-section reaches the three paired
+    names a correlation needs. The study writes what it has to write there: a ``0.0`` placeholder
+    with a zero observation count, "not measured" spelled as a number. Read as a reading, that
+    placeholder clears the candidate -- exactly the plausible-but-wrong zero the per-section
+    fail-closed rule exists to stop, reached by a name that never left the mapping. The built-in
+    half measured cleanly, so the rejection can only come from the pool's own section.
+    """
+    frames, members = _fixture()
+    # One real panel's worth of rows and dates, carried under a symbol the universe does not hold.
+    unrelated = _unrelated_panel(frames)
+    orphan = unrelated[[unrelated.columns[0]]].rename(columns={unrelated.columns[0]: "ZZ"})
+    assert list(orphan.columns) == ["ZZ"] and orphan.notna().to_numpy().sum() >= 3
+    provider = _FakeProvider(frames, members)
+    provider.comparison = ComparisonSet(
+        factors=("rsi",),
+        pool=("pool:deadbeef",),
+        panels={"rsi": unrelated, "pool:deadbeef": orphan},
+    )
+
+    result = FactorMiningEngine(data_provider=provider).run(
+        user_id=1, code="PORTFOLIO = {}", config=_config(),
+    )
+
+    assert result["trials"][0]["stage"] == "L4"
+    assert result["trials"][0]["reason"] == "factorMining.reject.unverifiableRedundancy"
+
+
 def test_the_candidate_is_compared_against_registry_factors():
     """A mined candidate is measured against registry factors, not only the six proxies.
 
