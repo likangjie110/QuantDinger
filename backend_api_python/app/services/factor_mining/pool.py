@@ -34,6 +34,11 @@ FROZEN = "frozen"
 # evaluation of its own per member to every candidate the search scores.
 DEFAULT_POOL_LIMIT = 20
 
+# The key the engine already answers for a candidate it could not evaluate. Restated rather than
+# imported: the engine will import this module once the pool feeds its correlations, so a member
+# the pool cannot measure belongs in the same ledger column without a cycle.
+INVALID_EXPRESSION_REASON = "factorMining.reject.invalid"
+
 
 @dataclass(frozen=True)
 class PoolMember:
@@ -101,20 +106,31 @@ def load_pool(
 def pool_panels(
     entries: Sequence[PoolMember],
     field_panels: Mapping[str, pd.DataFrame],
-) -> dict[str, pd.DataFrame]:
-    """Fingerprint -> rebuilt factor panel, for every member that could be evaluated.
+) -> tuple[dict[str, pd.DataFrame], list[dict[str, str]]]:
+    """``(fingerprint -> rebuilt panel, the members no panel could be built for)``.
 
     ``field_panels`` is the caller's own field mapping -- the one the engine scores candidates
     with -- so a member is aligned to the same dates, symbols, and field semantics as the
-    candidate it is compared against. A member whose stored expression no longer evaluates is left
-    out rather than raised: one unreadable old row must not end the caller's evaluation.
+    candidate it is compared against.
+
+    A member whose stored expression no longer evaluates (an operator set that moved on, a row
+    whose JSON did not parse) is handed back in ``skipped`` with its fingerprint, rather than
+    dropped without a word: a caller that cannot tell "this member is unrelated to the candidate"
+    from "this member was never measured" reads the second as clearance. **Skipping is not a
+    pass** -- a skipped member is a missing measurement, and the gate reading the pool has to
+    answer with its own fail-closed rule, exactly as it would for a candidate nothing could be
+    measured on.
     """
     evaluator = ExpressionEvaluator(field_panels)
     panels: dict[str, pd.DataFrame] = {}
+    skipped: list[dict[str, str]] = []
     for member in entries:
         try:
             panels[member.fingerprint] = evaluator.evaluate(member.expression)
         except Exception:
-            # Dropped, exactly as the search drops a candidate it cannot score.
-            continue
-    return panels
+            # Same contract as the search's own guard: an unreadable candidate is not fatal.
+            skipped.append({
+                "fingerprint": member.fingerprint,
+                "reason": INVALID_EXPRESSION_REASON,
+            })
+    return panels, skipped

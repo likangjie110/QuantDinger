@@ -171,9 +171,10 @@ def test_pool_panels_are_rebuilt_from_the_stored_expression(monkeypatch):
     _library(monkeypatch, [_row(11, MOMENTUM)])
 
     members = pool.load_pool(USER_ID, MARKET, TIMEFRAME)
-    panels = pool.pool_panels(members, fields)
+    panels, skipped = pool.pool_panels(members, fields)
 
     assert list(panels) == [_hash(MOMENTUM)]
+    assert skipped == []
     pd.testing.assert_frame_equal(panels[_hash(MOMENTUM)], fields["close"].pct_change(20, fill_method=None))
     # The 20-bar warmup stays NaN rather than producing a shorter, differently dated panel.
     assert panels[_hash(MOMENTUM)].iloc[:20].isna().all().all()
@@ -224,11 +225,14 @@ def test_pool_caps_the_number_of_members(monkeypatch):
     assert [m.candidate_id for m in pool.load_pool(USER_ID, MARKET, TIMEFRAME, limit=9)] == [5, 4, 3, 2, 1]
 
 
-def test_pool_panels_skip_a_member_whose_stored_expression_no_longer_evaluates(monkeypatch):
-    """A member that cannot be scored is left out of the comparison set, not fatal.
+def test_pool_panels_report_a_member_whose_stored_expression_no_longer_evaluates(monkeypatch):
+    """A member that cannot be scored is reported as skipped, never silently dropped.
 
     The library outlives the code that wrote it: an expression the DSL no longer accepts, or a row
-    whose JSON does not parse, costs the evaluation that member and nothing more.
+    whose JSON does not parse, cannot be turned into a panel. Dropping one without a word would
+    leave a caller unable to tell "this member is unrelated to the candidate" from "this member was
+    never measured" -- and the gates that read the pool have to treat the second as a missing
+    measurement, not as clearance.
     """
     fields = _field_panels(_frames())
     _library(monkeypatch, [
@@ -239,9 +243,12 @@ def test_pool_panels_skip_a_member_whose_stored_expression_no_longer_evaluates(m
         {**_row(14, LAG), "expression_json": "{not json"},
     ])
 
-    panels = pool.pool_panels(pool.load_pool(USER_ID, MARKET, TIMEFRAME), fields)
+    panels, skipped = pool.pool_panels(pool.load_pool(USER_ID, MARKET, TIMEFRAME), fields)
 
     assert sorted(panels) == sorted([_hash(MOMENTUM), _hash(VOLUME_MEAN)])
+    # Newest member first, the pool's own order, both identities named.
+    assert [item["fingerprint"] for item in skipped] == [_hash(LAG), "e" * 64]
+    assert {item["reason"] for item in skipped} == {"factorMining.reject.invalid"}
     pd.testing.assert_frame_equal(panels[_hash(VOLUME_MEAN)], ExpressionEvaluator(fields).evaluate(VOLUME_MEAN))
 
 
@@ -268,4 +275,4 @@ def test_an_empty_library_reads_as_an_empty_pool(monkeypatch):
     members = pool.load_pool(USER_ID, MARKET, TIMEFRAME)
 
     assert members == []
-    assert pool.pool_panels(members, _field_panels(_frames())) == {}
+    assert pool.pool_panels(members, _field_panels(_frames())) == ({}, [])
