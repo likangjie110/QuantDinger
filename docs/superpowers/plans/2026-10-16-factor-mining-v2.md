@@ -38,7 +38,7 @@
 5. **协同价值评估读到冻结段**：用冻结段数据评估「加进池子后有无增量」→ 冻结段隔离被击穿，样本外证据失效。钉住：任务 8 `test_pool_gain_is_measured_without_the_freeze_segment`。
 6. **跨市场字段口径不可靠却照跑**：字段存在但按错误时点对齐（用了结算后才可知的费率）→ 看似有信号，实为未来数据。钉住：任务 12 `test_funding_field_is_aligned_to_the_bar_it_was_known_at`。
 7. **新字段被静默拒绝**：`dsl.normalize_expression` 的 `allowed_fields` 默认值是 5 个价量字段，现有 5 个调用点全部依赖默认值——只改白名单常量而不把字段集一路传下去，新字段会在 L1 以 `unknownField` 被拒且看不出原因。钉住：任务 10 `test_a_derivatives_field_is_accepted_after_the_field_set_is_threaded_through`。
-8. **非周末交易市场的日历口径**：`pd.bdate_range` 对 Crypto 把冻结段切成约 21% 的日历日而非 30% 的交易日 → 样本外窗口被系统性缩短。钉住：任务 12 `test_session_calendar_follows_the_markets_trading_days`。
+8. **非周末交易市场的日历口径**：Crypto 的搜索/冻结边界落在市场不交易的那一天上，session 计数用的是该市场不交易的日历。**修复的真实效果是「口径正确 + 边界正确」**（1 年窗口边界差 1 天、15 天窗口跨度占比差 6.7 个百分点），**不是**「样本外窗口被系统性缩短」——按任何自洽口径量，升级前的尾段跨度也是 ≈30%（1 年 111/366 = 30.33%），且旧实现尾段反而**多** 1~2 根 bar，真正被压缩的是**搜索段**。钉住：任务 12 `test_session_calendar_follows_the_markets_trading_days`。
 9. **L4 把「没测到」当成「没问题」**：池段被问过、却因成员表达式损坏 / 面板全 NaN / 观测不足而一条相关度都没测出来时，候选带着 L4 通过并进库 —— 正是本功能要防的那类重复。钉住：任务 7 `test_a_pool_segment_that_was_asked_but_measured_nothing_is_refused`（另有一条 `test_an_empty_pool_is_not_a_reason_to_refuse` 守着「不误杀空池」）。
 
 ---
@@ -663,12 +663,12 @@ git commit -m "docs: 同步因子挖掘 v2 的字段、阶梯、契约与键清�
 
 ## 手工验收（需要真实数据源与 DB，不在单测范围）
 
-1. 枚举模式跑一次 USStock 日线作业，候选列表与顺序 **与升级前逐字节相同**（确定性未被破坏）。
+1. **日历未变的市场**（如 USStock）枚举模式跑一次日线作业，候选列表与顺序 **与升级前逐字节相同**（确定性未被破坏）。**Crypto 不适用**：`split_periods` 改了它的 `search_end`，搜索窗口长度随之变化，门槛读数与**通过集合**都可能移动；Crypto 上不变的是候选的**展开**列表与顺序（`expand_candidates` 不接收 split），按第 6 条验边界。
 2. 进化模式跑同一配置，`qd_factor_trials` 行数 = **初代模板候选数 + 进化产出数**（R10 之后初代也入台账，因此**大于 `budget`**；实测 budget=200 → 262 行 / 189 candidates），`origin` 列同时出现 `"template"` 与 `"evolution"`。
 3. 同 seed 重跑进化作业，`trials` 序列逐字节相同。
 4. 已有 `frozen` 候选的 `expression_hash` 在升级前后不变（查库比对）。
 5. 池非空时新候选的 `poolIncrement` 有残差 IC 与池规模；池为空时不淘汰任何候选。
-6. Crypto 配置下冻结段占比为约 30% 的 **交易日**（升级前约 21% 的日历日）。
+6. Crypto 配置下的**日历边界**：① 冻结段起点必须是市场自己日历上的下一格（1 年窗口 `2024-09-13`；Q1 窗口 `2024-03-04`；修复前分别给 `2024-09-12` / `2024-03-02`）；② `freeze_start = search_end + 1 天`，两段不重叠；③ 占比按市场自己的会话计 ≈30%——**此条修复前后都成立，不作为判据**（原计划的「21% → 30%」是错的，见审查重点 8）。
 
 ---
 
