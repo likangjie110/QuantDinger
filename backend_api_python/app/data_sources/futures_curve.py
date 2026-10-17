@@ -7,14 +7,14 @@ is what lets a point-in-time reader align a close with the bar on which it becam
 
 Requests that fail -- transport, HTTP status, venue error or undocumented payload -- answer an
 empty series or ``None`` rather than raising; no caller substitutes another venue's number. Only
-``Crypto`` and the underlyings in :data:`_UNDERLYINGS` exist here, and curve assembly itself lands
-in a later change.
+``Crypto`` and the underlyings in :data:`_UNDERLYINGS` exist here.
 """
 
 from __future__ import annotations
 
 import calendar
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 
 import pandas as pd
 import requests
@@ -130,11 +130,85 @@ def _daily_closes(name: str, start: datetime, end: datetime) -> pd.Series:
     return series[(series.index >= start_ts) & (series.index <= end_ts)]
 
 
+_ROLL_DAYS = 7  # the main contract is the nearest monthly with at least this many days to expiry
+_CURVE_FIELDS = ("term_structure", "roll_cost")
+
+
+@lru_cache(maxsize=32)
+def _curve(underlying: str, start: datetime, end: datetime, *,
+           instrument=_instrument, daily_closes=_daily_closes) -> pd.DataFrame:
+    """Point-in-time term structure and roll cost of one underlying's monthly futures.
+
+    The grid is the union of the contracts' close instants inside ``[start, end]``; each such
+    instant is when a close became known, so a value at ``t`` never reads a later one. A contract
+    joins the universe only between its creation and expiry, and its last known close is carried
+    forward between candle instants. A point that needs a missing leg is NaN -- a single
+    contract's price is never presented as a spread.
+
+    The main contract is the nearest eligible one with at least ``_ROLL_DAYS`` days to expiry and
+    the far leg is the next eligible contract after it. ``term_structure`` annualizes the far /
+    main spread over the expiries' calendar-day gap; ``roll_cost`` keeps it un-annualized.
+
+    The cache is deliberate: ``market_fields`` asks for both fields of one window, and one fetch
+    of the venue should answer both. Its key includes the injected functions, so a test stand-in
+    never reuses a live answer.
+    """
+    start_ts, end_ts = _utc_naive(start), _utc_naive(end)
+    listed = []
+    for name, _expiry in _monthly_expiries(underlying, start_ts, end_ts):
+        meta = instrument(name)
+        if meta is not None:
+            listed.append((meta["expiration"], name, meta["creation"]))
+    listed.sort()
+
+    series = {name: daily_closes(name, start, end) for _expiration, name, _creation in listed}
+    grid = pd.DatetimeIndex([])
+    for closes in series.values():
+        grid = grid.union(closes.index)
+    grid = grid[(grid >= start_ts) & (grid <= end_ts)]
+
+    legs = [(expiration, creation, series[name].reindex(grid, method="ffill"))
+            for expiration, name, creation in listed]
+
+    term_structure: list[float] = []
+    roll_cost: list[float] = []
+    for t in grid:
+        eligible = [leg for leg in legs if leg[1] <= t < leg[0]]
+        main_at = next((i for i, leg in enumerate(eligible)
+                        if leg[0] - t >= _ROLL_DAYS * _DAY), None)
+        term = roll = float("nan")
+        if main_at is not None and main_at + 1 < len(eligible):
+            main_expiry, _main_creation, main_closes = eligible[main_at]
+            far_expiry, _far_creation, far_closes = eligible[main_at + 1]
+            main_price, far_price = main_closes.get(t), far_closes.get(t)
+            days = (far_expiry - main_expiry).days
+            if days > 0 and pd.notna(main_price) and pd.notna(far_price):
+                roll = far_price / main_price - 1.0
+                term = roll * 365.0 / days
+        term_structure.append(term)
+        roll_cost.append(roll)
+
+    return pd.DataFrame(
+        {"term_structure": term_structure, "roll_cost": roll_cost},
+        index=grid,
+        dtype="float64",
+    )
+
+
+def _curve_field(market: str, symbol: str, field: str, *, start: datetime, end: datetime) -> pd.Series:
+    """One curve field for one member symbol; empty for an unsupported market or underlying."""
+    underlying = _underlying(symbol) if market in _MARKETS else None
+    if underlying is None:
+        return _empty_series()
+    curve = _curve(underlying, start, end)
+    return curve[field] if not curve.empty else _empty_series()
+
+
 def fetch_term_structure(market: str, symbol: str, *, start: datetime, end: datetime) -> pd.Series:
-    """Curve values for one underlying; assembled in a later change, empty for now."""
-    return _empty_series()
+    """Annualized spread between the main and the next eligible monthly contract, point in time."""
+    return _curve_field(market, symbol, "term_structure", start=start, end=end)
 
 
 def fetch_roll_cost(market: str, symbol: str, *, start: datetime, end: datetime) -> pd.Series:
-    """Roll cost for one underlying; assembled in a later change, empty for now."""
-    return _empty_series()
+    """Un-annualized spread between the main and the next eligible monthly contract, point in time."""
+    return _curve_field(market, symbol, "roll_cost", start=start, end=end)

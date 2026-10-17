@@ -92,3 +92,70 @@ def test_underlying_parses_btc_and_eth_and_refuses_everything_else():
     assert futures_curve._underlying("Crypto:BTC/USDT@swap") == "BTC"
     assert futures_curve._underlying("Crypto:ETH/USDT") == "ETH"
     assert futures_curve._underlying("Crypto:SOL/USDT@swap") is None
+
+
+_SEP = pd.Timestamp("2026-09-25 08:00")
+_OCT = pd.Timestamp("2026-10-30 08:00")
+_NOV = pd.Timestamp("2026-11-27 08:00")
+_DEC = pd.Timestamp("2026-12-25 08:00")
+
+
+def _meta(created="2026-06-01 08:00", expires=_SEP):
+    return {"creation": pd.Timestamp(created), "expiration": pd.Timestamp(expires)}
+
+
+def test_the_universe_excludes_a_contract_created_after_the_bar():
+    meta = {"BTC-25SEP26": _meta(created="2026-09-02 08:00", expires=_SEP)}
+    closes = {"BTC-25SEP26": pd.Series([100.0], index=pd.DatetimeIndex(["2026-09-01 08:00"]))}
+    curve = futures_curve._curve(
+        "BTC", datetime(2026, 9, 1), datetime(2026, 9, 3),
+        instrument=lambda name: meta.get(name),
+        daily_closes=lambda name, start, end: closes.get(name, pd.Series(dtype="float64")))
+    assert curve.empty or curve["roll_cost"].isna().all()
+
+def test_term_structure_annualizes_between_the_two_main_contracts():
+    meta = {"BTC-25SEP26": _meta(expires=_SEP), "BTC-25DEC26": _meta(expires=_DEC)}
+    index = pd.DatetimeIndex(["2026-08-03 08:00"])
+    closes = {"BTC-25SEP26": pd.Series([100.0], index=index),
+              "BTC-25DEC26": pd.Series([103.0], index=index)}
+    curve = futures_curve._curve(
+        "BTC", datetime(2026, 8, 1), datetime(2026, 10, 31),
+        instrument=lambda name: meta.get(name),
+        daily_closes=lambda name, start, end: closes.get(name, pd.Series(dtype="float64")))
+    row = curve.loc[pd.Timestamp("2026-08-03 08:00")]
+    assert row["term_structure"] == pytest.approx((103.0 / 100.0 - 1.0) * 365 / 91)
+    assert row["roll_cost"] == pytest.approx(0.03)
+
+def test_the_main_contract_rolls_seven_days_before_expiry():
+    meta = {"BTC-25SEP26": _meta(expires=_SEP), "BTC-30OCT26": _meta(expires=_OCT),
+            "BTC-27NOV26": _meta(expires=_NOV)}
+    index = pd.DatetimeIndex(["2026-09-17 08:00", "2026-09-18 08:00", "2026-09-19 08:00"])
+    closes = {
+        "BTC-25SEP26": pd.Series([100.0, 100.0, 100.0], index=index),
+        "BTC-30OCT26": pd.Series([102.0, 102.0, 102.0], index=index),
+        "BTC-27NOV26": pd.Series([104.0, 104.0, 104.0], index=index),
+    }
+    curve = futures_curve._curve(
+        "BTC", datetime(2026, 9, 1), datetime(2026, 9, 30),
+        instrument=lambda name: meta.get(name),
+        daily_closes=lambda name, start, end: closes.get(name, pd.Series(dtype="float64")))
+    assert curve.loc[pd.Timestamp("2026-09-17 08:00"), "roll_cost"] == pytest.approx(0.02)
+    assert curve.loc[pd.Timestamp("2026-09-18 08:00"), "roll_cost"] == pytest.approx(0.02)
+    # 6 days to expiry: the main is OCT, the far is NOV
+    assert curve.loc[pd.Timestamp("2026-09-19 08:00"), "roll_cost"] == pytest.approx(104.0 / 102.0 - 1.0)
+
+def test_no_far_contract_gives_nan_not_a_one_contract_curve():
+    meta = {"BTC-25SEP26": _meta(expires=_SEP)}
+    closes = {"BTC-25SEP26": pd.Series([100.0], index=pd.DatetimeIndex(["2026-08-03 08:00"]))}
+    curve = futures_curve._curve(
+        "BTC", datetime(2026, 8, 1), datetime(2026, 8, 5),
+        instrument=lambda name: meta.get(name),
+        daily_closes=lambda name, start, end: closes.get(name, pd.Series(dtype="float64")))
+    assert curve["term_structure"].isna().all()
+    assert curve["roll_cost"].isna().all()
+
+def test_the_curve_index_is_the_close_known_instant():
+    series = futures_curve._daily_closes("BTC-25DEC26", datetime(2026, 8, 1), datetime(2026, 10, 2))
+    assert all(stamp.hour == 8 for stamp in series.index)
+    # The first raw tick is 2026-07-31 08:00; its close is known at 2026-08-01 08:00.
+    assert series.index[0] == pd.Timestamp("2026-08-01 08:00")
