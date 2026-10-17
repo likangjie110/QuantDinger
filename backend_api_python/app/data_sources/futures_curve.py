@@ -131,7 +131,6 @@ def _daily_closes(name: str, start: datetime, end: datetime) -> pd.Series:
 
 
 _ROLL_DAYS = 7  # the main contract is the nearest monthly with at least this many days to expiry
-_CURVE_FIELDS = ("term_structure", "roll_cost")
 
 
 @lru_cache(maxsize=32)
@@ -182,7 +181,7 @@ def _curve(underlying: str, start: datetime, end: datetime, *,
             far_expiry, _far_creation, far_closes = eligible[main_at + 1]
             main_price, far_price = main_closes.get(t), far_closes.get(t)
             days = (far_expiry - main_expiry).days
-            if days > 0 and pd.notna(main_price) and pd.notna(far_price):
+            if days > 0 and pd.notna(main_price) and pd.notna(far_price) and main_price != 0:
                 roll = far_price / main_price - 1.0
                 term = roll * 365.0 / days
         term_structure.append(term)

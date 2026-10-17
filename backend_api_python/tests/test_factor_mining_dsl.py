@@ -264,6 +264,7 @@ def test_the_fingerprint_does_not_depend_on_the_field_set():
 
 def test_crypto_field_set_includes_the_delivery_curve_fields():
     fields = fields_for("Crypto")
+    assert len(fields) == 9
     assert "term_structure" in fields
     assert "roll_cost" in fields
     assert fields_for("USStock") == PRICE_VOLUME_FIELDS

@@ -172,3 +172,31 @@ def test_a_non_crypto_market_returns_an_empty_series_without_touching_the_venue(
         empty = fetch("USStock", "USStock:AAPL",
                       start=datetime(2026, 8, 1), end=datetime(2026, 10, 1))
         assert empty.empty
+
+
+def test_the_recorded_curve_pairs_sep_with_dec_and_turns_nan_at_the_roll():
+    meta = {
+        "BTC-25SEP26": {"creation": pd.Timestamp("2025-09-26 08:00:21"),
+                        "expiration": pd.Timestamp("2026-09-25 08:00")},
+        "BTC-25DEC26": {"creation": pd.Timestamp("2025-12-26 08:00"),
+                        "expiration": pd.Timestamp("2026-12-25 08:00")},
+    }
+    curve = futures_curve._curve(
+        "BTC", datetime(2026, 8, 1), datetime(2026, 10, 2),
+        instrument=lambda name: meta.get(name),
+        daily_closes=futures_curve._daily_closes)
+    row = curve.loc[pd.Timestamp("2026-08-03 08:00")]
+    assert pd.notna(row["term_structure"]) and pd.notna(row["roll_cost"])
+    # Six days to expiry: SEP leaves the main leg, and DEC has no farther contract to pair with.
+    assert pd.isna(curve.loc[pd.Timestamp("2026-09-19 08:00"), "term_structure"])
+    assert pd.isna(curve.loc[pd.Timestamp("2026-09-19 08:00"), "roll_cost"])
+
+
+def test_an_identical_injected_request_is_served_from_the_cache():
+    futures_curve._curve.cache_clear()
+    instrument = lambda name: None
+    daily_closes = lambda name, start, end: pd.Series(dtype="float64")
+    start, end = datetime(2026, 8, 1), datetime(2026, 10, 2)
+    futures_curve._curve("BTC", start, end, instrument=instrument, daily_closes=daily_closes)
+    futures_curve._curve("BTC", start, end, instrument=instrument, daily_closes=daily_closes)
+    assert futures_curve._curve.cache_info().hits == 1

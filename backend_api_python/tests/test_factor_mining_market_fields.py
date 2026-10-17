@@ -1,9 +1,9 @@
 """Market-field assembly tests: the derivative columns, their point-in-time alignment, the run's
 own session calendar, and the data fingerprint that covers them.
 
-Every data source is faked -- the bars come from a fake Strategy V2 service, and the two
-derivative entry points are monkeypatched into ``market_fields`` -- so nothing here opens a
-socket or a database connection. What is *not* faked is the rest of the path: the real provider
+Every data source is faked -- the bars come from a fake Strategy V2 service, and the derivative
+entry points are monkeypatched into ``market_fields`` -- so nothing here opens a socket or a
+database connection. What is *not* faked is the rest of the path: the real provider
 assembles the panel and the real gate ladder scores the candidate, which is what makes the L2
 coverage pin below worth anything. A field set that admits a derivative leaf and a panel that
 can only partly fill it are two halves of one run, and only the engine sees both.
@@ -41,7 +41,7 @@ from tests.test_factor_mining_engine import (
 )
 
 
-# --- fixtures: a perpetual universe, its bars, and the two sources it reads -------------------
+# --- fixtures: a perpetual universe, its bars, and the derivative sources it reads -------------
 
 # Two key shapes, both of them real: ``@binance:swap`` names a venue and a product, ``@swap``
 # names the product alone -- the spelling this repository builds when a member records no

@@ -97,7 +97,13 @@ and the far leg is the next one; `term_structure` annualizes the far/main spread
 calendar-day gap, and `roll_cost` is the same spread un-annualized. Only BTC and ETH have these
 contracts, so every other `Crypto` symbol keeps a NaN column. Both legs are Deribit contracts, so
 currency differences mostly cancel, but a member may quote on another venue (a USDT perpetual, for
-example), which makes this a cross-venue rather than a strict same-venue spread.
+example), which makes this a cross-venue rather than a strict same-venue spread. Written out,
+`term_structure = (far / main - 1) * 365 / d`, where `d` is the calendar-day gap between the two
+expiries, and `roll_cost = far / main - 1` is not annualized; a contract joins the pool only
+between its listing and expiry. Because only BTC and ETH members carry these fields, a candidate
+that depends on either one passes L2's coverage gate only when BTC/ETH members fill at least the
+gate's share of the active universe (0.60 by default); `min_coverage` can be overridden by the
+run's parameters.
 
 `GET /catalog` serves this list for a market: `?market=Crypto` returns the two groups' nine fields,
 and no `market` (or one this build does not know) returns the five price-volume fields.

@@ -23,8 +23,8 @@ trades. A market that trades every calendar day is counted in calendar days; eve
 supported market trades on weekdays and has no holiday calendar at this layer, so it is counted
 in business days, which is what the whole repository counted before this module existed.
 
-Nothing here reaches a database, and the two sources are imported rather than wired so a test
-can stand in for them; the provider calls :func:`enrich_frames` and :func:`sessions` and owns
+Nothing here reaches a database, and the derivative sources are imported rather than wired so a
+test can stand in for them; the provider calls :func:`enrich_frames` and :func:`sessions` and owns
 both decisions' windows.
 """
 
