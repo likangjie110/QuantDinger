@@ -87,3 +87,8 @@ def test_a_failed_request_returns_an_empty_series(monkeypatch):
     monkeypatch.setattr(futures_curve.requests, "get", fail)
     empty = futures_curve._daily_closes("BTC-25DEC26", datetime(2026, 8, 1), datetime(2026, 10, 2))
     assert empty.empty
+
+def test_underlying_parses_btc_and_eth_and_refuses_everything_else():
+    assert futures_curve._underlying("Crypto:BTC/USDT@swap") == "BTC"
+    assert futures_curve._underlying("Crypto:ETH/USDT") == "ETH"
+    assert futures_curve._underlying("Crypto:SOL/USDT@swap") is None
