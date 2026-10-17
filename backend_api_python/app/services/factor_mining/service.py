@@ -40,6 +40,7 @@ from typing import Any
 
 from app.markets.registry import list_market_keys
 from app.services.backtest_execution import DEFAULT_COMMISSION, DEFAULT_SLIPPAGE
+from app.services.factor_mining.dsl import fields_for
 from app.services.factor_mining.engine import (
     FactorMiningEngine,
     MiningConfig,
@@ -59,10 +60,18 @@ from app.utils import agent_jobs
 
 JOB_KIND = "factor_mining"
 
-# The integer fields ``MiningConfig`` reads with ``int()``. Only an absent key falls back to its
-# default there, so a blank ``""`` would raise a bare ``ValueError`` and escape this module's
-# closed key set; the boundary reads it as absent instead.
-_BLANK_AS_ABSENT = ("sourceId", "budget", "seed", "groups", "holdingPeriod")
+# The numeric fields ``MiningConfig`` reads with ``int()``/``float()``. Only an absent key falls
+# back to its default there, so a blank ``""`` would raise a bare ``ValueError`` and escape this
+# module's closed key set; the boundary reads it as absent instead. That tolerance is the whole
+# contract for the breeder's three numbers: they are optional in enumeration mode and bounded
+# whenever they are given, and a form that serializes an empty box as ``""`` must not be answered
+# with a key that says the parameter was illegal. The engine's own requirement is a separate check
+# and stays one -- a blank still cannot satisfy a run that breeds, because evolution names all
+# three rather than defaulting into a population nobody asked for.
+_BLANK_AS_ABSENT = (
+    "sourceId", "budget", "seed", "groups", "holdingPeriod",
+    "population", "generations", "eliteRatio",
+)
 
 _KNOWN_MARKETS = frozenset(list_market_keys())
 
@@ -75,7 +84,7 @@ _KNOWN_MARKETS = frozenset(list_market_keys())
 _JOB_CONFIG_KEYS = (
     "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio",
     "budget", "seed", "templateIds", "groups", "holdingPeriod", "commission", "slippage",
-    "neutralizeIndustry", "thresholds",
+    "neutralizeIndustry", "thresholds", "searchMode", "population", "generations", "eliteRatio",
 )
 
 
@@ -110,6 +119,7 @@ class FactorMiningService:
             template_ids=config.template_ids or None,
             budget=config.budget,
             seed=config.seed,
+            allowed_fields=fields_for(config.market),
         )
         # Deduped like the expansion dedupes: a repeated id contributes nothing to the search, and
         # counting it twice would report a template total the candidate count cannot come from.
@@ -247,7 +257,8 @@ class FactorMiningService:
                 data_provider=MiningDataProvider(backtest_service=self._backtest_service),
                 on_progress=on_progress,
             )
-            search = engine.run(user_id=user_id, code=code, config=config)
+            search = engine.run(user_id=user_id, code=code, config=config,
+                                search_mode=config.search_mode)
             self._repository.save_trials(run_id, user_id=user_id, trials=search["trials"])
             # The counts may only be persisted once the ledger holds them: a run row closed before
             # its trials were written would claim evaluations the ledger never received.
@@ -261,6 +272,11 @@ class FactorMiningService:
                 config=config,
                 survivors=result["candidates"],
                 trials_count=len(result["trials"]),
+                # The review carries the search's own mode: it is the warmup rule the frozen
+                # panel is fetched with, and the survivors it judges were bred under that rule.
+                # Left to the engine's default, the tail would be fetched short of an evolved
+                # survivor's lookback and the out-of-sample window silently truncated.
+                search_mode=config.search_mode,
             )
             self._repository.upsert_candidates(
                 user_id=user_id, run_id=run_id, candidates=reviewed,

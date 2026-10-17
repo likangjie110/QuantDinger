@@ -1,10 +1,10 @@
 """Graded screening gates: one metrics mapping in, one verdict out.
 
 Four pure functions walk the L2-L5 ladder of the factor mining spec -- data quality and signal
-strength (L2), stability (L3), redundancy against the built-in factor pool (L4), and the frozen
-window out-of-sample review (L5). Each returns the first check a candidate fails, paired with a
-closed reason key, so every rejection stays explainable; the caller owns the ordering and the
-trial ledger.
+strength (L2), stability (L3), redundancy against the built-in factors and the caller's own pool
+(L4), and the frozen window out-of-sample review (L5). Each returns the first check a candidate
+fails, paired with a closed reason key, so every rejection stays explainable; the caller owns the
+ordering and the trial ledger.
 
 An unreadable metric is read as 0.0, which fails a minimum; an infinite reading is kept, so it fails
 exactly the gates where more of that quantity is worse. The two limits that punish excess -- turnover
@@ -32,7 +32,10 @@ from app.services.strategy_evolution.statistics import deflated_sharpe, sample_s
 
 @dataclass(frozen=True)
 class GateThresholds:
-    """The L2-L5 bars. A run may override any of them from its payload."""
+    """The L2-L5 bars, plus ``min_abs_rank_ic``, which L6's pool increment reads too.
+
+    A run may override any of them from its payload.
+    """
 
     min_coverage: float = 0.60
     min_ic_observations: int = 30
@@ -40,7 +43,11 @@ class GateThresholds:
     min_icir: float = 0.30
     min_fold_consistency: float = 0.60
     max_turnover: float = 0.70
+    # One bar per L4 section. Both answer "does this candidate carry anything the comparison set
+    # does not already hold", so both default to the same number -- but a run may weigh its own
+    # library differently from the registry's factors, and the two overrides are read apart.
     max_builtin_correlation: float = 0.85
+    max_pool_correlation: float = 0.85
     min_oos_abs_rank_ic: float = 0.01
     min_deflated_sharpe_probability: float = 0.95
 
@@ -193,21 +200,51 @@ def screen_stability(metrics: Mapping[str, Any], thresholds: GateThresholds) -> 
     return _passed("L3")
 
 
-def screen_redundancy(correlations: Mapping[str, float], thresholds: GateThresholds) -> GateVerdict:
-    """L4: reject when any built-in factor correlates at or above the bar, in either direction.
+# The prefix a pooled candidate's name carries, so L4 can tell the caller's own library apart from
+# the registry's factor ids. It lives here, with the gate that reads it, and the engine imports it
+# from here: two literals spelling the same prefix could drift apart, and that drift is silent --
+# a pool member judged as a built-in, rejected under the wrong key.
+POOL_NAMESPACE = "pool:"
 
-    Only finite correlations count as evidence. A NaN pair is one the engine could not compare --
-    the fundamental factors carry no data on a price-volume run -- and skipping it is not the same
-    as clearing the candidate. So when nothing finite was measured the gate cannot run at all, and
-    an unrun de-duplication check rejects rather than waves a candidate past the ladder's only
-    redundancy checkpoint.
+
+def screen_redundancy(correlations: Mapping[str, float], thresholds: GateThresholds) -> GateVerdict:
+    """L4: reject when any comparison factor correlates at or above its own section's bar.
+
+    Two sections, one question each. A name carrying :data:`POOL_NAMESPACE` is a member of the
+    caller's own pool and is measured against ``max_pool_correlation``; every other name is a
+    registry factor id and is measured against ``max_builtin_correlation``. Both readings are
+    magnitudes, so a mirrored twin is a duplicate too. The keys stay apart because the findings
+    are: duplicating a built-in and duplicating what the caller already mined send a reader to
+    different places. Built-ins are judged first, so a candidate that duplicates both is reported
+    as the built-in duplicate it also is.
+
+    Only finite correlations count as evidence, and the rule is per section. A NaN pair is one the
+    engine could not compare -- a fundamental factor carrying no data on a price-volume run, or a
+    pooled member whose expression no longer rebuilds -- and skipping it is not the same as
+    clearing the candidate. So a section that appears in the mapping and holds nothing finite is
+    one the gate cannot judge, and L4 rejects as unverifiable rather than waving a candidate past
+    the ladder's only redundancy checkpoint: "the pool was compared and cleared" is a claim only
+    the readings can support. A section whose names are absent was never asked about -- a run with
+    no frozen pool, or one that reached no registry factor -- and demands nothing, or every run
+    outside the pool would fail closed. A mapping with nothing in it is neither state: nothing was
+    compared at all, and that is unverifiable too.
     """
-    measured = [abs(value) for value in (_finite(value) for value in correlations.values())
-                if value is not None]
-    if not measured:
+    # Keyed by whether the name is pool-namespaced. A key exists once a name of that section was
+    # asked about, measurable or not, which is the difference this gate turns on.
+    readings: dict[bool, list[float]] = {}
+    for name, value in correlations.items():
+        section = readings.setdefault(str(name).startswith(POOL_NAMESPACE), [])
+        reading = _finite(value)
+        if reading is not None:
+            section.append(abs(reading))
+    if not readings or any(not section for section in readings.values()):
         return _failed("L4", "factorMining.reject.unverifiableRedundancy")
-    if max(measured) >= thresholds.max_builtin_correlation:
+    builtin = readings.get(False)
+    pooled = readings.get(True)
+    if builtin and max(builtin) >= thresholds.max_builtin_correlation:
         return _failed("L4", "factorMining.reject.duplicateBuiltin")
+    if pooled and max(pooled) >= thresholds.max_pool_correlation:
+        return _failed("L4", "factorMining.reject.duplicateInPool")
     return _passed("L4")
 
 

@@ -2,6 +2,7 @@
 
 from dataclasses import FrozenInstanceError
 
+import pandas as pd
 import pytest
 
 from app.services.factor_mining.gates import (GateThresholds, GateVerdict, net_return_series,
@@ -150,6 +151,108 @@ def test_screen_redundancy_ignores_pairs_that_were_never_measured():
         "factorMining.reject.unverifiableRedundancy")
     # An infinite correlation is not a finite measurement either, so it is no evidence.
     assert screen_redundancy({"momentum_20": float("inf")}, GateThresholds()).reason == (
+        "factorMining.reject.unverifiableRedundancy")
+
+
+def test_numeric_dedup_rejects_an_affine_rescaled_twin():
+    """A pooled candidate's affine twin carries no new information, and L4 says so by name.
+
+    ``2x + 3`` moves every value and preserves every rank, so the reading the engine takes -- the
+    cross-sectional rank correlation of the two -- comes back at 1.0. The twin is a pool member,
+    so it is the pool's own bar that rejects the candidate and the pool's own key that records
+    why: a candidate duplicating what the pool already holds is not a candidate duplicating a
+    built-in, and a ledger that says the second is unreadable.
+    """
+    values = pd.Series([0.4, -1.2, 0.05, 2.3, -0.7, 1.1])
+    twin = values * 2.0 + 3.0
+    # The reading ``FactorResearchEngine._factor_correlation`` takes: rank both sides, then
+    # correlate the ranks. scipy's spearman spells the same number and is not a dependency here.
+    correlation = values.rank(method="average").corr(twin.rank(method="average"))
+
+    assert correlation == pytest.approx(1.0, abs=1e-9)
+    verdict = screen_redundancy({"pool:aaaaaaaa": correlation}, GateThresholds())
+    assert verdict.stage == "L4"
+    assert verdict.reason == "factorMining.reject.duplicateInPool"
+
+
+def test_numeric_dedup_keeps_a_distinct_factor_with_low_correlation():
+    """A candidate unrelated to its pool and to the built-ins passes L4 -- and was measured.
+
+    The second and third mappings are one notch above a bar the first mapping is below, with
+    nothing else near its own: the rejection they draw is what keeps the first mapping's pass from
+    being the pass of a gate that never ran. The last one pins the namespace as a prefix rather
+    than a substring, so a built-in whose id merely contains the word is still a built-in.
+    """
+    assert screen_redundancy({"momentum_20": 0.3, "pool:aaaaaaaa": -0.3}, GateThresholds()).passed is True
+    assert screen_redundancy({"pool:aaaaaaaa": 0.86}, GateThresholds()).reason == (
+        "factorMining.reject.duplicateInPool")
+    assert screen_redundancy({"poolside_momentum": 0.9}, GateThresholds(max_builtin_correlation=0.9)).reason == (
+        "factorMining.reject.duplicateBuiltin")
+
+
+def test_the_two_correlation_thresholds_are_independently_overridable():
+    """One bar per section, each read from the run's own payload, neither moved by the other.
+
+    Both readings sit between the two bars the overrides leave behind, so which key comes back
+    says which bar moved: lowering the built-in bar must not reach the pool's section and the
+    other way round. The defaults are equal, because both sections answer the same question --
+    does this candidate carry anything the comparison set does not already hold.
+    """
+    reading = {"momentum_20": 0.5, "pool:aaaaaaaa": 0.5}
+    assert screen_redundancy(reading, GateThresholds()).passed is True
+    assert screen_redundancy(reading, GateThresholds(max_builtin_correlation=0.4)).reason == (
+        "factorMining.reject.duplicateBuiltin")
+    assert screen_redundancy(reading, GateThresholds(max_pool_correlation=0.4)).reason == (
+        "factorMining.reject.duplicateInPool")
+
+    assert GateThresholds().max_pool_correlation == GateThresholds().max_builtin_correlation == 0.85
+    pooled = GateThresholds.from_payload({"max_pool_correlation": 0.5})
+    assert (pooled.max_pool_correlation, pooled.max_builtin_correlation) == (0.5, 0.85)
+    builtin = GateThresholds.from_payload({"max_builtin_correlation": 0.5})
+    assert (builtin.max_pool_correlation, builtin.max_builtin_correlation) == (0.85, 0.5)
+
+
+def test_pool_redundancy_stays_fail_closed_on_all_nan():
+    """A section that was asked about and measured nothing is rejected as unverifiable.
+
+    A pool member the engine could not measure is not a member the candidate cleared; ``NaN`` is
+    how an unmeasured name travels, so the section is present in the mapping and holds nothing
+    finite -- the one state L4 refuses to judge. That rule is per section rather than for the
+    comparison as a whole: a built-in section that measured fine and came back clear says nothing
+    about the pool member nobody could rebuild, and the ladder's only redundancy checkpoint is not
+    cleared by a comparison that half ran.
+    """
+    assert screen_redundancy({"pool:aaaaaaaa": float("nan")}, GateThresholds()).reason == (
+        "factorMining.reject.unverifiableRedundancy")
+    assert screen_redundancy({"pool:aaaaaaaa": float("inf"), "pool:bbbbbbbb": None}, GateThresholds()).reason == (
+        "factorMining.reject.unverifiableRedundancy")
+    assert screen_redundancy({"momentum_20": 0.1, "pool:aaaaaaaa": float("nan")}, GateThresholds()).reason == (
+        "factorMining.reject.unverifiableRedundancy")
+    assert screen_redundancy({"momentum_20": float("nan"), "pool:aaaaaaaa": 0.1}, GateThresholds()).reason == (
+        "factorMining.reject.unverifiableRedundancy")
+    # An unmeasured member beside a measured one is just a skipped pair, and the section the
+    # candidate was actually compared against decides on its own.
+    assert screen_redundancy({"pool:aaaaaaaa": float("nan"), "pool:bbbbbbbb": 0.3}, GateThresholds()).passed is True
+    assert screen_redundancy({"pool:aaaaaaaa": float("nan"), "pool:bbbbbbbb": 0.9}, GateThresholds()).reason == (
+        "factorMining.reject.duplicateInPool")
+
+
+def test_a_comparison_section_that_was_never_asked_about_is_not_required():
+    """Only the sections present in the mapping have to carry evidence.
+
+    A run outside the pool -- nothing frozen yet, or nothing in it rebuildable over this window --
+    asks about no pool member at all, and a gate that demanded a pool reading would reject every
+    candidate such a run ever produces. Only the section that appears is answerable. An empty
+    mapping is a different state again: the study could not be read, nothing was compared, and
+    that stays unverifiable rather than becoming a pass.
+    """
+    assert screen_redundancy({"momentum_20": 0.3}, GateThresholds()).passed is True
+    assert screen_redundancy({"pool:aaaaaaaa": 0.3}, GateThresholds()).passed is True
+    # A pool bar below everything is still not a bar the absent pool section can fail.
+    assert screen_redundancy({"momentum_20": 0.3}, GateThresholds(max_pool_correlation=0.1)).passed is True
+    assert screen_redundancy({}, GateThresholds()).reason == "factorMining.reject.unverifiableRedundancy"
+    assert screen_redundancy({}, GateThresholds(max_builtin_correlation=0.0,
+                                                max_pool_correlation=0.0)).reason == (
         "factorMining.reject.unverifiableRedundancy")
 
 

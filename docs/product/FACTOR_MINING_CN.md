@@ -9,7 +9,7 @@
 **做什么**
 
 - 从 8 个金融假设模板展开成一批确定性的候选表达式，逐个打分并留下完整试验台账。
-- 用分级门槛（L1–L5）把候选从「合法」一路筛到「在冻结段仍有样本外证据」。
+- 用分级门槛（L1–L6）把候选从「合法」一路筛到「在冻结段仍有样本外证据」，最后再过一道「相对调用者自己的候选库是否还有增量」。
 - 把结果沉淀进候选库 `qd_factor_candidates`：同一表达式跨多次运行去重，`run_id` 指向最近一次判定它的运行。
 - 全过程按用户隔离，可按作业取消，可事后审计（配置、数据指纹、计数、逐条淘汰原因都落库）。
 
@@ -59,7 +59,18 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 ### 3.1 字段白名单
 
-只有 5 个价量字段：`open`、`high`、`low`、`close`、`volume`。（`PRICE_VOLUME_FIELDS`）
+字段按组划分，一个市场的可用集就是它拥有的那些组的并集：
+
+| 组 | 字段 | 市场 |
+| --- | --- | --- |
+| `price_volume` | `open`、`high`、`low`、`close`、`volume` | 全部市场 |
+| `derivatives` | `funding_rate`、`open_interest` | 仅 `Crypto` |
+
+`fields_for(market)` 按组顺序返回这个集合。市场名**按运行时原样精确匹配**（`Crypto`、`USStock`）：不做大小写折叠、不做别名解析，因此 `crypto`——以及空或未知的市场——只会回退到 `price_volume` 组。这个回退是刻意的，方向是「拒绝」而非「放行」：市场名写错只会少字段，不会多字段；而且落在 `fields_for(market)` 之外的字段本来就会在 L1 以 `unknownField` 被拒。
+
+某组存在只说明**数据源能回答**这个字段，不说明每个标的都有值：衍生品序列返回空的标的仍保留它的 frame，该字段是一整列 NaN，由 L2 的覆盖率门槛决定这个缺口算不算问题。`term_structure` 与 `roll_cost` 不在任何组里，因为它们需要的期货多合约数据面尚不存在（见第 11 节）。
+
+`GET /catalog` 按市场提供这份清单：`?market=Crypto` 返回两个组共七个字段；不带 `market`（或带一个本版本不认识的市场名）返回价量五个字段。
 
 ### 3.2 算子（31 个）
 
@@ -79,11 +90,13 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 | 常量 | 值 | 含义 |
 | --- | --- | --- |
-| `MAX_DEPTH` | 6 | 树深度上限（根算 1） |
+| `MAX_DEPTH` | 8 | 树深度上限（根算 1） |
 | `MAX_NODES` | 24 | 节点总数上限（叶子与算子节点都算） |
 | `WINDOW_MIN` | 1 | 窗口参数 `n` 下限 |
 | `WINDOW_MAX` | 252 | 窗口参数 `n` 上限 |
 | `MAX_LOOKBACK` | 504 | 任一「根到叶」路径上窗口之和的上限，也就是该表达式需要的最大历史长度 |
+
+**为什么深度上限定为 8，以及它没有改变什么。** 原值是 6。交叉会把一个表达式的子树嫁接到另一个表达式的路径上，子代深度是两个半边的深度相加——上界如果比最深的合法表达式毫无余量，最深的那批候选就根本组合不起来：最深的模板表达式（`conditional_filter` / `volume_price_confirm` 的基础式加一层平滑变体）深度正好是 6，恰好顶到旧上界，新上界给了这一族 2 层余量。深度上限是**校验策略，不是表达式语义的一部分**，因此 `DSL_VERSION` **不递增**、既有 `expression_hash` 全部不变：同一个表达式升级前后指纹相同，没有任何已存候选被重新建档。会变的是**哪些表达式合法**：原先会以 `factorMining.reject.invalid:tooDeep` 被拒的深度 7、8 的树现在被接受，余量本来就紧的种子也可能产出数量不同的被拒子代。
 
 ### 3.4 前视防护
 
@@ -124,16 +137,19 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | **L1 合法性** | DSL 形状、字段、算子、参数范围；以及求值本身（除零、溢出、标量传给面板算子等） | — | `factorMining.reject.invalid` |
 | **L2 快速筛选** | 覆盖率 → IC 观测数 → 信号强度（`\|rankIC\|`） | coverage ≥ 0.60；观测数 ≥ 30；`\|rankIC\|` ≥ 0.02 | `factorMining.reject.lowCoverage` / `factorMining.reject.insufficientObservations` / `factorMining.reject.weakIc` |
 | **L3 稳定性** | ICIR → 分折符号一致性 → 前后半段同号 → 平均换手 | ICIR ≥ 0.30；分折一致 ≥ 0.60；前后半 IC 同号；换手 ≤ 0.70 | `factorMining.reject.weakIcir` / `factorMining.reject.unstableFolds` / `factorMining.reject.unstableHalves` / `factorMining.reject.highTurnover` |
-| **L4 与内置因子去重** | 与每个已打分内置因子的相关度（取绝对值） | < 0.85 | `factorMining.reject.duplicateBuiltin` / `factorMining.reject.unverifiableRedundancy` |
+| **L4 冗余去重** | 与每个已打分的比较因子的相关度（取绝对值）：内置注册表的因子用内置门槛，调用者自己的冻结候选池（名字带 `pool:` 命名空间）用池门槛 | 内置 < 0.85；池 < 0.85 | `factorMining.reject.duplicateBuiltin` / `factorMining.reject.duplicateInPool` / `factorMining.reject.unverifiableRedundancy` |
 | **L5 冻结段样本外** | 样本内外 `rankIC` 同号且强度；通缩夏普（DSR）概率 | `\|OOS rankIC\|` ≥ 0.01 且与 IS 同号；DSR 概率 ≥ 0.95 | `factorMining.reject.weakOutOfSample` / `factorMining.reject.selectionBias` |
+| **L6 池增量** | 在每个截面上把调用者的整个冻结候选池回归掉之后，残差与前瞻收益是否仍有相关，且与原始 IC 同侧 | `\|残差 IC\|` ≥ `min_abs_rank_ic`（0.02）**且**残差 IC 与原始 IC 同号 | `factorMining.reject.noIncrementalValue` |
 
 **几个容易踩的点：**
 
-- **L4 的非有限相关度被忽略**：只有有限值才算证据。NaN 表示「引擎没能测到」——价量运行下基本面因子本来就没有可比数据——跳过它**不等于**放行。因此当**过滤后一个有限值都没有**时，L4 无法执行，直接以 `factorMining.reject.unverifiableRedundancy` 淘汰，而不是让候选白过唯一的冗余关卡。
+- **L4 忽略非有限相关度，且按命名空间分组**：只有有限值才算证据。NaN 表示「引擎没能测到」——价量运行下基本面因子本来就没有可比数据，或者池成员的存储表达式已无法重建——跳过它**不等于**放行。因此规则是分组的：**某个命名空间**（内置、池）被问过、却**一个有限值都没有**时，L4 无法执行，候选直接以 `factorMining.reject.unverifiableRedundancy` 淘汰，而不是白过唯一的冗余关卡。从未被问过的命名空间不作要求，否则所有没有池的运行都会 fail-closed；映射整体为空则同样属于「什么都没问过」，也判无法验证。内置段先判，因此两段都超阈的候选报的是内置重复键。
+- **L4 的两道阈值彼此独立**：`max_builtin_correlation` 与 `max_pool_correlation` 默认都是 0.85，但一次运行可以用不同尺度看待自己的库与注册表因子，所以两者分开读、淘汰键也分开——「与内置因子重复」和「与你自己挖出来的东西重复」该把运维引向不同地方。
+- **L6 只在有读数时才淘汰**：池增量有三种状态，其中只有一种会淘汰候选——`true`（有增量信息）、`false`（测出了，且不含池子里没有的信息，**唯一**可据以淘汰的状态）、以及「没答案」。池为空、或池里什么都测不出时，候选保持 `frozen`，原因写在增量自己的块里：`factorMining.poolIncrement.noPool`、`factorMining.poolIncrement.unmeasured`。这两个都不是淘汰键，也不会出现在候选的 `reason` 里。这与 L4 的 fail-closed 刻意相反：在 L4 放行的候选会进入此后每次运行都要比较的池，重复会复利；在这里放行的候选已经过了 L2–L5，运维可以事后按证据摘掉它。
 - **不可测的换手不算低换手**：`factorMining.reject.highTurnover` 的判定写成 `not (turnover <= max_turnover)`，NaN 与 `inf` 都会失败（fail-closed）。
 - **分折一致性缺省即跳过**：`foldIcSigns` 由搜索引擎写入（把 IC 序列等分成最多 4 折，取每折均值符号）。序列缺失、或折数不足两项时，都表示「没评估过」，该检查跳过。
 - **L5 的 `trials` 用全部试验数**：DSR 的分母是**本次运行评估过的全部候选数（含被淘汰的）**，不是幸存者数。用幸存者数会给搜索本身定价过低，正好低估了它要修正的选择偏差。
-- **门槛可覆盖**：`POST /run` 的 payload 可以带 `thresholds` 对象，键名是 `GateThresholds` 的字段名（snake_case）：`min_coverage`、`min_ic_observations`、`min_abs_rank_ic`、`min_icir`、`min_fold_consistency`、`max_turnover`、`max_builtin_correlation`、`min_oos_abs_rank_ic`、`min_deflated_sharpe_probability`。未识别或为 `null` 的键保留默认值。值必须能按字段自身类型读取：整数计数门槛 `min_ic_observations` 接受 `30` 与 `30.0`，但拒绝 `0.5`（`int()` 会把它静默变成 `0`，等于把 L2 的观测数下限关掉）；任何门槛都不接受布尔值和非有限数值。`thresholds` 不是对象、或某个值不满足上述规则时，返回 400 + `factorMining.thresholdsInvalid`，绝不落成一个被强制转换过的门槛。
+- **门槛可覆盖**：`POST /run` 的 payload 可以带 `thresholds` 对象，键名是 `GateThresholds` 的字段名（snake_case）：`min_coverage`、`min_ic_observations`、`min_abs_rank_ic`、`min_icir`、`min_fold_consistency`、`max_turnover`、`max_builtin_correlation`、`max_pool_correlation`、`min_oos_abs_rank_ic`、`min_deflated_sharpe_probability`。`min_abs_rank_ic` 是本次运行唯一的信号强度门槛，L6 也用同一个值读残差。未识别或为 `null` 的键保留默认值。值必须能按字段自身类型读取：整数计数门槛 `min_ic_observations` 接受 `30` 与 `30.0`，但拒绝 `0.5`（`int()` 会把它静默变成 `0`，等于把 L2 的观测数下限关掉）；任何门槛都不接受布尔值和非有限数值。`thresholds` 不是对象、或某个值不满足上述规则时，返回 400 + `factorMining.thresholdsInvalid`，绝不落成一个被强制转换过的门槛。
 
 ## 6. 时间口径与防偏差
 
@@ -143,15 +159,17 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 **搜索段与冻结段严格隔离。** 请求区间按**交易日**切分：末尾 `freezeRatio`（默认 0.3，必须落在 `(0, 0.5)`）比例的交易日构成冻结段，冻结段从搜索段最后一个交易日的**次日**开始，两段不共享任何一根 bar。搜索阶段的数据源调用止于搜索段末尾；**冻结段只被读取一次**——在 `review_frozen` 里，且只在有幸存者时才读。没有任何候选能接触到将要评判它的那段行情。
 
+**池增量读的是搜索段。** L6 衡量一个幸存者相对调用者冻结候选池的增量，用的是**搜索段自己**的那些截面，绝不是冻结段：增量是搜索期口径的判断，而冻结段是用来评判候选的证据，不是给候选当证据的。池成员由它存储的表达式在当前搜索评分所用的同一份字段面板上重建——这才是成员可比的前提；整个测量读的是搜索段那份已裁剪的 frame，因此数据源多返回的、越过搜索段末尾的那些 bar 到不了这个读数里。
+
 **全部试验（含失败）留痕。** 每个被评估的候选都往 `qd_factor_trials` 写一行，通过和淘汰一视同仁。这份台账的条数就是 L5 里 DSR 的分母。
 
 **台账行只保留门槛会读的字段。** 试验的 `metrics` 里只有 `coverage`、`rankIc`、`icir`、`foldIcSigns`、`averageTurnover`、`stability`、`executionAssumptions`，以及 `icObservations`——IC 序列的**长度**，单独一个键，因为 L2 只问观测数有多少，从不问观测值是什么。其余内容（IC 序列本身、分组与多空曲线、逐日截面、相关度矩阵）只对走到台账通过侧的候选留在**候选**行上——幸存者，以及此后被冻结段复核过的那些；在 L1–L4 就被淘汰的候选从没有候选行，对它而言那条台账行就是仅存的记录。台账是一次评估一行，所以不裁剪的就是让运行记录随预算膨胀的那一项：200 标的时单行 0.78 MB，`budget=400` 的一次运行要落大约三分之一 GB——而且是三份，因为同一份记录同时写进 `qd_factor_trials`、`qd_factor_mining_runs.result_json` 与 `qd_agent_jobs.result`。
 
 **数据指纹。** `summary.snapshotId` 是对面板内容算出的真实指纹：按标的排序，逐个把该标的的规范 OHLCV 字节混入 `sha256`（标的代码也参与哈希）。它是**数据指纹，不是可重放副本**——v1 只存指纹，不存行情快照。
 
-**预热。** 抓取区间会在搜索段起点之前多取一段历史，长度由**本次实际要评估的候选**决定（同样的模板选择 + 预算 + 种子），取 `max(40, min(504, 最长 lookback + 5))` 根 bar 折算成自然日。用 DSL 的 504 上限去取会多花约 3.5 倍历史长度，在日线策略上等于把可搜索窗口从一年压到四个月。
+**预热。** 抓取区间会在搜索段起点之前多取一段历史，取多少取决于搜索模式，因为两种模式对「将要评估什么」的已知程度不同。**枚举模式**完全已知：候选全部来自模板，运行在抓取之前就能先把模板集算出来（同样的模板选择 + 预算 + 种子），只取 `max(40, min(504, 最长 lookback + 5))` 根 bar 折算成自然日。用 DSL 的 504 上限去取会多花约 3.5 倍历史长度，在日线策略上等于把可搜索窗口从一年压到四个月。**进化模式**什么都不知道：交叉可以把任意子树（带任意合法窗口参数）嫁到任意路径上，所以它取满上界（`MAX_LOOKBACK=504` 根 bar ≈ 953 自然日）。若市场数据策略对抓取区间有上限，这个上界会让进化运行**直接被拒**（由共用的回测区间校验在请求任何一根 bar 之前抛出，作业以 `strategyV2.backtestRangeLimit` 失败），而不是把窗口缩小后照跑。
 
-**确定性与可复现。** 同一份面板 + 同一组 `(templateIds, budget, seed)` 产出同一批试验和同一批候选，顺序也一致：模板展开是有种子的，门槛阶梯是纯函数，代码里不迭代集合。
+**确定性与可复现。** 同一份面板 + 同一份运行配置（请求里的每一个字段，含 `searchMode`）产出同一批试验和同一批候选，顺序也一致。`(templateIds, budget, seed)` 只是其中一部分：模式决定哪些来源贡献候选、抓取多少历史，进化模式下 `population`、`generations`、`eliteRatio` 决定从什么里繁殖。模板展开是有种子的，进化流只从 `random.Random(seed)` 取数，门槛阶梯是纯函数，代码里不迭代集合。
 
 ## 7. HTTP 接口
 
@@ -159,7 +177,7 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/catalog` | DSL 词表：`fields`、`operators`、`templates` |
+| `GET` | `/catalog` | DSL 词表：`fields`、`operators`、`templates`；可选 `?market=` 指定字段集（见 3.1） |
 | `POST` | `/estimate` | 静态估价，**只**返回 `{templateCount, candidateBudget}` 这两项；不读数据源、不建面板、不开作业 |
 | `POST` | `/run` | 提交一次挖掘，**HTTP 202**，返回作业回执 |
 | `GET` | `/jobs` | 当前用户的挖掘作业列表，最新在前，**不带** `result` |
@@ -170,9 +188,13 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 **`POST /run` 请求体。** 服务端只读取以下键，其余键被丢弃（不会落进作业表的 request）：
 
-`sourceId`、`sourceName`、`market`、`timeframe`、`startDate`、`endDate`、`freezeRatio`、`budget`、`seed`、`templateIds`、`groups`、`holdingPeriod`、`commission`、`slippage`、`neutralizeIndustry`、`thresholds`
+`sourceId`、`sourceName`、`market`、`timeframe`、`startDate`、`endDate`、`freezeRatio`、`budget`、`seed`、`templateIds`、`groups`、`holdingPeriod`、`commission`、`slippage`、`neutralizeIndustry`、`thresholds`、`searchMode`、`population`、`generations`、`eliteRatio`
 
 必填：`sourceId`（正整数）、`market`（合法市场 key）、`startDate` / `endDate`（`YYYY-MM-DD`）。`budget` 缺省 400。`timeframe` 缺省 `1D`。
+
+**四个搜索模式键。** `searchMode` 取 `enumeration`（缺省，即模板展开）或 `evolution`（模板展开 + 由它繁殖出的流）；其它值一律以 `factorMining.invalidParameter` 拒绝，**绝不**回退成缺省值——两种模式搜索的候选集不同、消耗的历史长度也不同。`population`（缺省 32）、`generations`（缺省 20）、`eliteRatio`（缺省 0.25）是繁殖参数，**进化运行必须三个都给出且非空**：本层臆造出来的值等于一次没被要求的搜索。三者分别按整数、整数、数值读取，上下界用同一个键拒绝：`population` 与 `generations` 必须 ≥ 1，`eliteRatio` 必须落在 `[0, 1)`（份额 ≥ 1 会让每一代的精英占满全部名额、繁殖循环没有空间产生子代，运行会搜完模板、什么都没繁殖出来，却仍被记为成功）。枚举模式下三者可选，给了同样受上下界约束。
+
+**`/estimate` 不受以上任何影响。** 它校验同一份 payload（含模式与繁殖参数），返回体**仍然只有** `{templateCount, candidateBudget}` 两项：不回显模式，因为调用方本来就知道自己提交的是什么。
 
 **作业回执 / 作业对象**（同一套字段）：
 
@@ -201,9 +223,9 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 **候选对象字段：** `id`、`userId`、`runId`、`expressionHash`、`expression`、`origin`、`templateId`、`market`、`timeframe`、`status`、`reason`、`createdAt`、`updatedAt`；详情另带 `metrics`、`outOfSample`。
 
-**`status` 取值：** `search`（过了 L1–L4，等待冻结段复核）、`frozen`（也过了 L5）、`rejected`（被某一层淘汰，淘汰键在 `reason`）。
+**`status` 取值：** `search`（过了 L1–L4，等待冻结段复核）、`frozen`（也过了 L5，且没有在 L6 被淘汰）、`rejected`（被某一层淘汰，淘汰键在 `reason`——L6 淘汰带的是 `factorMining.reject.noIncrementalValue`，而测不出的增量不淘汰任何候选）。
 
-**`GET /catalog`：** `operators` **只给算子名字**，不含 arity 和是否带窗口——需要这些信息请看本页第 3.2 节。`templates` 每项是 `{templateId, hypothesisI18nKey, category, parameterGrid}`。
+**`GET /catalog`：** `fields` 是该市场自己的字段集，经由校验器所用的同一个 `fields_for` 求得，因此编辑器提供的与 L1 接受的不会漂移。可选查询参数 `market` 指定调用者即将运行的市场；不带、留空或给一个不认识的市场名，返回的是价量组（见 3.1）。`operators` **只给算子名字**，不含 arity 和是否带窗口——需要这些信息请看本页第 3.2 节。`templates` 每项是 `{templateId, hypothesisI18nKey, category, parameterGrid}`。
 
 **相关度研究里的标签。** 挖掘出来的候选进入 L4 的相关度研究时，显示的因子名是 **`"expression"`**（内置因子排在它后面）。所以 `metrics.factorCorrelation.factors[0]` 恒为 `"expression"`，`matrix[0][1:]` 就是它与各内置因子的相关度。
 
@@ -241,6 +263,22 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 所有写入都按租户作用域执行，并且**可听地失败**：写入不属于调用者的运行会抛错（`factorMining.runNotFound`），而不是「写了 0 行但返回行数」——那会让一次本该记下 250 条试验的调用静默丢失台账。
 
+**池增量写在哪。** 幸存者的池增量写进它的 `outOfSample` 块——即 `qd_factor_candidates` 的 `out_of_sample_json` 列，由 `/candidates/<id>` 以 `outOfSample` 提供——键为 `poolIncrement`：
+
+| 键 | 含义 |
+| --- | --- |
+| `residualIc`、`rawIc` | 参与测量的那些截面上的平均残差 IC 与平均原始 IC；没测出时是 `null`（部分平均不是一个读数） |
+| `poolSize` | 本次运行的上限与自排除处理完之后，池的规模 |
+| `compared` | **能**重建出面板的成员名——读数实际覆盖的就是这些 |
+| `skipped` | 重建失败的成员；**跳过不等于放行** |
+| `complete` | 恰好当 `skipped` 为空时为 `true`，即读数覆盖了整个池 |
+| `hasIncrementalValue` | `true` / `false` / `null`（没测出）——消费端必须能分辨这三种状态 |
+| `reason` | 有增量时为空；测出了但没有增量时是 `factorMining.reject.noIncrementalValue`；没有判定时是 `factorMining.poolIncrement.noPool` / `.unmeasured` |
+| `usedCrossSections`、`skippedCrossSections` | 读数平均了多少个截面、又被迫丢掉了多少个 |
+| `minAbsRankIc` | 残差 IC 对比的那道门槛，随读数一起存下，让一条已存读数能自解释它的判定 |
+
+**消费端必须读 `complete` 与那两个计数，绝不能只看 `hasIncrementalValue`。** 被截断的池仍然给出判定，这是刻意的：否则只要有一个成员的存储表达式不再能重建，这一层就永久失效；而这里的 `false` 是由**已测到**的成员决定的。不能发生的是截断被隐去——只显示 `hasIncrementalValue`、不显示 `complete`、`poolSize`、`compared` 的界面，会把「这个库只比了一半」和「这个库什么都加不进去」渲染成一模一样，而后者才是读数支持的那个结论。
+
 ## 10. i18n 键清单
 
 前端文案在另一个仓库。以下是后端会产出的**全部** `factorMining.*` 键，后端只发键，不渲染文案。
@@ -254,7 +292,7 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | `factorMining.jobNotFound` | 作业不存在、不属于该用户、或不是挖掘作业 |
 | `factorMining.candidateNotFound` | 候选不存在，或不属于该用户；id 无法解析为整数时同样 |
 | `factorMining.invalidQuery` | 查询参数不是合法整数 |
-| `factorMining.invalidParameter` | 运行字段无法按其计价类型读取：整数字段（`seed` / `groups` / `holdingPeriod`）不是整数、`commission` / `slippage` 大到无法转换，或 `timeframe` 不在支持的形状内（`<数字><m\|h\|d\|w>`） |
+| `factorMining.invalidParameter` | 运行字段无法按其计价类型读取：整数字段（`seed` / `groups` / `holdingPeriod` / `population` / `generations`）不是整数、`eliteRatio` 不是数值、`commission` / `slippage` 大到无法转换、`searchMode` 是本版本不认识的值、`timeframe` 不在支持的形状内（`<数字><m\|h\|d\|w>`）、`population` / `generations` 小于 1、`eliteRatio` 不在 `[0, 1)`，或进化运行里 `population` / `generations` / `eliteRatio` 缺失或为空串 |
 | `factorMining.thresholdsInvalid` | `thresholds` 不是对象，或某个门槛无法按字段自身类型读取（`min_ic_observations` 给了小数、给了布尔值、给了非有限数值） |
 | `factorMining.sourceRequired` | 缺少 `sourceId` 或不是正整数 |
 | `factorMining.sourceNotFound` | `sourceId` 指向的脚本源不存在或不属于该用户 |
@@ -282,7 +320,7 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | `factorMining.fingerprintInvalid:<index>` | 第 `<index>` 个候选的指纹不是 64 位 sha256 十六进制 |
 | `factorMining.reject.invalid:<reason>` | DSL 校验失败时 `ExpressionError.code` 携带的具体原因（`unknownField` / `tooDeep` / `tooManyNodes` / `unknownOperator` / `badArity` / `badNode` / `badWindow` / `lookbackExceeded`） |
 
-**L1–L5 淘汰原因（12 个）**
+**L1–L6 淘汰原因（14 个）**
 
 | 键 | 层级 |
 | --- | --- |
@@ -295,9 +333,20 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | `factorMining.reject.unstableHalves` | L3 |
 | `factorMining.reject.highTurnover` | L3 |
 | `factorMining.reject.duplicateBuiltin` | L4 |
+| `factorMining.reject.duplicateInPool` | L4 |
 | `factorMining.reject.unverifiableRedundancy` | L4 |
 | `factorMining.reject.weakOutOfSample` | L5 |
 | `factorMining.reject.selectionBias` | L5 |
+| `factorMining.reject.noIncrementalValue` | L6 |
+
+**池增量读数（2 个键，刻意不是淘汰原因）**
+
+| 键 | 出现位置 |
+| --- | --- |
+| `factorMining.poolIncrement.noPool` | `outOfSample.poolIncrement.reason`，调用者还没有冻结候选库——这个问题从没被问过 |
+| `factorMining.poolIncrement.unmeasured` | `outOfSample.poolIncrement.reason`，比过却什么都测不出，或这次复核背后没有搜索段可读 |
+
+这两个键都不淘汰候选，也都不出现在候选的 `reason` 或试验的 `reason` 里：它们是并列在判定旁边的两种「没答案」状态（见第 9 节），而把运维引到错的那一个，等于让他去错的地方找库。
 
 **模板假设（8 个）**
 
@@ -320,5 +369,8 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 - **不接入策略运行时**：挖掘结果无法被策略引用，也没有用户作用域的读取路径。
 - **不做 AI 提案**：候选全部来自模板参数展开（v3 再考虑）。
 - **只存数据指纹**：没有可重放的面板副本，因此历史运行无法离线重跑。
+- **`term_structure` 与 `roll_cost` 不在本次范围内，也不在白名单里。** 这里先把语义定死，免得将来另起计划时还要重吵一遍：**`term_structure`** 是近月与远月合约之间的年化价差，**`roll_cost`** 是按既定换月规则切换主力合约的成本。两者都**和其他所有字段一样必须回答「哪个时点可知」**——将来要进白名单，就得先证明点时可用性，并同样走完 L1–L6 这道阶梯。
+
+  本计划不实现它们，因为需要一条**当前还不存在的数据面**：本仓的期货数据源只提供单合约的 ticker 与 kline，而期限结构需要同一标的的多个合约同时报价。要做出来，得先有单独的数据源计划，以及本版本无处安放的合约元数据——主力合约判定、换月规则、价格复权口径，三者中的任何一个变了，这个字段报出的数就变了，而两个实现各按各的口径就会在同一个字段名下静默报出不同的因子。在这条数据面与这套元数据就绪之前，这两个字段不进任何 `FIELD_GROUPS` 条目：`fields_for(market)` 永远不会返回它们，L1 会把命名它们的候选以 `unknownField` 拒绝，也就没有任何运行会被定价在一条没人能填的数据上。
 
 相关：[策略工作流](STRATEGY_WORKFLOW_CN.md)、[回测中心](BACKTEST_CENTER_CN.md)、[Strategy API V2 开发指南](../trading/STRATEGY_DEV_GUIDE_CN.md)、[实盘安全](../trading/LIVE_TRADING_SAFETY_CN.md)。

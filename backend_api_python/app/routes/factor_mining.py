@@ -31,7 +31,7 @@ factor_mining_blp = Blueprint("factor_mining", __name__)
 _RUN_FIELDS = frozenset({
     "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio",
     "budget", "seed", "templateIds", "groups", "holdingPeriod", "commission", "slippage",
-    "neutralizeIndustry", "thresholds",
+    "neutralizeIndustry", "thresholds", "searchMode", "population", "generations", "eliteRatio",
 })
 
 
@@ -78,11 +78,18 @@ def _iso(value):
 @login_required
 def factor_mining_catalog():
     """The DSL's own vocabulary: searchable fields, operators, and hypothesis templates."""
+    # ``fields`` is the *market's* set, not the price-volume group: a client that is about to
+    # submit a run already holds the market (``/run`` requires it), and a Crypto run's editor
+    # otherwise offers five of the seven fields its candidates may name. The optional ``market``
+    # query argument is read through the same ``fields_for`` the validator uses, so what this
+    # advertises and what L1 admits cannot drift apart. Absent and unrecognised both take
+    # ``fields_for``'s own fallback -- the price-volume group, which refuses rather than admits.
+    # The docstring stays one paragraph on purpose: it becomes the route's OpenAPI description.
     return jsonify({
         "code": 1,
         "msg": "common.success",
         "data": {
-            "fields": list(dsl.PRICE_VOLUME_FIELDS),
+            "fields": list(dsl.fields_for(str(request.args.get("market") or ""))),
             "operators": list(dsl.OPERATOR_SPECS),
             "templates": templates.template_catalog(),
         },

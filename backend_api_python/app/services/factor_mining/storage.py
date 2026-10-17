@@ -374,10 +374,12 @@ class FactorMiningRepository:
         run_id: int | None = None,
         status: str = "",
         market: str = "",
+        timeframe: str = "",
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        """The candidate library, newest first, filtered by the run or the state it ended in.
+        """The candidate library, newest first, filtered by the run, the state it ended in, or the
+        market and timeframe it was searched over.
 
         Rows are hydrated without their metric payloads: a candidate's metrics carry its whole IC
         series and curves, which a page of fifty does not need. ``get_candidate`` returns them.
@@ -393,6 +395,9 @@ class FactorMiningRepository:
         if market:
             where.append("market = ?")
             params.append(str(market))
+        if timeframe:
+            where.append("timeframe = ?")
+            params.append(str(timeframe))
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(

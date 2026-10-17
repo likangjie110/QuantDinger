@@ -18,6 +18,7 @@ assert the candidate list is non-empty, because a run that rejects everything ca
 whether the search works.
 """
 
+import json
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -25,16 +26,24 @@ import pandas as pd
 import pytest
 
 from app.services.factor_mining import engine as engine_module
+from app.services.factor_mining import pool
+from app.services.factor_mining.dsl import MAX_LOOKBACK, fields_for
 from app.services.factor_mining.engine import (
+    DEFAULT_BUILTIN_COMPARISON_LIMIT,
+    ComparisonSet,
     FactorMiningEngine,
     MiningConfig,
+    MiningDataProvider,
     PreparedPanel,
+    _comparison_set,
     _field_panels,
     _fold_ic_signs,
     _metrics_payload,
     _resolved_members,
+    _warmup_bars,
     split_periods,
 )
+from app.services.factor_mining.evaluator import ExpressionEvaluator
 from app.services.factor_mining.gates import GateThresholds
 from app.services.factor_mining.templates import expand_candidates
 from app.services.strategy_v2.factor_research import FactorResearchEngine
@@ -45,20 +54,31 @@ class _FakeProvider:
 
     ``fields`` is built by the same ``_field_panels`` the provider uses rather than left empty:
     the fake stands in for the provider, so a field mapping it never filled would hide a real
-    provider bug behind a candidate panel of nothing.
+    provider bug behind a candidate panel of nothing. ``search_modes`` records what the engine
+    asked for, which is the only way to see that the warmup rule traveled with the run.
     """
 
     def __init__(self, frames, members):
         self.panel = PreparedPanel(frames=frames, members=members, fields=_field_panels(frames),
                                    snapshot_id="b" * 64, frequency="1d", warnings=[])
+        self.search_modes: list[str | None] = []
+        # What this run compares its candidates against. Empty by default: the fake stands in
+        # for a provider that found no registry factor and no pooled candidate to measure, which
+        # is a real run shape and the one every pre-existing test in this module was written for.
+        self.comparison = ComparisonSet()
 
-    def prepare(self, *, user_id, code, config):
+    def prepare(self, *, user_id, code, config, search_mode=None):
+        self.search_modes.append(search_mode)
         return self.panel
 
-    def prepare_freeze(self, *, user_id, code, config):
+    def prepare_freeze(self, *, user_id, code, config, search_mode=None):
         # The real provider fetches the frozen tail on this call. The fake holds one panel and
         # serves it for both, so a test that needs a disagreeing tail hands in different frames.
+        self.search_modes.append(search_mode)
         return self.panel
+
+    def comparison_set(self, *, panel, config, user_id, start_date, end_date):
+        return self.comparison
 
 
 def _frames_and_members(periods=200):
@@ -104,16 +124,20 @@ def _config(**overrides):
 # The fixture ranks the symbols identically for every candidate, so L4 is the gate that
 # decides this fixture's runs. A bar of 1.1 is above every possible correlation, so the
 # de-duplication gate can never fire and the run has a genuine end-to-end pass path; every
-# other gate is turned off for the same reason.
+# other gate is turned off for the same reason. Both L4 bars are raised: the fixture's pool
+# panels are the candidates' own twins, so a run that compares against one is a duplicate of it.
 _NO_DEDUPLICATION = GateThresholds(min_ic_observations=5, min_abs_rank_ic=0.0, min_icir=0.0,
                                    min_fold_consistency=0.0, max_turnover=1.0, min_coverage=0.0,
-                                   max_builtin_correlation=1.1)
+                                   max_builtin_correlation=1.1, max_pool_correlation=1.1)
 
 
 def _run(frames, members, **overrides):
+    """One run over ``frames``. ``search_mode`` picks the engine's source; the rest is config."""
+    search_mode = overrides.pop("search_mode", "enumeration")
     seen: list[dict] = []
     engine = FactorMiningEngine(data_provider=_FakeProvider(frames, members), on_progress=seen.append)
-    result = engine.run(user_id=1, code="PORTFOLIO = {}", config=_config(**overrides))
+    result = engine.run(user_id=1, code="PORTFOLIO = {}", config=_config(**overrides),
+                        search_mode=search_mode)
     return result, seen
 
 
@@ -304,7 +328,8 @@ def test_the_search_window_is_cut_from_the_panel_that_carries_warmup():
     candidate_panel = _evaluator(frames, trial["expression"])
     direct = _metrics_payload(
         FactorMiningEngine(data_provider=_FakeProvider(frames, members))._research(
-            config, split_periods(config), panel, _resolved_members(members), candidate_panel),
+            config, split_periods(config), panel, _resolved_members(members), candidate_panel,
+            ComparisonSet()),
         config,
     )
     assert direct == trial["metrics"]
@@ -574,6 +599,461 @@ def test_the_correlation_study_reads_the_injected_panel_not_a_lookalike():
     assert whole_observed - partial_observed == len(blanked)
 
 
+# --- what a candidate is compared against: the registry's factors plus the caller's pool ---
+
+_POOL_MEMBER = {"op": "ts_pct_change", "args": ["close"], "params": {"n": 10}}
+
+
+def _empty_pool(user_id, market, timeframe, **kwargs):
+    return []
+
+
+def _recording_pool(members, calls):
+    def loader(user_id, market, timeframe, **kwargs):
+        calls.append((user_id, market, timeframe, kwargs))
+        return list(members)
+
+    return loader
+
+
+def _unrelated_panel(frames):
+    """A comparison panel that is measured but unrelated to the fixture's candidates.
+
+    The fixture's prices are exact geometric curves, so every candidate ranks the six symbols in
+    symbol order. A panel holding one fixed cross-section outside that order is a real
+    cross-sectional measurement the de-duplication gate does not fire on, which is what a test
+    needs when a rejection must be attributable to the pool half rather than to the built-in one.
+    """
+    panel = _evaluator(frames, _MOMENTUM_5)
+    for column, value in zip(panel.columns, [3.0, 6.0, 1.0, 5.0, 2.0, 4.0]):
+        panel[column] = value
+    return panel
+
+
+def _computable_factor_ids(frames):
+    """Registry ids a panel carrying these columns can measure, derived outside the module.
+
+    Mirrors the registry's own ``required_fields`` contract rather than a hand-kept list: the
+    fixture's panels carry price and volume only, so every technical factor is measurable and
+    no fundamental one is.
+    """
+    from app.services.factors import list_factors
+
+    columns = set().union(*(set(frame.columns) for frame in frames.values()))
+    return [item["factor_id"] for item in list_factors()
+            if set(item["required_fields"]) <= columns]
+
+
+def _assembly(frames, members, *, pool_loader, factor_limit=DEFAULT_BUILTIN_COMPARISON_LIMIT,
+              pool_limit=pool.DEFAULT_POOL_LIMIT, config=None):
+    """The comparison set one run assembles for the fixture's search panel."""
+    config = config or _config()
+    split = split_periods(config)
+    return _comparison_set(
+        panel=_FakeProvider(frames, members).panel, config=config, user_id=1,
+        start_date=split.search_start, end_date=split.search_end,
+        pool_loader=pool_loader, factor_limit=factor_limit, pool_limit=pool_limit,
+    )
+
+
+def test_the_comparison_set_defaults_bound_the_registry_and_the_pool():
+    """The two caps are the run's cost bound, and they are the sizes they claim to be.
+
+    Every measured name costs one point-in-time panel rebuilt once per run and one
+    cross-sectional Spearman per candidate, so the caps are what keeps a run's cost proportional
+    to something a caller chose. The registry's cap is its own size: a smaller number would
+    silently drop factors from the comparison, and a bigger one would only ever be slack.
+    """
+    assert DEFAULT_BUILTIN_COMPARISON_LIMIT == 61
+    assert pool.DEFAULT_POOL_LIMIT == 20
+
+
+def test_the_comparison_set_covers_the_registry_factors_the_panel_can_measure():
+    """Built-in coverage comes from the registry, filtered by the fields the panel carries.
+
+    That filter is what "computable" means here: the registry computes each factor from a
+    frame's fields, so a factor whose fields the panel does not carry has no point-in-time
+    values to correlate with, and listing it would only report a comparison that never ran.
+    """
+    frames, members = _frames_and_members(periods=80)
+
+    assembled = _assembly(frames, members, pool_loader=_empty_pool)
+
+    assert {"rsi", "macd", "atr"} <= set(assembled.factors)
+    assert "earnings_yield" not in assembled.factors
+    assert set(assembled.factors) <= set(_computable_factor_ids(frames))
+    assert set(assembled.panels) == set(assembled.factors)
+    for name in ("rsi", "macd"):
+        assert int(assembled.panels[name].notna().sum().sum()) >= 3
+
+
+def test_the_registry_comparison_panel_is_point_in_time():
+    """Each value is computed from the bars up to its own date, never from the whole window.
+
+    Correlating a candidate against a factor whose values were computed from data the candidate
+    never saw would decide L4 with the future. Rewriting the last bars leaves every earlier
+    value untouched -- and moves the later ones, which is what keeps the first half from being
+    vacuously equal to a panel that is a constant.
+    """
+    frames, members = _frames_and_members(periods=80)
+    name = _computable_factor_ids(frames)[0]
+
+    before = _assembly(frames, members, pool_loader=_empty_pool, factor_limit=1)
+    assert before.factors == (name,)
+    mutated = {key: frame.copy() for key, frame in frames.items()}
+    for frame in mutated.values():
+        frame.iloc[-20:] = frame.iloc[-20:] * 3.0
+    after = _assembly(mutated, members, pool_loader=_empty_pool, factor_limit=1)
+
+    panel = before.panels[name]
+    assert len(panel) > 8, "the window must reach past the bars the mutation touches"
+    pd.testing.assert_frame_equal(panel.iloc[:3], after.panels[name].iloc[:3])
+    assert not panel.iloc[-3:].equals(after.panels[name].iloc[-3:])
+
+
+def test_the_registry_panel_is_built_on_the_studys_own_index():
+    """A comparison panel must be aligned with the candidate's, whatever the frames arrived as.
+
+    The study normalizes the frames it reads, so a panel built from the raw ones would carry a
+    different index: every date lookup would miss, the panel would be empty on every date, and
+    the factor would drop out of the study without a word -- a de-duplication gate running
+    against one comparison factor fewer, and reporting nothing about it.
+    """
+    frames, members = _frames_and_members(periods=80)
+    localized = {key: frame.set_axis(frame.index.tz_localize("UTC"))
+                 for key, frame in frames.items()}
+
+    assembled = _assembly(localized, members, pool_loader=_empty_pool, factor_limit=1)
+
+    panel = assembled.panels[assembled.factors[0]]
+    assert int(panel.notna().sum().sum()) >= 3
+    assert panel.index.equals(pd.Index(_assembly(frames, members, pool_loader=_empty_pool,
+                                                factor_limit=1).panels[assembled.factors[0]].index))
+
+
+def test_the_comparison_set_is_capped_in_registry_order():
+    """The cap truncates the tail of a deterministic order, so a run's comparison set repeats.
+
+    An unstable order would not only move the truncation point between runs: the correlation
+    matrix's columns would follow it, so two runs over the same panel would report the same
+    candidate against a differently ordered set of factors.
+    """
+    frames, members = _frames_and_members(periods=80)
+
+    limited = _assembly(frames, members, pool_loader=_empty_pool, factor_limit=2)
+
+    assert limited.factors == tuple(_computable_factor_ids(frames)[:2])
+    assert set(limited.panels) == set(limited.factors)
+
+
+def test_pool_members_are_namespaced_and_their_skips_are_reported():
+    """The pool half of the comparison set: scoped, prefixed, capped, and never silently short.
+
+    A pooled candidate is a fingerprint, which is not a name a reader can tell apart from a
+    registry factor id, so every member is namespaced. A member whose stored expression no
+    longer evaluates is handed back as a skip rather than dropped: a comparison set that is one
+    member shorter than the pool looks exactly like a pool that never had it.
+    """
+    from app.services.factor_mining.pool import PoolMember
+
+    frames, members = _frames_and_members(periods=80)
+    calls: list[tuple] = []
+    pooled = [
+        PoolMember(candidate_id=7, fingerprint="a" * 64, expression=_POOL_MEMBER),
+        PoolMember(candidate_id=8, fingerprint="b" * 64,
+                   expression={"op": "nope", "args": [], "params": {}}),
+    ]
+
+    assembled = _assembly(frames, members, pool_loader=_recording_pool(pooled, calls),
+                          factor_limit=0, pool_limit=5)
+
+    assert calls == [(1, "USStock", "1d", {"limit": 5})]
+    assert assembled.factors == ()
+    assert assembled.pool == ("pool:aaaaaaaa",)
+    assert set(assembled.panels) == {"pool:aaaaaaaa"}
+    assert assembled.skipped == (
+        {"fingerprint": "b" * 64, "reason": "factorMining.reject.invalid"},
+    )
+
+
+def test_the_pool_section_follows_the_order_the_pool_loader_returned():
+    """The pool half keeps the loader's order; nothing here re-sorts or de-duplicates by name.
+
+    ``load_pool`` hands its members back newest first, and that order is what the cap keeps, so
+    it is the order the comparison set is built in. The study's correlation matrix follows the
+    name list it was handed, and L4 reads its columns by name: an assembly that sorted the pool
+    -- or dropped it through a set -- would move those columns between two runs over the same
+    pool, and a stored run's ``factorCorrelation`` would no longer line up with one taken again.
+    The fingerprints are picked so id-descending and fingerprint-ascending disagree, which is
+    what makes a ``sorted()`` visible here rather than a coincidence.
+    """
+    from app.services.factor_mining.pool import PoolMember
+
+    frames, members = _frames_and_members(periods=80)
+    pooled = [
+        PoolMember(candidate_id=9, fingerprint="f" * 64, expression=_POOL_MEMBER),
+        PoolMember(candidate_id=4, fingerprint="a" * 64, expression=_POOL_MEMBER),
+        PoolMember(candidate_id=2, fingerprint="b" * 64, expression=_POOL_MEMBER),
+    ]
+
+    assembled = _assembly(frames, members, pool_loader=_recording_pool(pooled, []),
+                          factor_limit=0, pool_limit=5)
+
+    assert assembled.pool == ("pool:ffffffff", "pool:aaaaaaaa", "pool:bbbbbbbb")
+    assert set(assembled.panels) == set(assembled.pool)
+
+
+def test_a_pool_members_twin_is_rejected_under_the_pool_key():
+    """The pool half reaches the ledger: a candidate duplicating a frozen member says so.
+
+    The injected built-in is measured and clear, so the only reading above its bar is the pooled
+    one -- and the row that records the rejection names the pool, not the registry. This is the
+    seam the second threshold exists for: the same candidate measured against the registry alone
+    would have passed, and a ledger that called this a built-in duplicate would send a reader
+    looking for a factor that is not there.
+    """
+    frames, members = _fixture()
+    provider = _FakeProvider(frames, members)
+    provider.comparison = ComparisonSet(
+        factors=("rsi",),
+        pool=("pool:deadbeef",),
+        panels={"rsi": _unrelated_panel(frames),
+                "pool:deadbeef": _evaluator(frames, _NEGATED_MOMENTUM_5)},
+    )
+
+    result = FactorMiningEngine(data_provider=provider).run(
+        user_id=1, code="PORTFOLIO = {}", config=_config(),
+    )
+
+    assert result["trials"][0]["stage"] == "L4"
+    assert result["trials"][0]["reason"] == "factorMining.reject.duplicateInPool"
+
+
+def test_a_pool_member_that_never_rebuilt_rejects_the_candidate():
+    """A member the pool could not rebuild is asked about too, and it is not a clearance.
+
+    ``pool_panels`` hands back a member whose stored expression no longer evaluates as a skip
+    rather than a panel, and the assembly keeps it out of the comparison names -- so the only way
+    the gate hears about it at all is the skip list, carried as the pool name the member would
+    have had and no reading. The comparison set here is a real assembly over a pool of one
+    unreadable member, the shape a stored pool takes after an operator set moves on: with the
+    skip dropped, the run compares against a set one member short of the pool, reports nothing,
+    and accepts candidates the pool may already hold.
+    """
+    from app.services.factor_mining.pool import PoolMember
+
+    frames, members = _fixture()
+    unreadable = [PoolMember(candidate_id=7, fingerprint="a" * 64,
+                             expression={"op": "nope", "args": [], "params": {}})]
+    provider = _FakeProvider(frames, members)
+    provider.comparison = _assembly(frames, members, pool_loader=_recording_pool(unreadable, []),
+                                    factor_limit=0, pool_limit=5)
+    assert provider.comparison.pool == () and provider.comparison.factors == ()
+    assert [item["fingerprint"] for item in provider.comparison.skipped] == ["a" * 64]
+
+    result = FactorMiningEngine(data_provider=provider).run(
+        user_id=1, code="PORTFOLIO = {}", config=_config(),
+    )
+
+    assert result["trials"][0]["stage"] == "L4"
+    assert result["trials"][0]["reason"] == "factorMining.reject.unverifiableRedundancy"
+
+
+def test_a_pool_member_that_could_not_be_measured_rejects_the_candidate():
+    """A member the study could not compare still reaches the gate -- as no evidence.
+
+    The member was asked about and is absent from the study, which looks exactly like a pool that
+    never held it unless the engine carries the name back with a NaN. Without that the gate sees
+    a comparison set that was fully measured and clears a candidate whose own library holds a
+    member nothing could be measured against -- the skipped member read as a distinction it never
+    earned. The built-in section here measured cleanly, which is the point: one section's reading
+    does not stand in for the other's.
+    """
+    frames, members = _fixture()
+    provider = _FakeProvider(frames, members)
+    provider.comparison = ComparisonSet(
+        factors=("rsi",),
+        pool=("pool:deadbeef",),
+        panels={"rsi": _unrelated_panel(frames),
+                "pool:deadbeef": _evaluator(frames, _MOMENTUM_5) * float("nan")},
+    )
+
+    result = FactorMiningEngine(data_provider=provider).run(
+        user_id=1, code="PORTFOLIO = {}", config=_config(),
+    )
+
+    assert result["trials"][0]["stage"] == "L4"
+    assert result["trials"][0]["reason"] == "factorMining.reject.unverifiableRedundancy"
+
+
+def test_a_pool_member_with_no_correlatable_cross_section_rejects_the_candidate():
+    """A member the study could name but never *pair* is not a clearance either.
+
+    The member's panel is not empty -- it holds a full column of values, so the study's
+    observation filter keeps its name and reports it as measured -- but every one of its cells
+    sits on a symbol outside the run's universe, so no cross-section reaches the three paired
+    names a correlation needs. The study writes what it has to write there: a ``0.0`` placeholder
+    with a zero observation count, "not measured" spelled as a number. Read as a reading, that
+    placeholder clears the candidate -- exactly the plausible-but-wrong zero the per-section
+    fail-closed rule exists to stop, reached by a name that never left the mapping. The built-in
+    half measured cleanly, so the rejection can only come from the pool's own section.
+    """
+    frames, members = _fixture()
+    # One real panel's worth of rows and dates, carried under a symbol the universe does not hold.
+    unrelated = _unrelated_panel(frames)
+    orphan = unrelated[[unrelated.columns[0]]].rename(columns={unrelated.columns[0]: "ZZ"})
+    assert list(orphan.columns) == ["ZZ"] and orphan.notna().to_numpy().sum() >= 3
+    provider = _FakeProvider(frames, members)
+    provider.comparison = ComparisonSet(
+        factors=("rsi",),
+        pool=("pool:deadbeef",),
+        panels={"rsi": unrelated, "pool:deadbeef": orphan},
+    )
+
+    result = FactorMiningEngine(data_provider=provider).run(
+        user_id=1, code="PORTFOLIO = {}", config=_config(),
+    )
+
+    assert result["trials"][0]["stage"] == "L4"
+    assert result["trials"][0]["reason"] == "factorMining.reject.unverifiableRedundancy"
+
+
+def test_the_candidate_is_compared_against_registry_factors():
+    """A mined candidate is measured against registry factors, not only the six proxies.
+
+    The set the engine assembled is what the study used: the names it reports participating are
+    exactly the assembled ones, and the proxies are absent rather than quietly re-added -- an
+    injected set replaces the default pool instead of joining it.
+    """
+    frames, members = _frames_and_members(periods=80)
+    provider = _FakeProvider(frames, members)
+    config = _config(thresholds=_NO_DEDUPLICATION)
+    split = split_periods(config)
+    provider.comparison = _comparison_set(
+        panel=provider.panel, config=config, user_id=1,
+        start_date=split.search_start, end_date=split.search_end,
+        pool_loader=_empty_pool, factor_limit=3,
+    )
+
+    result = FactorMiningEngine(data_provider=provider).run(
+        user_id=1, code="PORTFOLIO = {}", config=config,
+    )
+
+    assert result["candidates"], "a comparison set with no measurement would reject everything"
+    names = result["candidates"][0]["metrics"]["factorCorrelation"]["factors"]
+    assert set(provider.comparison.factors) <= set(names)
+    assert "reversal_5" not in names
+    assert result["summary"]["comparisonFactors"]["builtin"] == list(provider.comparison.factors)
+
+
+def test_the_provider_hands_its_own_caps_to_the_comparison_set():
+    """The caps and the pool reader are the provider's, so a caller can bound the cost of a run.
+
+    The comparison set is assembled by the provider because it is panel-shaped data, and its two
+    bounds are the provider's own settings -- a run's cost is symbols x dates x comparison
+    factors, and a deployment that finds that too much has to be able to lower it without
+    touching the search. Nothing here reaches the panel's own fetcher: only the pool loader is
+    called, which is why a provider built without a backtest service is enough.
+    """
+    frames, members = _frames_and_members(periods=80)
+    calls: list[tuple] = []
+    provider = MiningDataProvider(pool_loader=_recording_pool([], calls),
+                                  comparison_factor_limit=2, pool_limit=3)
+    config = _config()
+    split = split_periods(config)
+
+    assembled = provider.comparison_set(
+        panel=_FakeProvider(frames, members).panel, config=config, user_id=9,
+        start_date=split.search_start, end_date=split.search_end,
+    )
+
+    assert assembled.factors == tuple(_computable_factor_ids(frames)[:2])
+    assert calls == [(9, "USStock", "1d", {"limit": 3})]
+
+
+def test_the_run_reports_the_names_it_compared_and_those_it_could_not():
+    """What a stored run compared against is readable afterwards, skips included.
+
+    The candidate's own metrics carry the names that were really measured; the run's summary
+    carries what was asked for, which is the pair a reader needs to tell "measured as unrelated"
+    from "never measured" -- the distinction the de-duplication gate refuses to blur.
+    """
+    provider = _FakeProvider(*_fixture())
+    provider.comparison = ComparisonSet(
+        factors=("rsi",),
+        pool=("pool:deadbeef",),
+        panels={
+            "rsi": _evaluator(_fixture()[0], _MOMENTUM_5),
+            "pool:deadbeef": _evaluator(_fixture()[0], _NEGATED_MOMENTUM_5),
+        },
+        skipped=({"fingerprint": "f" * 64, "reason": "factorMining.reject.invalid"},),
+    )
+    engine = FactorMiningEngine(data_provider=provider)
+
+    result = engine.run(user_id=1, code="PORTFOLIO = {}",
+                        config=_config(thresholds=_NO_DEDUPLICATION))
+
+    assert result["summary"]["comparisonFactors"] == {
+        "builtin": ["rsi"],
+        "pool": ["pool:deadbeef"],
+        "skipped": [{"fingerprint": "f" * 64, "reason": "factorMining.reject.invalid"}],
+    }
+    names = result["candidates"][0]["metrics"]["factorCorrelation"]["factors"]
+    assert names == ["expression", "rsi", "pool:deadbeef"]
+
+
+def test_a_run_keeps_the_increment_inputs_of_its_own_search_window():
+    """L6's inputs are assembled by the search, out of the search window, out of the pool's half.
+
+    The increment is a search-period judgment -- what this candidate adds to the library the run
+    compared it against -- so the run assembles the evidence while it holds both: the search
+    panel's own field panels, the search window's research dates, and the returns over them. The
+    registry's factors are left out (they are the comparison L4 already made, not the library a
+    candidate is added to), and the frozen tail is not in the panel to begin with, because the
+    search's own fetch stops at ``search_end``. A member the comparison could not rebuild travels
+    as a skip, under the name L4 would have asked about it by.
+    """
+    frames, members = _fixture()
+    config = _config(budget=1)
+    split = split_periods(config)
+    provider = _FakeProvider(frames, members)
+    provider.comparison = ComparisonSet(
+        factors=("rsi",),
+        pool=("pool:deadbeef",),
+        panels={
+            "rsi": _evaluator(frames, _MOMENTUM_5),
+            "pool:deadbeef": _unrelated_panel(frames),
+        },
+        skipped=({"fingerprint": "f" * 64, "reason": "factorMining.reject.invalid"},),
+    )
+
+    engine = FactorMiningEngine(data_provider=provider)
+    engine.run(user_id=1, code="PORTFOLIO = {}", config=config)
+
+    evidence = engine._pool_increment
+    assert evidence is not None, "the run is what assembles L6's inputs; the review reads them"
+    assert set(evidence.members) == {"pool:deadbeef"}, "the registry's factors are not the library"
+    assert evidence.skipped == ("pool:ffffffff",)
+    assert evidence.fields is provider.panel.fields, "the candidates' own panels, not a copy"
+    # One grid for all three sides of the regression, inside the search window and nowhere else.
+    assert evidence.members["pool:deadbeef"].index.equals(evidence.returns.index)
+    assert evidence.returns.index.min() >= pd.Timestamp(split.search_start)
+    assert evidence.returns.index.max() <= pd.Timestamp(split.search_end)
+
+
+def test_an_empty_comparison_set_keeps_the_builtin_proxies():
+    """Nothing assembled is not the same as comparing against nothing.
+
+    An empty set handed to the study as an empty mapping would leave the de-duplication gate
+    with no finite measurement at all, and its fail-closed rule would reject every candidate of
+    the run -- a search with no pool and no registry hit would find nothing, ever.
+    """
+    result, _ = _search(thresholds=_NO_DEDUPLICATION)
+
+    names = result["candidates"][0]["metrics"]["factorCorrelation"]["factors"]
+    assert "reversal_5" in names
+
+
 def test_a_run_made_under_a_patched_expansion_is_never_memoized(monkeypatch):
     """A patched expansion's run must not answer the template search's memoized key.
 
@@ -752,6 +1232,117 @@ def test_a_failing_candidate_does_not_stop_the_candidates_after_it(monkeypatch):
     assert result["trials"][1]["reason"] == ""
 
 
+# --- the field set the run's market allows, at every point that validates a candidate ----------
+
+# A candidate that *names* a derivatives leaf without depending on its values: the condition holds
+# on every bar of the fixture, so its panel is the momentum leg alone. What these tests read is
+# which leaf the run's field set admits -- a candidate whose panel was a column of nothing would
+# be refused by a later gate, for a reason this fixture cannot tell apart from the one it means.
+_FUNDING_LEG = {
+    "op": "where",
+    "args": [
+        {"op": "gt", "args": ["close", {"op": "const", "args": [], "params": {"value": 0}}],
+         "params": {}},
+        {"op": "ts_pct_change", "args": ["close"], "params": {"n": 3}},
+        "funding_rate",
+    ],
+    "params": {},
+}
+
+
+def _funding_seed(expression, market="Crypto"):
+    """A seed for an expression only ``market``'s field set admits.
+
+    ``_seed_for`` cannot build this one -- it fingerprints through the DSL, which refuses the leaf
+    under the default set -- so the fingerprint is read the way the engine reads it.
+    """
+    from app.services.factor_mining.dsl import normalize_expression
+    from app.services.factor_mining.templates import CandidateSeed
+
+    return CandidateSeed(
+        expression=expression,
+        fingerprint=normalize_expression(expression, allowed_fields=fields_for(market)).fingerprint,
+        template_id="momentum", origin="template", params={},
+    )
+
+
+def test_a_derivatives_field_is_accepted_after_the_field_set_is_threaded_through(monkeypatch):
+    """A Crypto run may name a derivatives field, and the whole ladder has to agree it may.
+
+    L1 is not the only validation point in the path: the evaluator normalizes every subtree it
+    memoizes, so a field set that stopped at the DSL call would raise inside the candidate the
+    whitelist had just admitted.
+    """
+    result, _ = _run_with_seeds(monkeypatch, [_funding_seed(_FUNDING_LEG)], market="Crypto",
+                                thresholds=_NO_DEDUPLICATION)
+    assert [item["verdict"] for item in result["trials"]] == ["pass"]
+    assert result["candidates"], "a candidate that cleared L1-L4 is kept, not merely tolerated"
+
+
+def test_a_derivatives_field_is_rejected_when_the_market_has_none(monkeypatch):
+    """On a market with no funding history the leaf is an unknown field, not a missing column.
+
+    This is the direction the whitelist must not lose: a USStock run reads the same expression
+    against the price-volume group alone and refuses it at L1, with the field key.
+    """
+    result, _ = _run_with_seeds(monkeypatch, [_funding_seed(_FUNDING_LEG)])
+    assert [item["verdict"] for item in result["trials"]] == ["reject"]
+    assert result["trials"][0]["stage"] == "L1"
+    assert result["trials"][0]["reason"] == "factorMining.reject.invalid"
+    assert result["candidates"] == []
+
+
+@pytest.mark.parametrize("market,refused", [("Crypto", False), ("USStock", True)])
+def test_the_frozen_review_reads_the_survivor_under_the_runs_field_set(market, refused):
+    """L5 re-reads the survivor on the tail, so it has to be handed the field set L1 was.
+
+    A review that fell back to the default would reject a derivatives survivor as invalid -- the
+    one verdict that says "the expression is broken" about an expression that is not.
+    """
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    survivor = {"expression": _FUNDING_LEG, "fingerprint": "f" * 64, "origin": "template",
+                "template_id": "momentum", "status": "search", "reason": "",
+                "metrics": {}, "outOfSample": {}}
+    reviewed = engine.review_frozen(user_id=1, code="PORTFOLIO = {}", config=_config(market=market),
+                                    survivors=[survivor], trials_count=1)
+    assert (reviewed[0]["reason"] == "factorMining.reject.invalid") is refused
+
+
+def test_the_warmup_scan_reads_the_candidates_under_the_runs_field_set(monkeypatch):
+    """The warmup pre-scan normalizes every template candidate before a bar is fetched.
+
+    A leaf the set refuses raises out of the scan, which ends the run before a single candidate
+    was scored -- the same rejection as L1's, only louder. The window is longer than the fixture's
+    templates so the answer cannot hide behind the warmup floor.
+    """
+    seed = _funding_seed({"op": "ts_mean", "args": ["funding_rate"], "params": {"n": 60}})
+    monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: [seed])
+    assert _warmup_bars(_config(market="Crypto"), "enumeration") == 60 + engine_module.WARMUP_MARGIN_BARS
+
+
+def test_the_fitness_lookup_reads_an_expression_under_the_runs_field_set(monkeypatch):
+    """Evolution ranks a generation by what this run measured for each member.
+
+    ``fitness`` fingerprints the member to find that measurement, and a member it cannot name is
+    "unmeasured" rather than "bad": it can never be an elite. A default field set here would rank
+    every derivatives individual last while the run reported nothing wrong.
+    """
+    seed = _funding_seed(_FUNDING_LEG)
+    answers: list = []
+
+    def stream(source, *, fitness, **_kwargs):
+        # A generator, so the body runs on the first pull -- after the generation chained ahead of
+        # it was scored, which is the only point at which the lookup has an answer to give.
+        yield from ()
+        answers.append(fitness(seed.expression))
+
+    monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: [seed])
+    monkeypatch.setattr(engine_module, "evolve", stream)
+    _run(*_fixture(), search_mode="evolution", market="Crypto", thresholds=_NO_DEDUPLICATION)
+    assert answers and answers[0] is not None, \
+        "the individual was scored, so the lookup has no excuse for not naming it"
+
+
 def test_run_reports_the_config_split_and_summary():
     result, _ = _search()
     assert result["config"]["market"] == "USStock"
@@ -799,3 +1390,268 @@ def test_the_research_engine_is_told_the_runs_own_frequency(monkeypatch):
     calls.clear()
     _run(_fixture()[0], crypto)
     assert {call["annualization_periods"] for call in calls} == {365.25}
+
+
+# --- the candidate source: the template expansion, or a stream the engine breeds -----------
+
+
+def test_evolution_warmup_uses_the_dsl_lookback_budget(monkeypatch):
+    """Evolution's warmup is the DSL's ceiling, taken without expanding anything first.
+
+    An evolved individual's longest window is not knowable before it has been bred -- a crossover
+    may graft a 252-bar window onto any path -- so the ceiling is the only bound that stays
+    correct for a run that breeds. Enumeration keeps the candidate-derived warmup instead; that
+    half is pinned where the fetch itself is (`test_enumeration_warmup_is_unchanged_from_v1`).
+    """
+    config = _config(template_ids=("reversal",), budget=200, seed=3)
+    monkeypatch.setattr(engine_module, "expand_candidates",
+                        lambda **kwargs: pytest.fail("evolution must not pre-scan candidates"))
+    assert _warmup_bars(config, "evolution") == MAX_LOOKBACK == 504
+
+
+def _stream_run(monkeypatch, individuals, seeds=(), **overrides):
+    """One evolution pass over ``seeds`` and then exactly ``individuals``.
+
+    Both halves are patched so a test decides the whole stream: the template generation the
+    engine scores first, and what evolution yields after it. The empty default leaves the bred
+    half alone, which is what a test about the engine's own handling of an individual wants.
+    """
+    monkeypatch.setattr(engine_module, "expand_candidates", lambda **kwargs: list(seeds))
+    monkeypatch.setattr(engine_module, "evolve", lambda source, **kwargs: iter(individuals))
+    return _run(*_fixture(), search_mode="evolution", **overrides)
+
+
+def test_search_consumes_a_generator_source(monkeypatch):
+    """A stream source is pulled one individual at a time, and its progress is priced in budget.
+
+    Two properties in one run. The engine has to score what it already holds before the stream
+    is resumed: evolution ranks a generation by the caller's answer about its members, and that
+    answer exists only once the engine has evaluated them -- draining the stream first would
+    rank every generation on nothing. And the progress total is the generation plus the budget,
+    not the length of what the stream produced: draws that yield nothing still spend budget, so
+    the output is an outcome, never a length a reporter may announce in advance.
+    """
+    generation = _seeds(2)
+    bred = _seeds(10)
+    scored_between_draws: list[float | None] = []
+
+    def stream(source, *, fitness, **_kwargs):
+        for index, seed in enumerate(bred):
+            if index:
+                # Asked from inside the stream: the individual yielded before this point is only
+                # answerable if the consumer evaluated it before asking for the next one.
+                scored_between_draws.append(fitness(bred[index - 1].expression))
+            yield seed
+
+    monkeypatch.setattr(engine_module, "evolve", stream)
+    with _patched_expansion(monkeypatch, generation):
+        result, seen = _run(*_fixture(), search_mode="evolution", budget=25,
+                            thresholds=_NO_DEDUPLICATION)
+    assert scored_between_draws and all(value is not None for value in scored_between_draws), \
+        "the stream was drained before its individuals were scored"
+    assert len(result["trials"]) == 2 + 10
+    assert seen == [{"stage": "search", "evaluated": 10, "total": 2 + 25}]
+
+
+def test_every_scored_individual_cleared_l1_first(monkeypatch):
+    """An individual reaches the evaluator only after L1 validated it, whoever produced it.
+
+    A window perturbation can build a tree no template could -- three nested 252-bar windows,
+    whose lookback is 756 -- and every layer below L1 would compute it without complaint, so L1
+    is what keeps an evolved individual inside the lookback bound. The individual it refuses is
+    a rejected trial rather than a measurement, and the run carries on to the next one.
+    """
+    over_budget = {"op": "ts_mean", "args": [
+        {"op": "ts_mean", "args": [
+            {"op": "ts_mean", "args": ["close"], "params": {"n": 252}}], "params": {"n": 252}}],
+        "params": {"n": 252}}
+    healthy = {"op": "ts_pct_change", "args": ["close"], "params": {"n": 3}}
+    reached_the_evaluator: list = []
+    real_evaluate = ExpressionEvaluator.evaluate
+
+    def recording(self, node):
+        reached_the_evaluator.append(node)
+        return real_evaluate(self, node)
+
+    monkeypatch.setattr(ExpressionEvaluator, "evaluate", recording)
+    result, _ = _stream_run(monkeypatch, [_unvalidated_seed(over_budget), _seed_for(healthy)],
+                            thresholds=_NO_DEDUPLICATION)
+    invalid, scored = result["trials"]
+    assert (invalid["stage"], invalid["verdict"]) == ("L1", "reject")
+    assert invalid["reason"] == "factorMining.reject.invalid"
+    assert reached_the_evaluator == [healthy], "the individual L1 refused was evaluated anyway"
+    assert scored["verdict"] == "pass"
+
+
+def _unvalidated_seed(expression):
+    """A seed the DSL refuses, which ``_seed_for`` cannot build: it fingerprints through the DSL.
+
+    The fingerprint is spelled here because an individual L1 rejects never produces one -- which
+    is half of what the test above is about.
+    """
+    from app.services.factor_mining.templates import CandidateSeed
+
+    return CandidateSeed(expression=expression, fingerprint="0" * 64, template_id="evolution",
+                         origin="evolution", params={})
+
+
+def test_the_template_seeds_are_evaluated_in_evolution_mode():
+    """The seeds evolution breeds from are candidates of this run, and are scored like any other.
+
+    The template library is the only place this feature's hypotheses come from, so an evolution
+    run that bred without evaluating its generation would throw away every hypothesis-backed
+    candidate -- and the ledger, which prices the search, would be missing exactly the candidates
+    R6's fingerprint set assumes it holds.
+    """
+    generation = expand_candidates(budget=12, seed=3)
+    result, _ = _run(*_fixture(), search_mode="evolution", thresholds=_NO_DEDUPLICATION)
+    scored = [item["fingerprint"] for item in result["trials"]]
+    assert [seed.fingerprint for seed in generation] == scored[:len(generation)]
+    assert len(scored) > len(generation), "this run must also have bred something"
+
+
+def test_the_generation_is_ranked_before_evolution_breeds(monkeypatch):
+    """The first generation has measurements by the time evolution's body runs.
+
+    The template generation is chained in front of the bred stream, and a generator's body runs
+    on the first pull -- which is the pull after the generation has been exhausted, and therefore
+    after every seed has been scored. Breeding from an unranked generation is what a ``None``
+    answer is for, and it is not what a run should start from when the seeds are right there.
+    """
+    generation = _seeds(3)
+    opinions: list[float | None] = []
+
+    def stream(source, *, fitness, **_kwargs):
+        opinions.extend(fitness(seed.expression) for seed in generation)
+        # A generator with nothing to yield: the body above still runs on the first pull, and it
+        # must not run at construction time or this test would measure the wrong moment.
+        for individual in ():
+            yield individual
+
+    monkeypatch.setattr(engine_module, "evolve", stream)
+    with _patched_expansion(monkeypatch, generation):
+        _run(*_fixture(), search_mode="evolution", thresholds=_NO_DEDUPLICATION)
+    assert opinions and all(value is not None for value in opinions), \
+        "the first generation was bred from before it was ranked"
+
+
+def test_every_emitted_individual_gets_a_trial_row(monkeypatch):
+    """Every individual the engine receives is evaluated and written down, generation included.
+
+    The ledger is the denominator of the selection-bias correction, so nothing the run scored may
+    be missing from it. What the engine receives is the template generation plus what evolution
+    yields from it, and the two are bounded differently: the generation is a count the run knows,
+    while the yield is only bounded by the budget -- a refused draw, and a draw that repeats an
+    expression the run already holds, both spend budget without being an individual at all.
+    """
+    emitted: list = []
+    real_evolve = engine_module.evolve
+
+    def counting(source, **kwargs):
+        for individual in real_evolve(source, **kwargs):
+            emitted.append(individual)
+            yield individual
+
+    monkeypatch.setattr(engine_module, "evolve", counting)
+    result, _ = _run(*_fixture(), search_mode="evolution", budget=20, thresholds=_NO_DEDUPLICATION)
+    generation = expand_candidates(budget=20, seed=3)
+    assert emitted, "the stream produced nothing, so this run says nothing about the ledger"
+    assert [item["fingerprint"] for item in result["trials"]] == \
+        [seed.fingerprint for seed in generation] + [seed.fingerprint for seed in emitted]
+    assert len(emitted) <= 20, "the budget bounds the draws, not the run's ledger"
+
+
+@pytest.mark.parametrize("search_mode", ["enumeration", "evolution"])
+def test_run_is_byte_identical_for_the_same_seed(search_mode):
+    """Two runs of one mode and one seed produce the same ledger, byte for byte.
+
+    Evolution draws its randomness from ``random.Random(seed)`` alone and its fitness is the
+    engine's own measurement, so the bred population, its trials and their order are all
+    reproducible. Comparing serialized records rather than fingerprints is what makes this
+    byte-identical: a reordered metric or a changed float would pass a fingerprint comparison.
+    """
+    first, _ = _run(*_fixture(), search_mode=search_mode, thresholds=_NO_DEDUPLICATION)
+    second, _ = _run(*_fixture(), search_mode=search_mode, thresholds=_NO_DEDUPLICATION)
+    assert first is not second, "a memoized second run would compare a record with itself"
+    assert json.dumps(first["trials"], sort_keys=True) == json.dumps(second["trials"], sort_keys=True)
+    assert len(first["trials"]) > 1, "a single repeated trial would satisfy any equality"
+
+
+def test_the_search_and_the_review_tell_the_provider_which_warmup_rule_applies():
+    """The warmup follows the mode, so the engine has to say which mode the panel is for.
+
+    A provider left to guess would fetch v1's candidate-derived window for an evolved run --
+    short of the history the candidates being reviewed need, and silent about it.
+    """
+    provider = _FakeProvider(*_fixture())
+    engine = FactorMiningEngine(data_provider=provider)
+    survivor = {"expression": _MOMENTUM_5, "fingerprint": "f" * 64, "origin": "template",
+                "template_id": "momentum", "status": "search", "reason": "",
+                "metrics": {}, "outOfSample": {}}
+    engine.run(user_id=1, code="PORTFOLIO = {}", config=_config(budget=2),
+               search_mode="evolution")
+    engine.review_frozen(user_id=1, code="PORTFOLIO = {}", config=_config(), survivors=[survivor],
+                         trials_count=1, search_mode="evolution")
+    assert provider.search_modes == ["evolution", "evolution"]
+
+
+def test_the_breeding_settings_come_from_the_run_config(monkeypatch):
+    """The population, its generations and its elite share are the run's own, not the engine's.
+
+    A second copy of these numbers inside the engine would leave a stored run's config unable to
+    explain the search it ran -- the record and the numbers would be free to drift apart.
+    """
+    seen: dict = {}
+
+    def stream(source, **kwargs):
+        seen.update(kwargs)
+        return iter(())
+
+    monkeypatch.setattr(engine_module, "evolve", stream)
+    _run(*_fixture(), search_mode="evolution", population=7, generations=3, elite_ratio=0.5,
+         thresholds=_NO_DEDUPLICATION)
+
+    assert (seen["population"], seen["generations"], seen["elite_ratio"]) == (7, 3, 0.5)
+
+
+def test_a_run_that_names_no_mode_is_byte_identical_to_enumeration():
+    """No mode named anywhere searches v1's templates: the same candidates, byte for byte.
+
+    The service leans on this default, so it is pinned here rather than assumed -- a changed
+    default would move what every v1 caller searches without any of them naming a mode.
+    """
+    unnamed = FactorMiningEngine(data_provider=_FakeProvider(*_fixture())).run(
+        user_id=1, code="PORTFOLIO = {}", config=_config(thresholds=_NO_DEDUPLICATION),
+    )
+    named, _ = _search(thresholds=_NO_DEDUPLICATION)
+    assert unnamed["candidates"], "a run with no candidates would satisfy any comparison"
+    assert json.dumps(unnamed["candidates"], sort_keys=True) == \
+        json.dumps(named["candidates"], sort_keys=True)
+
+
+def test_an_unknown_search_mode_is_refused_rather_than_enumerated():
+    """A mode the engine does not know is a caller's bug, not a request for the default.
+
+    Enumerating anyway would search the templates and label the run with the mode it was asked
+    for -- two records disagreeing about what ran, and a caller who cannot see the difference.
+    """
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        engine.run(user_id=1, code="PORTFOLIO = {}", config=_config(), search_mode="genetic")
+
+
+def test_the_review_refuses_an_unknown_search_mode_too():
+    """Both entries read the same config, so both have to answer for its mode.
+
+    A mode the search would have refused must not reach the review at all -- and the review that
+    has nothing to review is no exception, because the two entries must not disagree about one
+    config. The refusal comes before the empty-survivors shortcut for that reason.
+    """
+    survivor = {"expression": _MOMENTUM_5, "fingerprint": "f" * 64, "origin": "template",
+                "template_id": "momentum", "status": "search", "reason": "",
+                "metrics": {}, "outOfSample": {}}
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    for survivors in ([survivor], []):
+        with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+            engine.review_frozen(user_id=1, code="PORTFOLIO = {}", config=_config(),
+                                 survivors=survivors, trials_count=1, search_mode="genetic")

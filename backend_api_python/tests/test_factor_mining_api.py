@@ -14,6 +14,7 @@ import pytest
 from flask import Flask, g
 
 from app.routes import factor_mining as mining_routes
+from app.services.factor_mining import service as mining_service
 from app.services.factor_mining.engine import MiningConfig
 
 
@@ -165,10 +166,32 @@ def test_run_drops_request_keys_a_run_config_never_reads(app, service):
     }
 
 
+def test_run_and_estimate_pass_the_search_mode_and_pool_settings(app, service):
+    """The whitelist is all that stands between the body and the service: a dropped key searches
+    something else, silently. ``/estimate`` is priced the same either way and answers the same two
+    keys -- the client knows which mode it submitted, so the body does not echo one back."""
+    body = {"sourceId": 1, "searchMode": "evolution", "population": 40, "generations": 5,
+            "eliteRatio": 0.2}
+    stub = service(submit=_receipt(), estimate={"templateCount": 8, "candidateBudget": 40})
+    _invoke(app, mining_routes.run_factor_mining, path="/api/factor-mining/run", json=body)
+    estimate = _invoke(app, mining_routes.estimate_factor_mining,
+                       path="/api/factor-mining/estimate", json=body)
+    assert stub.calls["submit"]["payload"] == body
+    assert stub.calls["estimate"]["payload"] == body
+    assert estimate.get_json()["data"] == {"templateCount": 8, "candidateBudget": 40}
+
+
 def test_run_field_whitelist_matches_the_config_it_feeds():
     """The whitelist is a hand-copied key set, so a field added to ``MiningConfig`` and forgotten
-    here would drop the caller's value silently: the job would search the default instead."""
+    here would drop the caller's value silently: the job would search the default instead.
+
+    The service keeps a second hand-copied whitelist of its own -- the keys a run config is echoed
+    back under -- and the two have to name the same fields or a key the route lets through
+    disappears from the receipt. Asserting them against each other pins that, so the pair can only
+    drift together, which the first assertion would catch.
+    """
     assert {_camel(field.name) for field in dataclasses.fields(MiningConfig)} == mining_routes._RUN_FIELDS
+    assert set(mining_routes._RUN_FIELDS) == set(mining_service._JOB_CONFIG_KEYS)
 
 
 def test_estimate_prices_the_search_and_drops_unknown_keys(app, service):
@@ -318,6 +341,22 @@ def test_catalog_lists_fields_operators_and_templates(app):
     assert "close" in payload["fields"]
     assert "ts_mean" in payload["operators"]
     assert payload["templates"]
+
+
+def test_catalog_fields_follow_the_market_the_caller_is_about_to_run(app):
+    """The editor's vocabulary has to be the validator's: a Crypto run may name more fields.
+
+    The endpoint reads the market from its own query argument and resolves the set through
+    ``fields_for`` -- the call L1 validates with -- so the two cannot drift. A market this build
+    does not know takes ``fields_for``'s fallback rather than a second rule here.
+    """
+    crypto = _invoke(app, mining_routes.factor_mining_catalog, path="/?market=Crypto")
+    assert "funding_rate" in crypto.get_json()["data"]["fields"]
+    plain = _invoke(app, mining_routes.factor_mining_catalog, path="/?market=USStock")
+    assert "funding_rate" not in plain.get_json()["data"]["fields"]
+    unknown = _invoke(app, mining_routes.factor_mining_catalog, path="/?market=crypto")
+    assert unknown.get_json()["data"]["fields"] == _invoke(
+        app, mining_routes.factor_mining_catalog).get_json()["data"]["fields"]
 
 
 def test_catalog_templates_carry_metadata_but_never_the_build_callable(app):

@@ -1,0 +1,107 @@
+{
+  "source": "recorded",
+  "recorded_at": "2026-10-16T19:35:30Z",
+  "note": "Real provider responses. Binance bodies were recorded through www.binance.com (same production futures API) because fapi.binance.com answers HTTP 451 from the recording host; the fixture keeps the URL the implementation calls.",
+  "responses": [
+    {
+      "url": "https://fapi.binance.com/fapi/v1/fundingRate",
+      "params": {
+        "symbol": "BTCUSDT",
+        "startTime": 1791417600000,
+        "endTime": 1791475200000,
+        "limit": 1000
+      },
+      "body": [
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1791417600000,
+          "fundingRate": "-0.00000992",
+          "markPrice": "83282.00000000",
+          "rateType": "Regular"
+        },
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1791446400000,
+          "fundingRate": "-0.00001185",
+          "markPrice": "82949.00343478",
+          "rateType": "Regular"
+        },
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1791475200000,
+          "fundingRate": "0.00003445",
+          "markPrice": "81012.60539130",
+          "rateType": "Regular"
+        }
+      ]
+    },
+    {
+      "url": "https://fapi.binance.com/fapi/v1/fundingRate",
+      "params": {
+        "symbol": "BTCUSDT",
+        "startTime": 1791331200000,
+        "endTime": 1791446400000,
+        "limit": 2
+      },
+      "body": [
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1791331200002,
+          "fundingRate": "-0.00000743",
+          "markPrice": "85516.50151449",
+          "rateType": "Regular"
+        },
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1791360000002,
+          "fundingRate": "-0.00003657",
+          "markPrice": "84102.70600725",
+          "rateType": "Regular"
+        }
+      ]
+    },
+    {
+      "url": "https://fapi.binance.com/fapi/v1/fundingRate",
+      "params": {
+        "symbol": "BTCUSDT",
+        "startTime": 1791360000003,
+        "endTime": 1791446400000,
+        "limit": 2
+      },
+      "body": [
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1791388800000,
+          "fundingRate": "0.00001152",
+          "markPrice": "83412.00521739",
+          "rateType": "Regular"
+        },
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1791417600000,
+          "fundingRate": "-0.00000992",
+          "markPrice": "83282.00000000",
+          "rateType": "Regular"
+        }
+      ]
+    },
+    {
+      "url": "https://fapi.binance.com/fapi/v1/fundingRate",
+      "params": {
+        "symbol": "BTCUSDT",
+        "startTime": 1791417600001,
+        "endTime": 1791446400000,
+        "limit": 2
+      },
+      "body": [
+        {
+          "symbol": "BTCUSDT",
+          "fundingTime": 1791446400000,
+          "fundingRate": "-0.00001185",
+          "markPrice": "82949.00343478",
+          "rateType": "Regular"
+        }
+      ]
+    }
+  ]
+}

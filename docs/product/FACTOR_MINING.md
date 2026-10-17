@@ -15,8 +15,9 @@ the HTTP surface, the job and budget limits, and every i18n key.
 
 - Expands 8 financial-hypothesis templates into a deterministic batch of candidate expressions,
   scores each one, and keeps a complete trial ledger.
-- Screens candidates down a graded ladder (L1-L5), from "legal" to "still has out-of-sample
-  evidence on the frozen window".
+- Screens candidates down a graded ladder (L1-L6), from "legal" to "still has out-of-sample
+  evidence on the frozen window" and finally "still carries something the caller's own library
+  does not".
 - Files results in the candidate library `qd_factor_candidates`: one row per distinct expression,
   deduplicated across runs, with `run_id` pointing at the run that judged it last.
 - Keeps everything tenant-scoped, cancelable per job, and auditable afterwards -- config, data
@@ -73,8 +74,26 @@ enters an expression through the zero-arity `const` operator.
 
 ### 3.1 Field whitelist
 
-Five price-volume fields only: `open`, `high`, `low`, `close`, `volume`.
-(`PRICE_VOLUME_FIELDS`)
+Fields come in groups, and a market's set is the union of the groups that market has:
+
+| Group | Fields | Markets |
+| --- | --- | --- |
+| `price_volume` | `open`, `high`, `low`, `close`, `volume` | every market |
+| `derivatives` | `funding_rate`, `open_interest` | `Crypto` only |
+
+`fields_for(market)` returns that set, in group order. The market is matched **exactly** as the run
+spells it (`Crypto`, `USStock`): there is no case folding and no alias resolution, so `crypto` --
+or an empty or unknown market -- falls back to the `price_volume` group alone. That fallback is
+deliberate and points the refusing way: a misspelled market loses fields rather than admits them,
+and a field outside `fields_for(market)` is refused at L1 as `unknownField` anyway.
+
+A group's presence says the **data source can answer** for the field, not that every symbol has it:
+a symbol whose derivative series comes back empty keeps its frame with the field as a column of
+NaN, and the L2 coverage gate decides what that gap means. `term_structure` and `roll_cost` are in
+no group, because the futures multi-contract data face they need does not exist yet (section 11).
+
+`GET /catalog` serves this list for a market: `?market=Crypto` returns the two groups' seven fields,
+and no `market` (or one this build does not know) returns the five price-volume fields.
 
 ### 3.2 Operators (31)
 
@@ -97,11 +116,24 @@ takes none, `clip` takes one, and `where` takes three.
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
-| `MAX_DEPTH` | 6 | Maximum tree depth, the root counting as 1 |
+| `MAX_DEPTH` | 8 | Maximum tree depth, the root counting as 1 |
 | `MAX_NODES` | 24 | Maximum node count; leaves and operator nodes both count |
 | `WINDOW_MIN` | 1 | Lower bound of the window parameter `n` |
 | `WINDOW_MAX` | 252 | Upper bound of the window parameter `n` |
 | `MAX_LOOKBACK` | 504 | Upper bound on the sum of windows along any root-to-leaf path -- that is, the history this expression needs |
+
+**Why the depth bound is 8, and what it does not change.** It was 6. A cross-over grafts one
+expression's subtree onto another expression's path, so the child's depth is the two halves' added
+up -- and with no margin above the deepest legal expression, the deepest candidates cannot be
+combined at all: the deepest template expression (the base of `conditional_filter` /
+`volume_price_confirm` with its smoothing variant) sits at depth 6, exactly the old bound, and the
+raised one leaves that family 2 levels of room. The bound is a
+**validation policy, not part of what an expression means**, which is why `DSL_VERSION` was *not*
+incremented and every existing `expression_hash` is unchanged: the same expression fingerprints
+identically before and after, so no stored candidate is re-keyed by this. What does move is which
+expressions are *legal*: trees of depth 7 or 8 that used to be refused as
+`factorMining.reject.invalid:tooDeep` are now accepted, and a seed whose legal margin was tight may
+now produce a different number of rejected children.
 
 ### 3.4 Look-ahead protection
 
@@ -159,16 +191,35 @@ further is checked.
 | **L1 legality** | DSL shape, fields, operators, parameter ranges -- and the evaluation itself (division by zero, overflow, a scalar handed to a panel operator) | -- | `factorMining.reject.invalid` |
 | **L2 quick screen** | Coverage, then IC observation count, then signal strength (`\|rankIC\|`) | coverage >= 0.60; observations >= 30; `\|rankIC\|` >= 0.02 | `factorMining.reject.lowCoverage` / `factorMining.reject.insufficientObservations` / `factorMining.reject.weakIc` |
 | **L3 stability** | ICIR, fold sign agreement, first/second half agreement, average turnover | ICIR >= 0.30; fold agreement >= 0.60; halves agree in sign; turnover <= 0.70 | `factorMining.reject.weakIcir` / `factorMining.reject.unstableFolds` / `factorMining.reject.unstableHalves` / `factorMining.reject.highTurnover` |
-| **L4 built-in redundancy** | Absolute correlation against every built-in factor that was scored | < 0.85 | `factorMining.reject.duplicateBuiltin` / `factorMining.reject.unverifiableRedundancy` |
+| **L4 redundancy** | Absolute correlation against every comparison factor that was scored: the registry's factors against the built-in bar, the caller's own frozen pool (names carrying the `pool:` namespace) against the pool bar | built-ins < 0.85; pool < 0.85 | `factorMining.reject.duplicateBuiltin` / `factorMining.reject.duplicateInPool` / `factorMining.reject.unverifiableRedundancy` |
 | **L5 frozen out-of-sample** | In-sample and out-of-sample `rankIC` agree and clear the strength bar; deflated-Sharpe probability | `\|OOS rankIC\|` >= 0.01 and same sign as IS; DSR probability >= 0.95 | `factorMining.reject.weakOutOfSample` / `factorMining.reject.selectionBias` |
+| **L6 pool increment** | With the caller's whole frozen pool regressed out of the candidate on each session, is the residual still correlated with the forward returns, and on the same side as the raw IC | `\|residual IC\|` >= `min_abs_rank_ic` (0.02) **and** the residual IC carries the raw IC's sign | `factorMining.reject.noIncrementalValue` |
 
 **Details that are easy to get wrong:**
 
-- **L4 ignores non-finite correlations.** Only finite values count as evidence. A NaN means "the
-  engine could not measure it" -- fundamental factors carry no data on a price-volume run --
-  and skipping one is **not** a clearance. So when **nothing finite survives the filter**, L4
-  cannot run at all and rejects with `factorMining.reject.unverifiableRedundancy` rather than
-  waving the candidate past the ladder's only redundancy checkpoint.
+- **L4 ignores non-finite correlations, per namespace.** Only finite values count as evidence. A
+  NaN means "the engine could not measure it" -- a fundamental factor carrying no data on a
+  price-volume run, or a pool member whose stored expression no longer rebuilds -- and skipping one
+  is **not** a clearance. So the rule is grouped: a namespace (built-ins, pool) that was asked
+  about and holds **no finite value at all** makes L4 unverifiable, and the candidate is rejected
+  with `factorMining.reject.unverifiableRedundancy` rather than waved past the ladder's only
+  redundancy checkpoint. A namespace whose names were never asked about demands nothing, or every
+  run without a pool would fail closed; a mapping with nothing in it at all was never asked
+  anything either, and that is unverifiable too. Built-ins are judged first, so a candidate that
+  duplicates both is reported as the built-in duplicate it also is.
+- **L4's two bars are separate.** `max_builtin_correlation` and `max_pool_correlation` both default
+  to 0.85, but a run may weigh its own library differently from the registry's factors, so the two
+  are read apart and the reject keys stay apart -- duplicating a built-in and duplicating what the
+  caller already mined send a reader to different places.
+- **L6 only retires on a measurement.** The increment has three states, and only one of them is a
+  rejection: `true` (carries information), `false` (measured, carries nothing the pool does not --
+  the only state a candidate may be retired on) and "no answer". A pool that is empty, or one
+  nothing could be read off, leaves the candidate **frozen** and records the reason in the
+  increment's own block: `factorMining.poolIncrement.noPool` and `factorMining.poolIncrement.unmeasured`.
+  Neither is a reject key and neither appears in a candidate's `reason`. This is deliberately the
+  opposite of L4's fail-closed rule: a candidate let through at L4 joins the pool every later run
+  compares against, so a duplicate there compounds, while one let through here has already cleared
+  L2-L5 and a reader can retire it later on evidence.
 - **An unmeasurable turnover is not a low one.** The `factorMining.reject.highTurnover` test is
   written as `not (turnover <= max_turnover)`, so both NaN and `inf` fail it (fail-closed).
 - **Absent fold consistency is skipped.** `foldIcSigns` is written by the search engine (the IC
@@ -181,7 +232,9 @@ further is checked.
 - **Thresholds are overridable.** A `POST /run` payload may carry a `thresholds` object whose keys
   are the `GateThresholds` field names (snake_case): `min_coverage`, `min_ic_observations`,
   `min_abs_rank_ic`, `min_icir`, `min_fold_consistency`, `max_turnover`,
-  `max_builtin_correlation`, `min_oos_abs_rank_ic`, `min_deflated_sharpe_probability`. An
+  `max_builtin_correlation`, `max_pool_correlation`, `min_oos_abs_rank_ic`,
+  `min_deflated_sharpe_probability`. `min_abs_rank_ic` is the run's one signal-strength bar and
+  L6 reads the residual against the same value. An
   unrecognised key or a `null` keeps the default. A value must read as its own field's type: the
   integer-count threshold `min_ic_observations` accepts `30` and `30.0` but refuses `0.5` (which
   `int()` would silently turn into `0` and switch L2's observation floor off), and no threshold
@@ -205,6 +258,14 @@ windows share no bar. The search's data-source calls stop at the search end; the
 read exactly once**, inside `review_frozen`, and only when something survived. No candidate can
 ever touch the bars that are going to judge it.
 
+**The pool increment is read on the search window.** L6 measures what a survivor adds to the
+caller's frozen pool over the search window's own cross-sections, never over the tail: an increment
+is a search-period judgment, and the frozen segment is the evidence that judges the candidate, not
+evidence for it. The pool's members are rebuilt from their stored expressions against the very
+field panels the search scored on, which is what makes a member comparable at all; the measurement
+reads the search window's prepared frames, so bars a source returns past the window's end cannot
+reach it.
+
 **Every trial is on the ledger, failures included.** Each evaluated candidate writes one row into
 `qd_factor_trials`, passes and rejections alike. That ledger's size is the deflated-Sharpe
 denominator used at L5.
@@ -222,15 +283,25 @@ are visited in sorted order and each one's canonical OHLCV bytes are mixed into 
 symbol name is hashed too). It is a **fingerprint, not a replayable copy** -- v1 stores the digest
 and no market snapshot.
 
-**Warmup.** The fetch reaches back before the search start by an amount driven by **the candidates
-this run will actually evaluate** (the same template selection, budget, and seed): `max(40,
+**Warmup.** The fetch reaches back before the search start by an amount that depends on the search
+mode, because the two modes know different things about what they will evaluate. **Enumeration**
+knows exactly: every candidate comes from a template, so the run measures them before it fetches --
+the same template selection, budget, and seed the search loop expands -- and asks for `max(40,
 min(504, longest lookback + 5))` bars, converted to calendar days. Budgeting the DSL's 504 ceiling
 instead would cost about 3.5x the provider history -- on a daily policy that is the difference
-between a one-year and a four-month searchable window.
+between a one-year and a four-month searchable window. **Evolution** knows nothing of the kind: a
+crossover grafts an arbitrary subtree, with any window the DSL accepts, onto an arbitrary path, so
+it takes the ceiling (`MAX_LOOKBACK=504` bars ≈ 953 calendar days) instead. Where a market-data
+policy caps the fetched range, that ceiling gets the evolved run **refused outright** -- the shared
+backtest range check raises before a bar is requested, and the job fails with
+`strategyV2.backtestRangeLimit` -- rather than searched over a shorter window.
 
-**Determinism and reproducibility.** The same panel plus the same `(templateIds, budget, seed)`
-produces the same trials and the same candidates in the same order: template expansion is seeded,
-the gate ladder is pure, and nothing iterates a set.
+**Determinism and reproducibility.** The same panel plus the same run config -- every field of the
+request, `searchMode` included -- produces the same trials and the same candidates in the same
+order. `(templateIds, budget, seed)` is only part of it: the mode decides which sources contribute
+candidates and how much history is fetched, and in evolution `population`, `generations` and
+`eliteRatio` decide what it breeds from. Template expansion is seeded, the evolution stream draws
+from `random.Random(seed)` alone, the gate ladder is pure, and nothing iterates a set.
 
 ## 7. HTTP surface
 
@@ -241,7 +312,7 @@ section 10, and `data` is `null`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/catalog` | The DSL's own vocabulary: `fields`, `operators`, `templates` |
+| `GET` | `/catalog` | The DSL's own vocabulary: `fields`, `operators`, `templates`; optional `?market=` picks the field set (section 3.1) |
 | `POST` | `/estimate` | Static price of a search, returning **exactly** `{templateCount, candidateBudget}` and nothing else; no source read, no panel, no job |
 | `POST` | `/run` | Submit a mining run; **HTTP 202**, returns the job receipt |
 | `GET` | `/jobs` | The caller's mining jobs, newest first, **without** `result` |
@@ -255,10 +326,26 @@ key never lands in the job store's request:
 
 `sourceId`, `sourceName`, `market`, `timeframe`, `startDate`, `endDate`, `freezeRatio`, `budget`,
 `seed`, `templateIds`, `groups`, `holdingPeriod`, `commission`, `slippage`, `neutralizeIndustry`,
-`thresholds`
+`thresholds`, `searchMode`, `population`, `generations`, `eliteRatio`
 
 Required: `sourceId` (positive integer), `market` (a known market key), and `startDate` / `endDate`
 (`YYYY-MM-DD`). `budget` defaults to 400 and `timeframe` to `1D`.
+
+**The four search-mode keys.** `searchMode` is `enumeration` (the default, the template expansion)
+or `evolution` (that same expansion plus the stream bred from it); any other value is refused with
+`factorMining.invalidParameter` rather than read as the default, because the two modes search
+different candidate sets over different amounts of history. `population` (default 32), `generations`
+(20) and `eliteRatio` (0.25) are the breeding settings, and they are **required — non-empty — of a
+run that breeds**: a value this layer invented would be a search nobody asked for. They are read as
+an integer, an integer and a number respectively, and bounds are enforced on the same key:
+`population` and `generations` must be >= 1, and `eliteRatio` must fall in `[0, 1)` (a share of 1 or
+more leaves the breeding loop no room for children, and the run would search the templates, breed
+nothing, and still be recorded as a success). In enumeration mode all three are optional and also
+bounded when supplied.
+
+**`/estimate` is unchanged by any of this.** It validates the same payload -- the mode and the
+breeding settings included -- and still answers with **exactly** `{templateCount, candidateBudget}`:
+two keys, and no echo of the mode, which the caller already knows because it is what it submitted.
 
 **Job receipt / job object** (one field set for both):
 
@@ -316,11 +403,16 @@ candidate's metrics carry its whole IC series and curves, which a page of fifty 
 `templateId`, `market`, `timeframe`, `status`, `reason`, `createdAt`, `updatedAt`; the detail view
 adds `metrics` and `outOfSample`.
 
-**`status` values:** `search` (cleared L1-L4, awaiting the frozen review), `frozen` (also cleared
-L5), `rejected` (stopped at some stage; the key is in `reason`).
+**`status` values:** `search` (cleared L1-L4, awaiting the frozen review), `frozen` (cleared L5 as
+well, and not retired at L6), `rejected` (stopped at some stage; the key is in `reason` -- an L6
+retirement carries `factorMining.reject.noIncrementalValue`, and an increment that could not be
+measured retires nobody).
 
-**`GET /catalog`:** `operators` gives **names only**, with no arity and no windowed flag -- section
-3.2 above is the authoritative table. Each entry of `templates` is
+**`GET /catalog`:** `fields` is the market's own set, resolved through the same `fields_for` the
+validator uses, so what the editor offers and what L1 accepts cannot drift apart. The optional
+`market` query argument names the market the caller is about to run; absent, empty or unrecognised
+returns the price-volume group (section 3.1). `operators` gives **names only**, with no arity and no
+windowed flag -- section 3.2 above is the authoritative table. Each entry of `templates` is
 `{templateId, hypothesisI18nKey, category, parameterGrid}`.
 
 **The label inside the correlation study.** When a mined candidate enters L4's correlation study,
@@ -381,6 +473,30 @@ Every write is tenant-scoped and **fails audibly**: writing against a run that i
 raises (`factorMining.runNotFound`) instead of returning a row count for rows that were never
 written. That silent version would lose a 250-trial ledger without a trace.
 
+**Where the pool increment lives.** A survivor's increment is written into its `outOfSample` block
+-- the `out_of_sample_json` column on `qd_factor_candidates`, served as `outOfSample` by
+`/candidates/<id>` -- under `poolIncrement`:
+
+| Key | Meaning |
+| --- | --- |
+| `residualIc`, `rawIc` | Mean residual IC and mean raw IC over the measured sessions; `null` when nothing was measured (a partial mean is not a reading) |
+| `poolSize` | The pool's size after the run's cap and self-exclusion |
+| `compared` | The member names a panel **could** be rebuilt for -- what the reading actually covers |
+| `skipped` | The members that could not be rebuilt; **skipping is not a pass** |
+| `complete` | `true` exactly when `skipped` is empty, i.e. the reading covers the whole pool |
+| `hasIncrementalValue` | `true` / `false` / `null` (not measured -- three states a consumer has to tell apart) |
+| `reason` | Empty when the candidate carries value; `factorMining.reject.noIncrementalValue` when it was measured and does not; `factorMining.poolIncrement.noPool` / `.unmeasured` when there is no verdict |
+| `usedCrossSections`, `skippedCrossSections` | Sessions the reading averages over, and sessions it had to drop |
+| `minAbsRankIc` | The bar the residual IC was read against, restated so a stored reading explains its own verdict |
+
+**A consumer reads `complete` and the two counts, never `hasIncrementalValue` alone.** A truncated
+pool still judges, deliberately: the alternative is a stage that falls silent the moment one stored
+expression stops rebuilding, and a `false` there is decided by the members that *were* measured.
+What may not happen is the truncation going unmentioned -- so a reader that shows
+`hasIncrementalValue` without `complete`, `poolSize` and `compared` renders "this library was
+compared by half" and "nothing adds anything to this library" identically, and the second is the
+only one the reading supports.
+
 ## 10. i18n keys
 
 The front-end copy lives in another repository. These are **all** the `factorMining.*` keys the
@@ -395,7 +511,7 @@ backend can emit; the backend emits keys only and never renders copy.
 | `factorMining.jobNotFound` | The job does not exist, is not the caller's, or is not a mining job |
 | `factorMining.candidateNotFound` | The candidate does not exist or is not the caller's; also when the id is not an integer |
 | `factorMining.invalidQuery` | A query parameter is not a readable integer |
-| `factorMining.invalidParameter` | A run field cannot be read as the type it is priced with: an integer field (`seed` / `groups` / `holdingPeriod`) that is not an integer, a `commission` / `slippage` too large to convert, or a `timeframe` outside the supported shape (`<digits><m\|h\|d\|w>`) |
+| `factorMining.invalidParameter` | A run field cannot be read as the type it is priced with: an integer field (`seed` / `groups` / `holdingPeriod` / `population` / `generations`) that is not an integer, an `eliteRatio` that is not a number, a `commission` / `slippage` too large to convert, a `searchMode` this build does not know, a `timeframe` outside the supported shape (`<digits><m\|h\|d\|w>`), a `population` / `generations` below 1, an `eliteRatio` outside `[0, 1)`, or one of `population` / `generations` / `eliteRatio` missing or blank in an evolution run |
 | `factorMining.thresholdsInvalid` | `thresholds` is not an object, or a threshold cannot be read as its own field's type (a fractional `min_ic_observations`, a boolean, a non-finite value) |
 | `factorMining.sourceRequired` | `sourceId` is missing or not a positive integer |
 | `factorMining.sourceNotFound` | The `sourceId` script source does not exist or is not the caller's |
@@ -423,7 +539,7 @@ backend can emit; the backend emits keys only and never renders copy.
 | `factorMining.fingerprintInvalid:<index>` | The `<index>`-th candidate's fingerprint is not a 64-character sha256 hex digest |
 | `factorMining.reject.invalid:<reason>` | The specific failure a DSL validation carried on `ExpressionError.code` (`unknownField` / `tooDeep` / `tooManyNodes` / `unknownOperator` / `badArity` / `badNode` / `badWindow` / `lookbackExceeded`) |
 
-**L1-L5 reject reasons (12 keys)**
+**L1-L6 reject reasons (14 keys)**
 
 | Key | Stage |
 | --- | --- |
@@ -436,9 +552,22 @@ backend can emit; the backend emits keys only and never renders copy.
 | `factorMining.reject.unstableHalves` | L3 |
 | `factorMining.reject.highTurnover` | L3 |
 | `factorMining.reject.duplicateBuiltin` | L4 |
+| `factorMining.reject.duplicateInPool` | L4 |
 | `factorMining.reject.unverifiableRedundancy` | L4 |
 | `factorMining.reject.weakOutOfSample` | L5 |
 | `factorMining.reject.selectionBias` | L5 |
+| `factorMining.reject.noIncrementalValue` | L6 |
+
+**Pool increment readings (2 keys, deliberately *not* rejections)**
+
+| Key | Where it appears |
+| --- | --- |
+| `factorMining.poolIncrement.noPool` | `outOfSample.poolIncrement.reason`, when the caller has no frozen library yet -- the question was never asked |
+| `factorMining.poolIncrement.unmeasured` | `outOfSample.poolIncrement.reason`, when a comparison was drawn and nothing could be measured off it, or when the review had no search window behind it |
+
+Neither key retires a candidate and neither appears in a candidate's `reason` or a trial's `reason`:
+they are the two "no answer" states that sit beside the verdict in the increment's own block
+(section 9), and an operator sent to the wrong one of the two looks for a library in the wrong place.
 
 **Template hypotheses (8 keys)**
 
@@ -466,6 +595,22 @@ never has to hardcode the template list.
   is no user-scoped read path to it.
 - **No AI proposals.** Every candidate comes from expanding template parameters (revisit in v3).
 - **Fingerprint only.** There is no replayable panel copy, so past runs cannot be re-run offline.
+- **`term_structure` and `roll_cost` are not in this release, and are not in the whitelist.** Their
+  semantics are fixed here so that a later plan does not have to re-litigate them: **`term_structure`**
+  is the annualized spread between a near contract and a far contract, and **`roll_cost`** is the
+  cost of switching the front contract under a stated roll rule. Both are **point-in-time fields like
+  every other one** -- each would have to answer "as of which instant was this value knowable", and
+  pass the same L1-to-L6 ladder before it could be offered.
+
+  Neither is in this plan's scope, because it needs a **data face that does not exist yet**: the
+  futures source in this repository serves a single contract's ticker and kline, and a term
+  structure needs several contracts of one underlying quoted together. Delivering them means a
+  separate data-source plan plus contract metadata that this build has no home for -- front-contract
+  determination, the roll rule, and the price-adjustment convention each change the number the field
+  would report, and two builds disagreeing about them would silently report different factors under
+  one name. Until that data face and that metadata exist, the fields join no `FIELD_GROUPS` entry,
+  so `fields_for(market)` never returns them, L1 refuses any candidate that names them as
+  `unknownField`, and no run can be priced on data nothing can fill.
 
 Related: [Strategy workflow](STRATEGY_WORKFLOW.md), [Backtest Center](BACKTEST_CENTER.md),
 [Strategy API V2 development](../trading/STRATEGY_DEV_GUIDE.md),

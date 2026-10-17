@@ -178,9 +178,15 @@ export default {
       'factorMining.reject.unstableHalves': '前后半段不稳定',
       'factorMining.reject.highTurnover': '换手率过高',
       'factorMining.reject.duplicateBuiltin': '与内置因子重复',
+      'factorMining.reject.duplicateInPool': '与候选池内因子重复',
       'factorMining.reject.unverifiableRedundancy': '无法验证冗余性',
       'factorMining.reject.weakOutOfSample': '样本外表现过弱',
-      'factorMining.reject.selectionBias': '选择偏差过高'
+      'factorMining.reject.selectionBias': '选择偏差过高',
+      'factorMining.reject.noIncrementalValue': '对候选池没有增量信息',
+
+      // 池增量读数：不是淘汰原因，只在 outOfSample.poolIncrement.reason 里出现
+      'factorMining.poolIncrement.noPool': '尚无冻结候选池可供比较',
+      'factorMining.poolIncrement.unmeasured': '池增量未能测出'
     },
 
     // 模板假设
