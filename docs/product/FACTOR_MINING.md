@@ -79,7 +79,7 @@ Fields come in groups, and a market's set is the union of the groups that market
 | Group | Fields | Markets |
 | --- | --- | --- |
 | `price_volume` | `open`, `high`, `low`, `close`, `volume` | every market |
-| `derivatives` | `funding_rate`, `open_interest` | `Crypto` only |
+| `derivatives` | `funding_rate`, `open_interest`, `term_structure`, `roll_cost` | `Crypto` only |
 
 `fields_for(market)` returns that set, in group order. The market is matched **exactly** as the run
 spells it (`Crypto`, `USStock`): there is no case folding and no alias resolution, so `crypto` --
@@ -89,10 +89,17 @@ and a field outside `fields_for(market)` is refused at L1 as `unknownField` anyw
 
 A group's presence says the **data source can answer** for the field, not that every symbol has it:
 a symbol whose derivative series comes back empty keeps its frame with the field as a column of
-NaN, and the L2 coverage gate decides what that gap means. `term_structure` and `roll_cost` are in
-no group, because the futures multi-contract data face they need does not exist yet (section 11).
+NaN, and the L2 coverage gate decides what that gap means. `term_structure` and `roll_cost` come
+from Deribit's BTC and ETH monthly dated futures: the venue stamps each daily candle at that day's
+08:00 UTC open, so a candle's close is knowable only at tick + 1 day, and both series are indexed
+by that later instant. The main leg is the nearest monthly contract with at least 7 days to expiry
+and the far leg is the next one; `term_structure` annualizes the far/main spread over the expiries'
+calendar-day gap, and `roll_cost` is the same spread un-annualized. Only BTC and ETH have these
+contracts, so every other `Crypto` symbol keeps a NaN column. Both legs are Deribit contracts, so
+currency differences mostly cancel, but a member may quote on another venue (a USDT perpetual, for
+example), which makes this a cross-venue rather than a strict same-venue spread.
 
-`GET /catalog` serves this list for a market: `?market=Crypto` returns the two groups' seven fields,
+`GET /catalog` serves this list for a market: `?market=Crypto` returns the two groups' nine fields,
 and no `market` (or one this build does not know) returns the five price-volume fields.
 
 ### 3.2 Operators (31)
@@ -595,22 +602,10 @@ never has to hardcode the template list.
   is no user-scoped read path to it.
 - **No AI proposals.** Every candidate comes from expanding template parameters (revisit in v3).
 - **Fingerprint only.** There is no replayable panel copy, so past runs cannot be re-run offline.
-- **`term_structure` and `roll_cost` are not in this release, and are not in the whitelist.** Their
-  semantics are fixed here so that a later plan does not have to re-litigate them: **`term_structure`**
-  is the annualized spread between a near contract and a far contract, and **`roll_cost`** is the
-  cost of switching the front contract under a stated roll rule. Both are **point-in-time fields like
-  every other one** -- each would have to answer "as of which instant was this value knowable", and
-  pass the same L1-to-L6 ladder before it could be offered.
-
-  Neither is in this plan's scope, because it needs a **data face that does not exist yet**: the
-  futures source in this repository serves a single contract's ticker and kline, and a term
-  structure needs several contracts of one underlying quoted together. Delivering them means a
-  separate data-source plan plus contract metadata that this build has no home for -- front-contract
-  determination, the roll rule, and the price-adjustment convention each change the number the field
-  would report, and two builds disagreeing about them would silently report different factors under
-  one name. Until that data face and that metadata exist, the fields join no `FIELD_GROUPS` entry,
-  so `fields_for(market)` never returns them, L1 refuses any candidate that names them as
-  `unknownField`, and no run can be priced on data nothing can fill.
+- **Term structure and roll cost remain out of scope for traditional futures**, which would need a
+  multi-contract futures data face. Crypto dated futures are covered: `term_structure` and
+  `roll_cost` are in the `Crypto` whitelist and sourced from Deribit's BTC/ETH monthly contracts
+  under the point-in-time rules in section 3.1.
 
 Related: [Strategy workflow](STRATEGY_WORKFLOW.md), [Backtest Center](BACKTEST_CENTER.md),
 [Strategy API V2 development](../trading/STRATEGY_DEV_GUIDE.md),
