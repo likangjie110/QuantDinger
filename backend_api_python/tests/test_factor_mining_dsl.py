@@ -260,3 +260,10 @@ def test_the_fingerprint_does_not_depend_on_the_field_set():
         other = normalize_expression(node, allowed_fields=allowed)
         assert other.canonical == default.canonical
         assert other.fingerprint == default.fingerprint
+
+
+def test_crypto_field_set_includes_the_delivery_curve_fields():
+    fields = fields_for("Crypto")
+    assert "term_structure" in fields
+    assert "roll_cost" in fields
+    assert fields_for("USStock") == PRICE_VOLUME_FIELDS

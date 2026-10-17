@@ -164,3 +164,11 @@ def test_the_curve_index_is_the_close_known_instant():
     assert all(stamp.hour == 8 for stamp in series.index)
     # The first raw tick is 2026-07-31 08:00; its close is known at 2026-08-01 08:00.
     assert series.index[0] == pd.Timestamp("2026-08-01 08:00")
+
+def test_a_non_crypto_market_returns_an_empty_series_without_touching_the_venue():
+    # The autouse fixture answers every request with ``_Unrecorded``; reaching the venue
+    # would raise instead of returning an empty series.
+    for fetch in (futures_curve.fetch_term_structure, futures_curve.fetch_roll_cost):
+        empty = fetch("USStock", "USStock:AAPL",
+                      start=datetime(2026, 8, 1), end=datetime(2026, 10, 1))
+        assert empty.empty

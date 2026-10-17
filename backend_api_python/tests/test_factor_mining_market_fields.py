@@ -113,7 +113,7 @@ class _CryptoService:
 
 
 class _FakeHistories:
-    """The two derivative entry points: recorded, symbol-dependent, never networked.
+    """The four derivative entry points: recorded, symbol-dependent, never networked.
 
     ``covered_days`` is how much of the requested window has settlements at all -- a real shape,
     since a venue's funding history is bounded -- and ``missing`` is a key whose series comes
@@ -151,10 +151,24 @@ class _FakeHistories:
         stamps = pd.date_range(end, end + timedelta(days=self.extra_days), freq="D")
         return pd.Series([_OI_USD] * len(stamps), index=stamps)
 
+    def term_structure(self, market, symbol, *, start, end):
+        return self._curve("term_structure", market, symbol, start=start, end=end)
+
+    def roll_cost(self, market, symbol, *, start, end):
+        return self._curve("roll_cost", market, symbol, start=start, end=end)
+
+    def _curve(self, field, market, symbol, *, start, end):
+        self.calls.append((field, market, symbol, start, end))
+        if symbol == self.missing:
+            return pd.Series(dtype="float64", index=pd.DatetimeIndex([]))
+        return pd.Series([0.05], index=pd.DatetimeIndex([end]))
+
 
 def _patch_histories(monkeypatch, histories):
     monkeypatch.setattr(market_fields, "fetch_funding_history", histories.funding)
     monkeypatch.setattr(market_fields, "fetch_open_interest_history", histories.interest)
+    monkeypatch.setattr(market_fields, "fetch_term_structure", histories.term_structure)
+    monkeypatch.setattr(market_fields, "fetch_roll_cost", histories.roll_cost)
     return histories
 
 
@@ -245,6 +259,35 @@ def test_fields_are_forward_filled_not_back_filled(monkeypatch):
         start=datetime(2024, 1, 1), end=datetime(2024, 1, 5),
     )[_BTC]
     assert repeated["funding_rate"].loc[pd.Timestamp(stamp)] == pytest.approx(0.02)
+
+
+def test_the_curve_fields_are_filled_from_their_own_source(monkeypatch):
+    _patch_histories(monkeypatch, _FakeHistories())
+    curve = pd.Series(
+        [0.05], index=pd.DatetimeIndex([datetime(2024, 1, 2)]))
+    monkeypatch.setattr(market_fields, "fetch_term_structure", lambda *a, **k: curve)
+    monkeypatch.setattr(market_fields, "fetch_roll_cost", lambda *a, **k: curve)
+    index = pd.date_range("2024-01-01", periods=4, freq="D")
+    frame = market_fields.enrich_frames(
+        {_BTC: _bars(index, 0.0)}, market="Crypto",
+        start=datetime(2024, 1, 1), end=datetime(2024, 1, 4))[_BTC]
+    assert pd.isna(frame["term_structure"].iloc[0])  # nothing is known before the first publication
+    assert frame["term_structure"].iloc[1:].tolist() == [0.05, 0.05, 0.05]
+    assert frame["roll_cost"].iloc[1:].tolist() == [0.05, 0.05, 0.05]
+
+
+def test_a_member_the_curve_cannot_answer_keeps_a_nan_column(monkeypatch):
+    _patch_histories(monkeypatch, _FakeHistories())
+    monkeypatch.setattr(market_fields, "fetch_term_structure",
+                        lambda *a, **k: pd.Series(dtype="float64", index=pd.DatetimeIndex([])))
+    monkeypatch.setattr(market_fields, "fetch_roll_cost",
+                        lambda *a, **k: pd.Series(dtype="float64", index=pd.DatetimeIndex([])))
+    index = pd.date_range("2024-01-01", periods=3, freq="D")
+    frame = market_fields.enrich_frames(
+        {_SOL: _bars(index, 0.0)}, market="Crypto",
+        start=datetime(2024, 1, 1), end=datetime(2024, 1, 3))[_SOL]
+    assert frame["term_structure"].isna().all()
+    assert frame["roll_cost"].isna().all()
 
 
 # --- the run's own calendar -------------------------------------------------------------------
@@ -352,11 +395,12 @@ def test_the_sources_are_asked_with_the_members_own_key_and_the_windows_own_rang
     frequency, fetch_start, fetch_end = service.fetch_calls[0]
     asked = {call[2] for call in histories.calls}
     assert asked == set(_KEYS), "every member key travels to the source as it was resolved"
-    assert len(histories.calls) == 2 * len(_KEYS), "one request per symbol per field"
+    assert len(histories.calls) == 4 * len(_KEYS), "one request per symbol per field"
     assert {call[3] for call in histories.calls} == {fetch_start}
     assert {call[4] for call in histories.calls} == {fetch_end}
     assert {call[1] for call in histories.calls} == {"Crypto"}
-    assert {call[0] for call in histories.calls} == {"funding_rate", "open_interest"}
+    assert {call[0] for call in histories.calls} == {
+        "funding_rate", "open_interest", "term_structure", "roll_cost"}
     assert frequency == "1d"
 
 
@@ -388,9 +432,9 @@ def test_a_source_that_over_returns_cannot_reach_the_search_panel(monkeypatch):
 
 
 def test_a_field_is_routed_to_its_own_source_and_an_unknown_one_is_refused(monkeypatch):
-    """The advertised fields and the dispatcher answer for the same two fields, and for nothing else.
+    """The advertised fields and the dispatcher answer for the same four fields, and for nothing else.
 
-    A catch-all branch would answer a third field with the second one's venue endpoint -- a
+    A catch-all branch would answer another field with the second one's venue endpoint -- a
     plausible wrong number rather than a missing one, which is the failure mode no coverage gate
     can see -- so the refusal is pinned beside the routing.
     """
@@ -404,19 +448,30 @@ def test_a_field_is_routed_to_its_own_source_and_an_unknown_one_is_refused(monke
         routed.append("open_interest")
         return pd.Series([_OI_USD], index=pd.DatetimeIndex([start]))
 
+    def term(_market, _key, *, start, end):
+        routed.append("term_structure")
+        return pd.Series([0.05], index=pd.DatetimeIndex([start]))
+
+    def roll(_market, _key, *, start, end):
+        routed.append("roll_cost")
+        return pd.Series([0.05], index=pd.DatetimeIndex([start]))
+
     monkeypatch.setattr(market_fields, "fetch_funding_history", funding)
     monkeypatch.setattr(market_fields, "fetch_open_interest_history", interest)
+    monkeypatch.setattr(market_fields, "fetch_term_structure", term)
+    monkeypatch.setattr(market_fields, "fetch_roll_cost", roll)
 
-    assert market_fields.derivative_fields("Crypto") == ("funding_rate", "open_interest")
+    assert market_fields.derivative_fields("Crypto") == (
+        "funding_rate", "open_interest", "term_structure", "roll_cost")
     for field in market_fields.derivative_fields("Crypto"):
         assert isinstance(
             market_fields._series("Crypto", _BTC, field,
                                   start=datetime(2024, 1, 1), end=datetime(2024, 1, 2)),
             pd.Series,
         )
-    assert routed == ["funding_rate", "open_interest"]
+    assert routed == ["funding_rate", "open_interest", "term_structure", "roll_cost"]
     with pytest.raises(KeyError):
-        market_fields._series("Crypto", _BTC, "term_structure",
+        market_fields._series("Crypto", _BTC, "order_book_depth",
                               start=datetime(2024, 1, 1), end=datetime(2024, 1, 2))
 
 

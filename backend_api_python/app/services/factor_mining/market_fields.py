@@ -12,6 +12,8 @@ value published at or before it. ``reindex(..., method="ffill")`` is exactly tha
 bar before the first publication stays NaN, which keeps a missing opening stretch missing rather
 than filled with the first number that ever appeared, and no bar ever reads a value from its own
 future -- including from a source that answers with a wider window than it was asked for.
+The term-structure fields come from Deribit's dated-futures curve, where a daily close is
+indexed one day after the candle tick, the instant it became known (``data_sources.futures_curve``).
 
 The second is the market's session calendar. The search window and the frozen tail are cut by
 the last ``freeze_ratio`` of a market's sessions, so a market counted on the wrong calendar gets
@@ -36,12 +38,13 @@ import numpy as np
 import pandas as pd
 
 from app.data_sources.derivatives import fetch_funding_history, fetch_open_interest_history
+from app.data_sources.futures_curve import fetch_roll_cost, fetch_term_structure
 from app.services.factor_mining.dsl import fields_for
 
 # The derivative fields this module can fill. A field here that the field set does not admit is
 # never fetched, and a field the field set admits and this set does not is a field with no
 # source: the two sets' intersection is the whole answer, so there is no second place to look.
-_SOURCE_FIELDS = frozenset({"funding_rate", "open_interest"})
+_SOURCE_FIELDS = frozenset({"funding_rate", "open_interest", "term_structure", "roll_cost"})
 
 # The markets that trade every calendar day, spelled the way the repository's scheduler spells
 # them (``market_schedule._is_continuous_market``). A market outside this set keeps the
@@ -117,6 +120,10 @@ def _series(market: str, key: str, field: str, *, start: datetime, end: datetime
         return fetch_funding_history(market, key, start=start, end=end)
     if field == "open_interest":
         return fetch_open_interest_history(market, key, start=start, end=end)
+    if field == "term_structure":
+        return fetch_term_structure(market, key, start=start, end=end)
+    if field == "roll_cost":
+        return fetch_roll_cost(market, key, start=start, end=end)
     raise KeyError(field)
 
 
