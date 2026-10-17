@@ -105,13 +105,18 @@ def _meta(created="2026-06-01 08:00", expires=_SEP):
 
 
 def test_the_universe_excludes_a_contract_created_after_the_bar():
-    meta = {"BTC-25SEP26": _meta(created="2026-09-02 08:00", expires=_SEP)}
-    closes = {"BTC-25SEP26": pd.Series([100.0], index=pd.DatetimeIndex(["2026-09-01 08:00"]))}
+    # A is listed after t and B before it; if the creation gate were missing, A would pair with
+    # B and the row would read 102 / 100 - 1 instead of NaN.
+    meta = {"BTC-25SEP26": _meta(created="2026-09-02 08:00", expires=_SEP),
+            "BTC-30OCT26": _meta(created="2026-06-01 08:00", expires=_OCT)}
+    index = pd.DatetimeIndex(["2026-09-01 08:00"])
+    closes = {"BTC-25SEP26": pd.Series([100.0], index=index),
+              "BTC-30OCT26": pd.Series([102.0], index=index)}
     curve = futures_curve._curve(
         "BTC", datetime(2026, 9, 1), datetime(2026, 9, 3),
         instrument=lambda name: meta.get(name),
         daily_closes=lambda name, start, end: closes.get(name, pd.Series(dtype="float64")))
-    assert curve.empty or curve["roll_cost"].isna().all()
+    assert pd.isna(curve.loc[pd.Timestamp("2026-09-01 08:00"), "roll_cost"])
 
 def test_term_structure_annualizes_between_the_two_main_contracts():
     meta = {"BTC-25SEP26": _meta(expires=_SEP), "BTC-25DEC26": _meta(expires=_DEC)}
