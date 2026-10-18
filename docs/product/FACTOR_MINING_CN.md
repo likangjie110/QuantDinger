@@ -13,15 +13,14 @@
 - 把结果沉淀进候选库 `qd_factor_candidates`：同一表达式跨多次运行去重，`run_id` 指向最近一次判定它的运行。
 - 全过程按用户隔离，可按作业取消，可事后审计（配置、数据指纹、计数、逐条淘汰原因都落库）。
 
-**v1 明确不做**
+**本模块明确不做**
 
 | 非目标 | 说明 |
 | --- | --- |
 | 不接入策略运行时 | 挖出的候选只存在于 `qd_factor_candidates`。策略侧仍然只能引用内置因子注册表 `_FACTORS`（`app/services/factors/registry.py`），没有任何用户作用域的路径让策略读到挖掘结果。 |
-| 不做 AI 提案 | v1 的候选全部来自模板库的参数展开，没有模型参与生成假设（留待 v3）。 |
 | 不写回因子注册表 | 挖掘结果不会变成新的内置因子，`_FACTORS` 是代码里静态维护的。 |
-| 不计费 | 本功能**完全不计费**：既不扣额度也不写账本。资源只由并发上限与预算上限约束（见第 8 节）。 |
-| 不存可重放副本 | 只保存数据指纹 `snapshotId`，不保存行情快照本身，因此不能离线重放一次历史运行。 |
+| 不计费 | 本功能**完全不计费**：既不扣额度也不写账本。资源只由并发上限与预算上限约束（见第 9 节）。 |
+| 不存可重放行情副本 | 只保存数据指纹 `snapshotId`，不保存行情快照本身，因此不能离线重放一次历史运行、拿回完全相同的数据。v3 的 AI 运行可以重放**提案**（`replayJobId`，见第 8 节），重放不调用模型，但仍会重新抓取数据；指纹变了就由 `snapshotChanged` 标出。 |
 
 ## 2. 复现一次挖掘
 
@@ -183,18 +182,21 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | `GET` | `/jobs` | 当前用户的挖掘作业列表，最新在前，**不带** `result` |
 | `GET` | `/jobs/<job_id>` | 单个作业（含 `progress` 与完整 `result`） |
 | `POST` | `/jobs/<job_id>/cancel` | 取消；执行体在下次进度上报时停下 |
+| `GET` | `/jobs/<job_id>/proposals` | AI 作业的提案，按生成顺序排列（见第 8 节）；运行中的作业返回已经写入的行 |
 | `GET` | `/candidates` | 候选库列表，支持过滤与分页 |
 | `GET` | `/candidates/<candidate_id>` | 单个候选，含 `metrics` 与 `outOfSample` |
 
 **`POST /run` 请求体。** 服务端只读取以下键，其余键被丢弃（不会落进作业表的 request）：
 
-`sourceId`、`sourceName`、`market`、`timeframe`、`startDate`、`endDate`、`freezeRatio`、`budget`、`seed`、`templateIds`、`groups`、`holdingPeriod`、`commission`、`slippage`、`neutralizeIndustry`、`thresholds`、`searchMode`、`population`、`generations`、`eliteRatio`
+`sourceId`、`sourceName`、`market`、`timeframe`、`startDate`、`endDate`、`freezeRatio`、`budget`、`seed`、`templateIds`、`groups`、`holdingPeriod`、`commission`、`slippage`、`neutralizeIndustry`、`thresholds`、`searchMode`、`population`、`generations`、`eliteRatio`、`aiRounds`、`aiProposalsPerRound`、`researchNotes`、`replayJobId`
 
 必填：`sourceId`（正整数）、`market`（合法市场 key）、`startDate` / `endDate`（`YYYY-MM-DD`）。`budget` 缺省 400。`timeframe` 缺省 `1D`。
 
-**四个搜索模式键。** `searchMode` 取 `enumeration`（缺省，即模板展开）或 `evolution`（模板展开 + 由它繁殖出的流）；其它值一律以 `factorMining.invalidParameter` 拒绝，**绝不**回退成缺省值——两种模式搜索的候选集不同、消耗的历史长度也不同。`population`（缺省 32）、`generations`（缺省 20）、`eliteRatio`（缺省 0.25）是繁殖参数，**进化运行必须三个都给出且非空**：本层臆造出来的值等于一次没被要求的搜索。三者分别按整数、整数、数值读取，上下界用同一个键拒绝：`population` 与 `generations` 必须 ≥ 1，`eliteRatio` 必须落在 `[0, 1)`（份额 ≥ 1 会让每一代的精英占满全部名额、繁殖循环没有空间产生子代，运行会搜完模板、什么都没繁殖出来，却仍被记为成功）。枚举模式下三者可选，给了同样受上下界约束。
+**搜索模式。** `searchMode` 取 `enumeration`（缺省，即模板展开）、`evolution`（模板展开 + 由它繁殖出的流）或 `ai`（纯模型提案，见第 8 节）；其它值一律以 `factorMining.invalidParameter` 拒绝，**绝不**回退成缺省值——这些模式搜索的候选集不同、消耗的历史长度也不同。`population`（缺省 32）、`generations`（缺省 20）、`eliteRatio`（缺省 0.25）是繁殖参数，**进化运行必须三个都给出且非空**：本层臆造出来的值等于一次没被要求的搜索。三者分别按整数、整数、数值读取，上下界用同一个键拒绝：`population` 与 `generations` 必须 ≥ 1，`eliteRatio` 必须落在 `[0, 1)`（份额 ≥ 1 会让每一代的精英占满全部名额、繁殖循环没有空间产生子代，运行会搜完模板、什么都没繁殖出来，却仍被记为成功）。枚举与 AI 模式下三者可选，给了同样受上下界约束。
 
-**`/estimate` 不受以上任何影响。** 它校验同一份 payload（含模式与繁殖参数），返回体**仍然只有** `{templateCount, candidateBudget}` 两项：不回显模式，因为调用方本来就知道自己提交的是什么。
+`aiRounds`（缺省 2，1–3）、`aiProposalsPerRound`（缺省 10，1–20）、`researchNotes`（纯文本，至多 8000 字符）与 `replayJobId`（作业 id）只属于 AI 模式：非 AI 运行携带其中任何一个**非空**值都会以 `factorMining.invalidParameter` 拒绝，不会被静默忽略。重放契约见第 8 节。
+
+**`/estimate` 不受以上任何影响。** 它校验同一份 payload（含模式、繁殖参数与 AI 字段），返回体**仍然只有** `{templateCount, candidateBudget}` 两项：不回显模式，因为调用方本来就知道自己提交的是什么。AI 运行的 `templateCount` 是 `0`，`candidateBudget` 是 `min(aiRounds * aiProposalsPerRound, budget)`——AI 提案流就是整次搜索，运行预算仍然是它的上限。
 
 **作业回执 / 作业对象**（同一套字段）：
 
@@ -229,7 +231,51 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 **相关度研究里的标签。** 挖掘出来的候选进入 L4 的相关度研究时，显示的因子名是 **`"expression"`**（内置因子排在它后面）。所以 `metrics.factorCorrelation.factors[0]` 恒为 `"expression"`，`matrix[0][1:]` 就是它与各内置因子的相关度。
 
-## 8. 作业、并发与预算
+## 8. AI 提案与失败反馈循环
+
+`searchMode="ai"` 用模型提案替代模板展开：作业向服务端配置的 LLM 要假设与表达式，每条表达式都按与其它候选**同一套**字段/算子白名单校验，合法提案走**不变**的 L1–L6 阶梯。模板库仍会作为先验示例放进 prompt，但不进入候选流：AI 运行的候选一律 `origin = "ai"`、`templateId` 为空。试验台账、候选池、冻结段复核与池增量阶段与其它模式完全相同。
+
+**请求字段。** `aiRounds`（缺省 2，1–3）、`aiProposalsPerRound`（缺省 10，1–20）、`researchNotes`（纯文本，至多 8000 字符）与 `replayJobId`（作业 id）是 `POST /run` 的 AI 字段；非 AI 运行携带任何一个**非空**值都会以 `factorMining.invalidParameter` 拒绝。模型与 provider **不是**请求字段，来自服务端的模型配置。运行的候选预算是 `min(aiRounds * aiProposalsPerRound, budget)`——AI 提案流就是整次搜索，运行预算仍然封顶；`/estimate` 对 AI 运行返回这个乘积作为 `candidateBudget`，`templateCount` 为 `0`。
+
+**一轮 = 一次模型调用。** 每轮 prompt 携带市场、周期与数据区间、字段目录（分组）、算子目录（arity 与窗口）、候选预算、跨 run 失败摘要、上一轮反馈、可选研究笔记，以及至多 10 个模板示例作为先验。研究笔记与全部历史材料都以**数据**定界：其中的任何指令都不会被执行。模型必须返回严格 JSON：`{"proposals": [{"hypothesis": "...", "expression": {...}}]}`。单次调用 60 秒超时，传输或 JSON 失败重试一次（每轮至多两次尝试）；仍失败则作业失败并返回 `factorMining.aiProposalFailed`，已写入的提案保留。
+
+**校验、去重与阶梯。** 提案先过 L1 才算候选：每条表达式都用 `allowed_fields=fields_for(market)` 归一化，模型拿不到模板搜索之外的字段或算子。校验失败存为 `status = "l1_rejected"`，`reason` 是 DSL 错误码；同一 run 内重复的指纹存为 `status = "duplicate"`，`reason` 是 `factorMining.reject.duplicateProposal`。这两类都不评估、不写试验台账。合法提案先以 `status = "proposed"` 写入并作为种子；评估结果回读后该行标为 `evaluated`（L1–L6 的判定在试验/候选台账里，不在提案的 `reason` 里）。某一轮零合法提案就提前收束，不再多花一次模型调用；所有轮都为零则作业失败并返回 `factorMining.aiNoValidProposals`。只有按 `(round, ordinal)` 顺序排在前 `min(aiRounds * aiProposalsPerRound, budget)` 条的合法提案会进入评估；模型多给的合法提案仍以 `proposed` 记录，但不会被评估。
+
+**失败反馈。** 反馈分两层。run 内：一轮的种子评估完后，引擎内存中的 outcome 按阶段与淘汰原因聚合，附至多 10 条失败表达式（指纹与原因）和至多 5 条近失（按与门槛的相对差距排序）；整块至多 6000 字符，成为下一轮的 `Previous round feedback`。它必须读引擎内存，不能读 `qd_factor_trials`：试验在 `engine.run` 返回后才由服务层写库。跨 run：第一轮读取同一用户、同一市场与周期下最近 5 次**成功**运行的 stage/verdict/reason 计数和至多 10 条失败表达式，整块同样至多 6000 字符；失败与取消的 run 不作为历史。
+
+**落库。** `qd_factor_proposals` 每条提案一行（`run_id`、`round`、`ordinal`、表达式、指纹、假设、model、provider、prompt hash、DSL 版本、source、status、淘汰原因）；`qd_factor_mining_runs.job_id`（新增列）把作业映射到 run，所以作业运行中与失败后都能读到已写入的提案。研究笔记不复制进 `config_json` 或提案行：它随作业请求（`qd_agent_jobs.request`，租户作用域）落库，摘要里只存 SHA-256 与长度。prompt 原文不存，只存 hash。
+
+**AI 摘要。** AI 运行的 `GET /jobs/<job_id>` 在 `result.summary.ai` 增加：
+
+```json
+{"enabled": true, "rounds": 2, "proposals": 17, "l1Rejected": 3, "duplicates": 2,
+ "evaluated": 12, "model": "...", "provider": "...", "modelFallbackUsed": false,
+ "promptHashes": ["..."], "researchNotesSha256": "...", "researchNotesLength": 1234,
+ "replayOf": "", "snapshotChanged": false}
+```
+
+`rounds` 是实际跑过的轮数；`model` / `provider` 是最后一次作答的批次（重放不调用模型，因此为空）。非 AI 运行不带 `summary.ai`。
+
+**提案端点。** `GET /api/factor-mining/jobs/<job_id>/proposals?limit=50&offset=0` 返回 `{"items": [...]}`，按 `(round, ordinal)` 排序；`limit` 上限 200。每项为 `{id, runId, round, ordinal, hypothesis, expression, expressionHash, status, reason, model, provider, promptHash, dslVersion, source, createdAt}`。运行中的作业返回已写入的行（可能为空）；未知作业、他人作业、非挖掘作业，以及尚未开出 run 的作业，都读作 404 `factorMining.jobNotFound`。
+
+**重放。** `replayJobId` 指向调用者自己的**成功** AI 运行。重放请求只需要 `searchMode="ai"` 与 `replayJobId`；市场、区间、预算、数据源与 AI 边界由被重放的记录提供。客户端可以重述 `market`、`timeframe`、`startDate`、`endDate`、`budget`、`thresholds`，但生效值必须与记录一致，不一致返回 `factorMining.aiReplayIncompatible`。`researchNotes` 可以为新的审计记录重新提供，但不会送给模型。重放把记录的提案复制成新 run 的行（`source = "replay"`），按当前 DSL 重新执行 L1（`dslVersion` 不同返回 `factorMining.aiReplayIncompatible`），只评估合法提案；这条路径**绝不调用 proposer**。由于面板会重新抓取，`snapshotChanged` 说明新指纹是否与原 run 不同：提案及其 L1 状态可复现，指标则是一次新的测量。未知或他人的 `replayJobId` 返回 `factorMining.aiReplayNotFound`。
+
+**限额。**
+
+| 项 | 值 |
+| --- | --- |
+| 轮次 | 缺省 2，最大 3（`aiRounds`） |
+| 每轮提案 | 缺省 10，最大 20（`aiProposalsPerRound`） |
+| 每次运行的合法提案 | 按 `(round, ordinal)` 顺序取前 `min(aiRounds * aiProposalsPerRound, budget)` 条评估；其后的合法提案保持 `proposed` |
+| 模型调用 | 60 秒超时；重试 1 次（每轮 2 次尝试） |
+| 研究笔记 | 8000 字符 |
+| 单轮 prompt | 24000 字符；空间不足时先截断可选材料，字段/算子目录与硬约束不截断 |
+| 跨 run 历史 | 最近 5 次成功运行 |
+| 反馈摘要 | 6000 字符 |
+
+**已知限制。** 模型与 provider 是部署配置，不是单次运行的选择。本功能不抓取论文/研报，也没有文件或 PDF 解析，只读取调用者粘贴的纯文本笔记。提案质量取决于配置的 provider 与模型；AI 提案仍必须通过与其它候选完全相同的 L1–L6 阶梯——AI 模式改变的是假设从哪来，不是什么算作证据。模拟运行监控尚未实现。本功能仍然不计费；每一轮是一次模型调用，整次运行受上述边界约束。
+
+## 9. 作业、并发与预算
 
 **持久执行。** 挖掘作业走共用的 `qd_agent_jobs`，`kind = "factor_mining"`，由 Celery 持久执行路径承接（`app/tasks/agent_jobs.py` 已注册该 kind）。进程内池与 Celery 两条派发路径最终调用同一个实现 `run_mining_job`，不存在两套逻辑。
 
@@ -245,7 +291,7 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | `MAX_BUDGET` | 2000（超出返回 `factorMining.budgetExceeded`） |
 | 最小可用预算 | 1（`< 1` 或不可读返回 `factorMining.budgetInvalid`） |
 
-`budget` 是**上限**不是承诺：模板集能展开出的去重候选不足 400 时，实际评估数就是展开数（默认模板集是 102）。
+`budget` 是**上限**不是承诺：模板集能展开出的去重候选不足 400 时，实际评估数就是展开数（默认模板集是 102）。AI 运行的提案流同样封顶在 `min(aiRounds * aiProposalsPerRound, budget)`；模型产出的合法提案还可能少于这两个上限，实际评估的就是过了 L1 的那部分。
 
 **取消。** `POST /jobs/<id>/cancel` 只把作业标记为已取消，执行体在**下一次进度上报**时抛 `JobCancelledError` 停下。此时运行行也会被收尾成 `cancelled`——而不是 `failed`，因为把用户自己的取消显示成引擎故障是错的。
 
@@ -253,13 +299,14 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 **未决：** 停在 `queued` 的幽灵作业**不在清扫范围内**（延后处理）。
 
-## 9. 数据表
+## 10. 数据表
 
 | 表 | 粒度 | 关键约束 |
 | --- | --- | --- |
-| `qd_factor_mining_runs` | 一次运行一行 | 配置、数据指纹、三个计数、状态；`user_id` 外键到 `qd_users` |
+| `qd_factor_mining_runs` | 一次运行一行 | 配置、数据指纹、三个计数、状态，以及 `job_id`（驱动该运行的作业）；`user_id` 外键到 `qd_users` |
 | `qd_factor_candidates` | 一个表达式一行 | `UNIQUE (user_id, expression_hash)`，跨运行去重；`run_id` 是 `ON DELETE SET NULL`——候选是跨运行的资产，随运行消失的只能是它的指针 |
 | `qd_factor_trials` | 一次评估一行 | `run_id` 是 `ON DELETE CASCADE`——台账脱离它定价的那次运行就没有意义 |
+| `qd_factor_proposals` | 一条 AI 提案一行 | `UNIQUE (run_id, round, ordinal)`，按 `(round, ordinal)` 排序；`run_id` 是 `ON DELETE CASCADE`；每次读取都带 `user_id` 作用域，`status` / `reject_reason` 记录提案自身的审计状态（见第 8 节） |
 
 所有写入都按租户作用域执行，并且**可听地失败**：写入不属于调用者的运行会抛错（`factorMining.runNotFound`），而不是「写了 0 行但返回行数」——那会让一次本该记下 250 条试验的调用静默丢失台账。
 
@@ -279,11 +326,11 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 **消费端必须读 `complete` 与那两个计数，绝不能只看 `hasIncrementalValue`。** 被截断的池仍然给出判定，这是刻意的：否则只要有一个成员的存储表达式不再能重建，这一层就永久失效；而这里的 `false` 是由**已测到**的成员决定的。不能发生的是截断被隐去——只显示 `hasIncrementalValue`、不显示 `complete`、`poolSize`、`compared` 的界面，会把「这个库只比了一半」和「这个库什么都加不进去」渲染成一模一样，而后者才是读数支持的那个结论。
 
-## 10. i18n 键清单
+## 11. i18n 键清单
 
 前端文案在另一个仓库。以下是后端会产出的**全部** `factorMining.*` 键，后端只发键，不渲染文案。
 
-**接口与服务层（24 个）**
+**接口与服务层（28 个）**
 
 | 键 | 触发场景 |
 | --- | --- |
@@ -292,7 +339,7 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | `factorMining.jobNotFound` | 作业不存在、不属于该用户、或不是挖掘作业 |
 | `factorMining.candidateNotFound` | 候选不存在，或不属于该用户；id 无法解析为整数时同样 |
 | `factorMining.invalidQuery` | 查询参数不是合法整数 |
-| `factorMining.invalidParameter` | 运行字段无法按其计价类型读取：整数字段（`seed` / `groups` / `holdingPeriod` / `population` / `generations`）不是整数、`eliteRatio` 不是数值、`commission` / `slippage` 大到无法转换、`searchMode` 是本版本不认识的值、`timeframe` 不在支持的形状内（`<数字><m\|h\|d\|w>`）、`population` / `generations` 小于 1、`eliteRatio` 不在 `[0, 1)`，或进化运行里 `population` / `generations` / `eliteRatio` 缺失或为空串 |
+| `factorMining.invalidParameter` | 运行字段无法按其计价类型读取：整数字段（`seed` / `groups` / `holdingPeriod` / `population` / `generations` / `aiRounds` / `aiProposalsPerRound`）不是整数、`eliteRatio` 不是数值、`commission` / `slippage` 大到无法转换、`searchMode` 是本版本不认识的值、`timeframe` 不在支持的形状内（`<数字><m\|h\|d\|w>`）、`population` / `generations` 小于 1、`eliteRatio` 不在 `[0, 1)`、`aiRounds` 不在 `1-3`、`aiProposalsPerRound` 不在 `1-20`、`researchNotes` 不是字符串或超过 8000 字符、非 AI 运行携带任何 AI 字段（`aiRounds` / `aiProposalsPerRound` / `researchNotes` / `replayJobId`），或进化运行里 `population` / `generations` / `eliteRatio` 缺失或为空串 |
 | `factorMining.thresholdsInvalid` | `thresholds` 不是对象，或某个门槛无法按字段自身类型读取（`min_ic_observations` 给了小数、给了布尔值、给了非有限数值） |
 | `factorMining.sourceRequired` | 缺少 `sourceId` 或不是正整数 |
 | `factorMining.sourceNotFound` | `sourceId` 指向的脚本源不存在或不属于该用户 |
@@ -310,6 +357,10 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | `factorMining.usableUniverseTooSmall` | 抓取后剩余可用标的少于 3 个 |
 | `factorMining.noMarketData` | 抓取没有返回任何行情 |
 | `factorMining.missingIcSeries` | 研究引擎没有返回 IC 序列（上游异常） |
+| `factorMining.aiProposalFailed` | 模型调用在传输或 JSON 上失败且重试后仍失败；已写入的提案保留 |
+| `factorMining.aiNoValidProposals` | AI 运行的所有轮次都产出零合法提案 |
+| `factorMining.aiReplayNotFound` | `replayJobId` 指向的作业不存在、不属于调用者，或不是挖掘作业 |
+| `factorMining.aiReplayIncompatible` | 被重放的运行不是成功运行、DSL 版本不同，或客户端重述的运行字段与记录不一致 |
 | `factorMining.runNotFound` | 写入指向了一个不存在或不属于调用者的运行 |
 
 **参数化形式（3 类，消费端不要做裸键精确匹配）**
@@ -320,10 +371,11 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | `factorMining.fingerprintInvalid:<index>` | 第 `<index>` 个候选的指纹不是 64 位 sha256 十六进制 |
 | `factorMining.reject.invalid:<reason>` | DSL 校验失败时 `ExpressionError.code` 携带的具体原因（`unknownField` / `tooDeep` / `tooManyNodes` / `unknownOperator` / `badArity` / `badNode` / `badWindow` / `lookbackExceeded`） |
 
-**L1–L6 淘汰原因（14 个）**
+**淘汰原因（15 个）**
 
 | 键 | 层级 |
 | --- | --- |
+| `factorMining.reject.duplicateProposal` | AI 提案流（run 内重复指纹；状态 `duplicate`，从不评估） |
 | `factorMining.reject.invalid` | L1（试验与候选的 `reason` 列存的是这个**裸键**；带 `:<reason>` 的形式只出现在 DSL 抛出的 `ExpressionError.code` 上） |
 | `factorMining.reject.lowCoverage` | L2 |
 | `factorMining.reject.insufficientObservations` | L2 |
@@ -346,7 +398,7 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | `factorMining.poolIncrement.noPool` | `outOfSample.poolIncrement.reason`，调用者还没有冻结候选库——这个问题从没被问过 |
 | `factorMining.poolIncrement.unmeasured` | `outOfSample.poolIncrement.reason`，比过却什么都测不出，或这次复核背后没有搜索段可读 |
 
-这两个键都不淘汰候选，也都不出现在候选的 `reason` 或试验的 `reason` 里：它们是并列在判定旁边的两种「没答案」状态（见第 9 节），而把运维引到错的那一个，等于让他去错的地方找库。
+这两个键都不淘汰候选，也都不出现在候选的 `reason` 或试验的 `reason` 里：它们是并列在判定旁边的两种「没答案」状态（见第 10 节），而把运维引到错的那一个，等于让他去错的地方找库。
 
 **模板假设（8 个）**
 
@@ -361,13 +413,16 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 
 `GET /catalog` 的 `templates[].hypothesisI18nKey` 直接给出这些键，前端不必硬编码模板清单。
 
-## 11. 已知非目标与未决
+## 12. 已知非目标与未决
 
 - **不计费**：本功能不扣额度、不写账本，资源只受并发上限与预算上限约束。
 - **`queued` 幽灵不清扫**：只清扫 `running` 的僵尸作业，卡在 `queued` 的不在处理范围内（延后）。
 - **`/catalog` 的 `operators` 只有名字**：不含 arity，也不标注是否带窗口参数；本页第 3.2 节的表是权威来源。
 - **不接入策略运行时**：挖掘结果无法被策略引用，也没有用户作用域的读取路径。
-- **不做 AI 提案**：候选全部来自模板参数展开（v3 再考虑）。
+- **不抓外部研究材料**：AI 模式只读 prompt 里带的内容——字段/算子目录、运行参数、失败摘要与调用者粘贴的纯文本笔记；论文、研报、文件上传与 PDF 解析都不在范围内。
+- **模型是部署配置**：单次运行不能指定模型或 provider，只能用服务端配置；provider 未配置或调用失败时 AI 作业直接失败（`factorMining.aiProposalFailed`），不会回退到模板。因此提案质量是部署的属性，不是本功能的保证。
+- **模拟运行监控未实现**：把挖出的候选放到模拟前向运行里跟踪，仍在范围之外。
+- **重放的是提案，不是数据**：`replayJobId` 不调用模型，能复现提案集合及其 L1 状态，但会重新抓取面板；指纹变了由 `snapshotChanged` 标出。
 - **只存数据指纹**：没有可重放的面板副本，因此历史运行无法离线重跑。
 - **传统期货的期限结构与换月成本仍不在范围内**，需要一条期货多合约数据面。加密交割合约已由 Deribit 月度合约提供：`term_structure` 与 `roll_cost` 已进入 `Crypto` 白名单，点时口径见第 3.1 节。
 

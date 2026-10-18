@@ -23,15 +23,14 @@ the HTTP surface, the job and budget limits, and every i18n key.
 - Keeps everything tenant-scoped, cancelable per job, and auditable afterwards -- config, data
   fingerprint, counts, and a per-candidate reject reason all land in the database.
 
-**What v1 deliberately does not do**
+**What this module deliberately does not do**
 
 | Non-goal | Detail |
 | --- | --- |
 | No strategy-runtime integration | Mined candidates live only in `qd_factor_candidates`. A strategy can still only reference the built-in factor registry `_FACTORS` (`app/services/factors/registry.py`); there is no user-scoped path from a strategy to the mining output. |
-| No AI proposals | Every v1 candidate comes from expanding the template library's parameter grids. No model proposes hypotheses (left to v3). |
 | No write-back to the factor registry | Mining output never becomes a new built-in factor; `_FACTORS` stays a static, code-maintained table. |
-| No billing | This feature is **entirely free of charge**: it neither debits credits nor writes a ledger. Resources are bounded only by the concurrency and budget caps (section 8). |
-| No replayable copy | Only the data fingerprint `snapshotId` is stored, never the market panel itself, so a past run cannot be replayed offline. |
+| No billing | This feature is **entirely free of charge**: it neither debits credits nor writes a ledger. Resources are bounded only by the concurrency and budget caps (section 9). |
+| No replayable market panel | Only the data fingerprint `snapshotId` is stored, never the market panel itself, so a past run cannot be re-run offline against identical data. A v3 AI run can replay its **proposals** (`replayJobId`, section 8) without calling the model, but the replay still refetches the panel and reports `snapshotChanged` when the fingerprint moved. |
 
 ## 2. Reproduce one mining run
 
@@ -321,7 +320,7 @@ from `random.Random(seed)` alone, the gate ladder is pure, and nothing iterates 
 Prefix `/api/factor-mining`; the OpenAPI tag is **`FactorMining`**. Every route requires
 authentication (`Authorization: Bearer <jwt>`). All responses use the standard envelope
 `{"code": 1, "msg": "common.success", "data": ...}`; on error `code: 0`, `msg` is the i18n key from
-section 10, and `data` is `null`.
+section 11, and `data` is `null`.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -331,6 +330,7 @@ section 10, and `data` is `null`.
 | `GET` | `/jobs` | The caller's mining jobs, newest first, **without** `result` |
 | `GET` | `/jobs/<job_id>` | One job, with `progress` and the full `result` |
 | `POST` | `/jobs/<job_id>/cancel` | Cancel; the runner stops at its next progress report |
+| `GET` | `/jobs/<job_id>/proposals` | An AI job's proposals in generation order (section 8); a running job returns the rows written so far |
 | `GET` | `/candidates` | The candidate library, filtered and paged |
 | `GET` | `/candidates/<candidate_id>` | One candidate, with `metrics` and `outOfSample` |
 
@@ -339,26 +339,35 @@ key never lands in the job store's request:
 
 `sourceId`, `sourceName`, `market`, `timeframe`, `startDate`, `endDate`, `freezeRatio`, `budget`,
 `seed`, `templateIds`, `groups`, `holdingPeriod`, `commission`, `slippage`, `neutralizeIndustry`,
-`thresholds`, `searchMode`, `population`, `generations`, `eliteRatio`
+`thresholds`, `searchMode`, `population`, `generations`, `eliteRatio`, `aiRounds`,
+`aiProposalsPerRound`, `researchNotes`, `replayJobId`
 
 Required: `sourceId` (positive integer), `market` (a known market key), and `startDate` / `endDate`
 (`YYYY-MM-DD`). `budget` defaults to 400 and `timeframe` to `1D`.
 
-**The four search-mode keys.** `searchMode` is `enumeration` (the default, the template expansion)
-or `evolution` (that same expansion plus the stream bred from it); any other value is refused with
-`factorMining.invalidParameter` rather than read as the default, because the two modes search
-different candidate sets over different amounts of history. `population` (default 32), `generations`
-(20) and `eliteRatio` (0.25) are the breeding settings, and they are **required — non-empty — of a
-run that breeds**: a value this layer invented would be a search nobody asked for. They are read as
-an integer, an integer and a number respectively, and bounds are enforced on the same key:
-`population` and `generations` must be >= 1, and `eliteRatio` must fall in `[0, 1)` (a share of 1 or
-more leaves the breeding loop no room for children, and the run would search the templates, breed
-nothing, and still be recorded as a success). In enumeration mode all three are optional and also
-bounded when supplied.
+**Search modes.** `searchMode` is `enumeration` (the default, the template expansion),
+`evolution` (that same expansion plus the stream bred from it), or `ai` (pure model proposals,
+section 8); any other value is refused with `factorMining.invalidParameter` rather than read as the
+default, because the modes search different candidate sets over different amounts of history.
+`population` (default 32), `generations` (20) and `eliteRatio` (0.25) are the breeding settings,
+and they are **required — non-empty — of a run that breeds**: a value this layer invented would be
+a search nobody asked for. They are read as an integer, an integer and a number respectively, and
+bounds are enforced on the same key: `population` and `generations` must be >= 1, and `eliteRatio`
+must fall in `[0, 1)` (a share of 1 or more leaves the breeding loop no room for children, and the
+run would search the templates, breed nothing, and still be recorded as a success). In enumeration
+and ai modes all three are optional and also bounded when supplied.
 
-**`/estimate` is unchanged by any of this.** It validates the same payload -- the mode and the
-breeding settings included -- and still answers with **exactly** `{templateCount, candidateBudget}`:
-two keys, and no echo of the mode, which the caller already knows because it is what it submitted.
+`aiRounds` (default 2, 1–3), `aiProposalsPerRound` (default 10, 1–20), `researchNotes` (plain
+text, at most 8000 characters) and `replayJobId` (a job id) belong to the AI mode alone: a non-AI
+run that carries a non-empty one is refused with `factorMining.invalidParameter`, not silently
+ignored. The replay contract is in section 8.
+
+**`/estimate` is unchanged by any of this.** It validates the same payload -- the mode, the
+breeding settings and the AI fields included -- and still answers with **exactly**
+`{templateCount, candidateBudget}`: two keys, and no echo of the mode, which the caller already
+knows because it is what it submitted. For an AI run `templateCount` is `0` and
+`candidateBudget` is `min(aiRounds * aiProposalsPerRound, budget)`: the AI stream is the whole
+search, and the run budget still caps it.
 
 **Job receipt / job object** (one field set for both):
 
@@ -433,7 +442,118 @@ it is displayed under the factor name **`"expression"`** (the built-ins follow i
 `metrics.factorCorrelation.factors[0]` is always `"expression"` and `matrix[0][1:]` holds its
 correlation against each built-in.
 
-## 8. Jobs, concurrency, and budget
+## 8. AI proposals and the failure-feedback loop
+
+`searchMode="ai"` replaces the template expansion with model proposals. The job asks the
+server-configured LLM for hypotheses and expressions, validates every expression against the same
+field and operator whitelist as any other candidate, and sends the legal ones through the
+unchanged L1-L6 ladder. The template library is still given to the model as prior examples, but
+it does not enter the candidate stream: every AI candidate has `origin = "ai"` and an empty
+`templateId`. The trial ledger, candidate pool, frozen review and pool-increment stage are the
+same as in the other modes.
+
+**Request fields.** `aiRounds` (default 2, 1-3), `aiProposalsPerRound` (default 10, 1-20),
+`researchNotes` (plain text, at most 8000 characters) and `replayJobId` (a job id) are the AI
+fields of `POST /run`; carrying a non-empty one on a non-AI run is refused with
+`factorMining.invalidParameter`. The model and provider are **not** request fields: they come from
+the server's model configuration. The run's candidate budget is
+`min(aiRounds * aiProposalsPerRound, budget)` -- the AI stream is the whole search, and the run
+budget still caps it. `/estimate` returns that product as `candidateBudget` and `0` as
+`templateCount`.
+
+**One round, one model call.** Each round's prompt carries the market, timeframe and data window,
+the field catalogue (grouped), the operator catalogue (arity and window), the candidate budget,
+the cross-run failure summary, the previous round's feedback, the optional research notes, and up
+to ten template examples as priors. Research notes and all historical material are delimited as
+**data**: instructions inside them are not executed. The model must answer with strict JSON:
+`{"proposals": [{"hypothesis": "...", "expression": {...}}]}`. The call has a 60-second timeout
+and is retried once (two attempts per round) on transport or JSON failure; a round that still
+fails fails the job with `factorMining.aiProposalFailed`, keeping the proposals already written.
+
+**Validation, deduplication, and the ladder.** A proposal is not a candidate until it passes L1:
+each expression is normalized with `allowed_fields=fields_for(market)`, so the model cannot use a
+field or operator the template search could not. A validation failure is stored as
+`status = "l1_rejected"` with the DSL error code in `reason`; a repeated fingerprint within the
+run is `status = "duplicate"` with `factorMining.reject.duplicateProposal`. Neither is evaluated
+nor written to the trial ledger. A legal proposal is written as `status = "proposed"` and becomes
+a seed; once its evaluation outcome is known the row is marked `evaluated` (its L1-L6 verdict is in
+the trial/candidate ledger, not in the proposal's `reason`). A round with no legal proposal stops
+the stream early rather than spending another call; a run whose rounds all produce nothing fails
+with `factorMining.aiNoValidProposals`. Only the first
+`min(aiRounds * aiProposalsPerRound, budget)` legal proposals in `(round, ordinal)` order are
+evaluated; legal proposals the model returned beyond that cap stay recorded as `proposed` and are
+never evaluated.
+
+**Failure feedback.** Feedback has two layers. Within a run, after a round's seeds have been
+evaluated, the engine's in-memory outcomes are aggregated by stage and reject reason, with up to
+10 failed expressions (hash and reason) and up to 5 near misses ordered by their relative distance
+to the threshold; the block is capped at 6000 characters and becomes the next round's `Previous
+round feedback`. It must read the engine, not `qd_factor_trials`: the service writes trials only
+after `engine.run` returns. Across runs, the first round reads the caller's 5 most recent
+**successful** runs on the same market and timeframe -- stage/verdict/reason counts plus up to 10
+failed expressions, capped at 6000 characters. Failed and cancelled runs are not used as history.
+
+**What is stored.** `qd_factor_proposals` holds one row per proposal (`run_id`, `round`,
+`ordinal`, expression, hash, hypothesis, model, provider, prompt hash, DSL version, source,
+status, reject reason). `qd_factor_mining_runs.job_id` (an added column) maps a job to its run, so
+proposals are readable while the job runs and after it fails. Research notes are not copied into
+`config_json` or the proposal rows: they travel with the job request (`qd_agent_jobs.request`,
+tenant-scoped), and the summary stores only their SHA-256 and length. Prompts are not stored;
+only their hashes are.
+
+**AI summary.** `GET /jobs/<job_id>` adds `result.summary.ai` to an AI run's result:
+
+```json
+{"enabled": true, "rounds": 2, "proposals": 17, "l1Rejected": 3, "duplicates": 2,
+ "evaluated": 12, "model": "...", "provider": "...", "modelFallbackUsed": false,
+ "promptHashes": ["..."], "researchNotesSha256": "...", "researchNotesLength": 1234,
+ "replayOf": "", "snapshotChanged": false}
+```
+
+`rounds` is the number of rounds actually run; `model` / `provider` identify the last answering
+batch (empty on a replay, which calls no model). Non-AI runs do not carry `summary.ai`.
+
+**Proposal endpoint.** `GET /api/factor-mining/jobs/<job_id>/proposals?limit=50&offset=0` returns
+`{"items": [...]}` sorted by `(round, ordinal)`; `limit` is clamped to 200. Each item is
+`{id, runId, round, ordinal, hypothesis, expression, expressionHash, status, reason, model,
+provider, promptHash, dslVersion, source, createdAt}`. A running job returns the rows written so
+far (possibly none); an unknown job, another tenant's job, a non-mining job, or a job that has not
+opened its run all read as 404 `factorMining.jobNotFound`.
+
+**Replay.** `replayJobId` names one of the caller's own **successful** AI runs. A replay request
+needs only `searchMode="ai"` and `replayJobId`; the recorded run supplies the market, window,
+budget, source and AI bounds. A client may restate `market`, `timeframe`, `startDate`, `endDate`,
+`budget` or `thresholds`, but only with effective values equal to the record -- a disagreement is
+`factorMining.aiReplayIncompatible`. `researchNotes` may be supplied afresh for the audit record;
+it is not sent to a model. The replay copies the recorded proposals into a new run with
+`source = "replay"`, re-runs L1 against the current DSL (a `dslVersion` mismatch is
+`factorMining.aiReplayIncompatible`), and evaluates only the legal ones. The proposer is never
+called on this path. Because the panel is refetched, `snapshotChanged` says whether its
+fingerprint differs from the original run's: the proposals and their L1 statuses are reproduced,
+but the metrics are a new measurement. An unknown or other-tenant `replayJobId` is
+`factorMining.aiReplayNotFound`.
+
+**Limits.**
+
+| Item | Value |
+| --- | --- |
+| Rounds | Default 2, maximum 3 (`aiRounds`) |
+| Proposals per round | Default 10, maximum 20 (`aiProposalsPerRound`) |
+| Valid proposals per run | The first `min(aiRounds * aiProposalsPerRound, budget)` in `(round, ordinal)` order are evaluated; later ones stay `proposed` |
+| Model call | 60 s timeout; 1 retry (2 attempts per round) |
+| Research notes | 8000 characters |
+| Prompt | 24000 characters per round; optional material is truncated before the field/operator catalogue and constraints |
+| Cross-run history | The 5 most recent successful runs |
+| Feedback block | 6000 characters |
+
+**Known limits.** The model and provider are deployment configuration, not per-run choices. The
+feature does not fetch papers or reports and has no file/PDF ingestion; only pasted plain-text
+notes are read. Proposal quality depends on the configured provider and model, and an AI proposal
+still has to pass the unchanged L1-L6 ladder -- AI mode changes where hypotheses come from, not
+what counts as evidence. Simulation/paper-run monitoring is not implemented. The feature remains
+free of charge; each round is one model call and the run is bounded as above.
+
+## 9. Jobs, concurrency, and budget
 
 **Durable execution.** A mining job travels through the shared `qd_agent_jobs` table with
 `kind = "factor_mining"`, carried by the Celery durable path (`app/tasks/agent_jobs.py` registers
@@ -459,7 +579,9 @@ another feature (which this feature's sweep does not retire) cannot block mining
 | Minimum usable budget | 1 (below 1, or unreadable, `factorMining.budgetInvalid`) |
 
 `budget` is a **cap, not a promise**: when the template set expands to fewer than 400 distinct
-candidates, the run evaluates exactly what expanded (102 for the default template set).
+candidates, the run evaluates exactly what expanded (102 for the default template set). An AI
+run's stream is capped at `min(aiRounds * aiProposalsPerRound, budget)` for the same reason, and
+the model may produce fewer legal proposals than either bound; the run evaluates what passed L1.
 
 **Cancellation.** `POST /jobs/<id>/cancel` marks the job cancelled and the runner stops by raising
 `JobCancelledError` at its **next progress report**. The run row is then closed as `cancelled`
@@ -474,13 +596,14 @@ so an unswept ghost would permanently block that tenant's submissions.
 
 **Open item:** a ghost stuck in `queued` is **out of the sweep's scope** (deferred).
 
-## 9. Data tables
+## 10. Data tables
 
 | Table | Granularity | Key constraints |
 | --- | --- | --- |
-| `qd_factor_mining_runs` | One row per run | Config, data fingerprint, three counts, status; `user_id` is a foreign key to `qd_users` |
+| `qd_factor_mining_runs` | One row per run | Config, data fingerprint, three counts, status, and `job_id` (the job that drives the run); `user_id` is a foreign key to `qd_users` |
 | `qd_factor_candidates` | One row per distinct expression | `UNIQUE (user_id, expression_hash)`, so it deduplicates across runs; `run_id` is `ON DELETE SET NULL` -- a candidate is an asset that outlives runs, so only its pointer may go with one |
 | `qd_factor_trials` | One row per evaluation | `run_id` is `ON DELETE CASCADE` -- a ledger detached from the run that priced it means nothing |
+| `qd_factor_proposals` | One row per AI proposal | `UNIQUE (run_id, round, ordinal)`, ordered by `(round, ordinal)`; `run_id` is `ON DELETE CASCADE`; `user_id` scopes every read, and `status` / `reject_reason` carry the proposal's own audit state (section 8) |
 
 Every write is tenant-scoped and **fails audibly**: writing against a run that is not the caller's
 raises (`factorMining.runNotFound`) instead of returning a row count for rows that were never
@@ -510,12 +633,12 @@ What may not happen is the truncation going unmentioned -- so a reader that show
 compared by half" and "nothing adds anything to this library" identically, and the second is the
 only one the reading supports.
 
-## 10. i18n keys
+## 11. i18n keys
 
 The front-end copy lives in another repository. These are **all** the `factorMining.*` keys the
 backend can emit; the backend emits keys only and never renders copy.
 
-**API and service layer (24 keys)**
+**API and service layer (28 keys)**
 
 | Key | When it fires |
 | --- | --- |
@@ -524,7 +647,7 @@ backend can emit; the backend emits keys only and never renders copy.
 | `factorMining.jobNotFound` | The job does not exist, is not the caller's, or is not a mining job |
 | `factorMining.candidateNotFound` | The candidate does not exist or is not the caller's; also when the id is not an integer |
 | `factorMining.invalidQuery` | A query parameter is not a readable integer |
-| `factorMining.invalidParameter` | A run field cannot be read as the type it is priced with: an integer field (`seed` / `groups` / `holdingPeriod` / `population` / `generations`) that is not an integer, an `eliteRatio` that is not a number, a `commission` / `slippage` too large to convert, a `searchMode` this build does not know, a `timeframe` outside the supported shape (`<digits><m\|h\|d\|w>`), a `population` / `generations` below 1, an `eliteRatio` outside `[0, 1)`, or one of `population` / `generations` / `eliteRatio` missing or blank in an evolution run |
+| `factorMining.invalidParameter` | A run field cannot be read as the type it is priced with: an integer field (`seed` / `groups` / `holdingPeriod` / `population` / `generations` / `aiRounds` / `aiProposalsPerRound`) that is not an integer, an `eliteRatio` that is not a number, a `commission` / `slippage` too large to convert, a `searchMode` this build does not know, a `timeframe` outside the supported shape (`<digits><m\|h\|d\|w>`), a `population` / `generations` below 1, an `eliteRatio` outside `[0, 1)`, an `aiRounds` outside `1-3`, an `aiProposalsPerRound` outside `1-20`, a `researchNotes` that is not a string or exceeds 8000 characters, any AI field on a non-AI run (`aiRounds` / `aiProposalsPerRound` / `researchNotes` / `replayJobId`), or one of `population` / `generations` / `eliteRatio` missing or blank in an evolution run |
 | `factorMining.thresholdsInvalid` | `thresholds` is not an object, or a threshold cannot be read as its own field's type (a fractional `min_ic_observations`, a boolean, a non-finite value) |
 | `factorMining.sourceRequired` | `sourceId` is missing or not a positive integer |
 | `factorMining.sourceNotFound` | The `sourceId` script source does not exist or is not the caller's |
@@ -542,6 +665,10 @@ backend can emit; the backend emits keys only and never renders copy.
 | `factorMining.usableUniverseTooSmall` | Fewer than 3 symbols remained usable after fetching |
 | `factorMining.noMarketData` | The fetch returned no market data at all |
 | `factorMining.missingIcSeries` | The research engine returned no IC series (an upstream fault) |
+| `factorMining.aiProposalFailed` | The model call failed on transport or JSON after its one retry; proposals already written are kept |
+| `factorMining.aiNoValidProposals` | Every round of an AI run produced zero legal proposals |
+| `factorMining.aiReplayNotFound` | `replayJobId` names no job of the caller's, or one that is not a mining job |
+| `factorMining.aiReplayIncompatible` | The recorded run is not a successful run, its DSL version differs, or a restated run field disagrees with the record |
 | `factorMining.runNotFound` | A write targeted a run that does not exist or is not the caller's |
 
 **Parameterized forms (3, so a consumer must not match on a bare key)**
@@ -552,10 +679,11 @@ backend can emit; the backend emits keys only and never renders copy.
 | `factorMining.fingerprintInvalid:<index>` | The `<index>`-th candidate's fingerprint is not a 64-character sha256 hex digest |
 | `factorMining.reject.invalid:<reason>` | The specific failure a DSL validation carried on `ExpressionError.code` (`unknownField` / `tooDeep` / `tooManyNodes` / `unknownOperator` / `badArity` / `badNode` / `badWindow` / `lookbackExceeded`) |
 
-**L1-L6 reject reasons (14 keys)**
+**Reject reasons (15 keys)**
 
 | Key | Stage |
 | --- | --- |
+| `factorMining.reject.duplicateProposal` | AI proposal stream (a repeated fingerprint within the run; status `duplicate`, never evaluated) |
 | `factorMining.reject.invalid` | L1 (the trial's and candidate's `reason` column holds this **bare key**; the `:<reason>` form appears only on the `ExpressionError.code` the DSL raises) |
 | `factorMining.reject.lowCoverage` | L2 |
 | `factorMining.reject.insufficientObservations` | L2 |
@@ -580,7 +708,7 @@ backend can emit; the backend emits keys only and never renders copy.
 
 Neither key retires a candidate and neither appears in a candidate's `reason` or a trial's `reason`:
 they are the two "no answer" states that sit beside the verdict in the increment's own block
-(section 9), and an operator sent to the wrong one of the two looks for a library in the wrong place.
+(section 10), and an operator sent to the wrong one of the two looks for a library in the wrong place.
 
 **Template hypotheses (8 keys)**
 
@@ -596,7 +724,7 @@ they are the two "no answer" states that sit beside the verdict in the increment
 `GET /catalog` returns these keys directly as `templates[].hypothesisI18nKey`, so the front end
 never has to hardcode the template list.
 
-## 11. Known non-goals and open items
+## 12. Known non-goals and open items
 
 - **No billing.** The feature debits nothing and writes no ledger; resources are bounded only by
   the concurrency and budget caps.
@@ -606,7 +734,18 @@ never has to hardcode the template list.
   section 3.2 is the authoritative source.
 - **No strategy-runtime integration.** Mining output cannot be referenced by a strategy, and there
   is no user-scoped read path to it.
-- **No AI proposals.** Every candidate comes from expanding template parameters (revisit in v3).
+- **No external research ingestion.** AI mode reads only what the prompt carries: the catalogue,
+  the run parameters, the failure summaries and the caller's pasted plain-text notes. Papers,
+  reports, file uploads and PDF parsing are out of scope.
+- **Model choice is deployment configuration.** A run cannot name a model or provider; it uses the
+  server's configuration, and an unconfigured or failing provider fails the AI job
+  (`factorMining.aiProposalFailed`) rather than falling back to templates. Proposal quality is
+  therefore a property of the deployment, not a guarantee of the feature.
+- **No simulation/paper-run monitoring.** Checking a mined candidate on a simulated forward run is
+  still out of scope.
+- **Replay is proposal replay, not data replay.** `replayJobId` never calls the model and
+  reproduces the proposal set and its L1 statuses, but it refetches the panel; `snapshotChanged`
+  reports when the fingerprint moved.
 - **Fingerprint only.** There is no replayable panel copy, so past runs cannot be re-run offline.
 - **Term structure and roll cost remain out of scope for traditional futures**, which would need a
   multi-contract futures data face. Crypto dated futures are covered: `term_structure` and
