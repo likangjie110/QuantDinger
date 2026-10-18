@@ -50,7 +50,10 @@ from app.services.factor_mining.engine import (
     FactorMiningEngine,
     MiningConfig,
     MiningDataProvider,
+    _payload_datetime,
+    _timeframe,
 )
+from app.services.factor_mining.gates import GateThresholds
 from app.services.factor_mining.proposals import LLMProposer, RESEARCH_NOTES_MAX_CHARS
 from app.services.factor_mining.storage import FactorMiningRepository
 from app.services.factor_mining.templates import (
@@ -101,6 +104,13 @@ _REPLAY_FIELDS = (
     "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio",
     "budget", "seed", "templateIds", "groups", "holdingPeriod", "commission", "slippage",
     "neutralizeIndustry", "thresholds", "aiRounds", "aiProposalsPerRound",
+)
+
+# Of those, the ones a client may also state -- and only when its *effective* value matches the
+# record. The rest are the record's alone: a client repeating one is ignored rather than refused,
+# because those values do not change which search the replay reproduces.
+_REPLAY_CONFLICT_FIELDS = (
+    "market", "timeframe", "startDate", "endDate", "budget", "thresholds",
 )
 
 # One AI run's own bounds make its proposal count at most this, so a replay reads the whole
@@ -229,10 +239,11 @@ class FactorMiningService:
     def _replay_request(self, request: Mapping[str, Any], user_id: int) -> dict[str, Any]:
         """A replay request rewritten to the recorded run's config; anything else is unchanged.
 
-        Beyond the run id the client may add only its own research notes. A run field it repeats
-        is compared with the record and refused on disagreement -- silently accepting either side
-        would make a replay of one run search another, which is the one thing the mode's name
-        promises it cannot do.
+        Beyond the run id the client may add only its own research notes. Of the run-shape fields
+        it repeats, the six in ``_REPLAY_CONFLICT_FIELDS`` are compared by effective value and
+        refused on disagreement -- silently accepting either side would make a replay of one run
+        search another, which is the one thing the mode's name promises it cannot do. Every
+        other field is the record's to state; a client value for one is ignored.
         """
         replay_job_id = str(request.get("replayJobId") or "").strip()
         if not replay_job_id:
@@ -242,8 +253,10 @@ class FactorMiningService:
             raise ValueError("factorMining.invalidParameter")
         original, _proposals = self._replay_source(replay_job_id, user_id)
         replay = _replay_fields(original, replay_job_id)
-        for key in _REPLAY_FIELDS:
-            if key in request and request[key] != replay[key]:
+        for key in _REPLAY_CONFLICT_FIELDS:
+            if key in request and _effective_field(
+                key, request[key],
+            ) != _effective_field(key, replay[key]):
                 raise ValueError("factorMining.aiReplayIncompatible")
         if "researchNotes" in request:
             replay["researchNotes"] = request["researchNotes"]
@@ -511,6 +524,45 @@ def run_mining_job(
     run the same implementation with the same collaborators.
     """
     return get_factor_mining_service()._run_mining_job(payload, on_progress)
+
+
+def _effective_field(key: str, value: Any) -> Any:
+    """One conflicting field as the run would read it, for comparing spellings of the same run.
+
+    The readers are the config's own -- ``_timeframe``, ``_payload_datetime``,
+    ``GateThresholds.from_payload`` -- so ``"d"`` matches the record's ``"1D"``, ``"20"`` its
+    ``20``, and a partial threshold override its effective bar. Comparing raw payload values
+    instead would refuse a replay of the very config a receipt hands back.
+    """
+    if key == "market":
+        return str(value or "")
+    if key == "timeframe":
+        return _timeframe(value, "1D")
+    if key in ("startDate", "endDate"):
+        return _effective_date(value)
+    if key == "budget":
+        return _effective_budget(value)
+    return GateThresholds.from_payload(value)
+
+
+def _effective_date(value: Any) -> datetime:
+    """A run date as the payload reader resolves it: the day, with no time of day.
+
+    ``config_json`` stores ISO datetimes, and an end date carries the day's last second; both
+    sides are cut to their date first so the stored spelling and a client's ``YYYY-MM-DD``
+    compare as the same day.
+    """
+    if isinstance(value, datetime):
+        return _payload_datetime(value.date().isoformat())
+    return _payload_datetime(str(value or "")[:10])
+
+
+def _effective_budget(value: Any) -> int:
+    """A budget as ``_config`` reads it, raising the field's own key on an unreadable one."""
+    try:
+        return DEFAULT_BUDGET if value is None else int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("factorMining.budgetInvalid") from exc
 
 
 def _replay_fields(run: Mapping[str, Any], replay_job_id: str) -> dict[str, Any]:

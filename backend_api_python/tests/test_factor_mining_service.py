@@ -9,12 +9,13 @@ integration check.
 """
 
 import copy
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from app.services.factor_mining import service as mining_service
+from app.services.factor_mining.dsl import DSL_VERSION
 from app.services.factor_mining.engine import DEFAULT_SEED, MiningConfig, MiningDataProvider
 from app.services.factor_mining.gates import GateThresholds
 from app.services.factor_mining.service import FactorMiningService
@@ -205,7 +206,7 @@ class _Jobs:
         return {"job_id": job_id, "status": "queued"}
 
 
-def _service():
+def _service(run_result=None):
     """A service wired to in-memory collaborators for the AI and replay tests.
 
     ``_restore_module_hooks`` puts back the two module hooks this patches -- the source lookup
@@ -214,7 +215,8 @@ def _service():
     inject no model call (replay, notes) or assert the wiring without running the stream.
     """
     repository = _Repository()
-    engine = _Engine(repository.trace, run_result=_run_result([], []))
+    engine = _Engine(repository.trace,
+                     run_result=_run_result([], []) if run_result is None else run_result)
     build, _ = _factory(repository.trace, engine)
     jobs = _Jobs()
     proposer = lambda system_prompt, user_prompt: pytest.fail("the model must not be called")
@@ -256,6 +258,20 @@ def _original_config():
         "generations": 20, "elite_ratio": 0.25, "ai_rounds": 2,
         "ai_proposals_per_round": 10, "replay_job_id": "",
     }
+
+
+def _ai_run_result(snapshot_id: str = "b" * 64) -> dict:
+    """A run record as the AI engine writes it: ``summary.ai`` present, snapshot settable."""
+    return {**_run_result([], []), "summary": {
+        **_run_result([], [])["summary"], "snapshotId": snapshot_id,
+        "ai": {"enabled": True, "replayOf": "", "snapshotChanged": False},
+    }}
+
+
+def _camel(name: str) -> str:
+    """``template_ids`` -> ``templateIds``: the spelling a run payload uses."""
+    head, *rest = name.split("_")
+    return head + "".join(part.title() for part in rest)
 
 
 # ─────────────────────────────── the job boundary ───────────────────────────────
@@ -1136,3 +1152,96 @@ def test_replay_refuses_a_field_that_disagrees_with_the_record():
     with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
         service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig",
                                            "budget": 99})
+
+
+def test_replay_compares_the_effective_thresholds_not_the_spelling():
+    """A partial override equal to the record's bars is the same run, so the replay is legal."""
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": "success"}
+    original = GateThresholds.from_payload(_original_config()["thresholds"])
+    service.submit(user_id=4, payload={
+        "searchMode": "ai", "replayJobId": "orig",
+        "thresholds": {"min_icir": original.min_icir},
+    })
+    # The record still wins the stored request: the client's spelling does not replace it.
+    assert service.jobs[-1]["request"]["thresholds"] == _original_config()["thresholds"]
+
+
+def test_replay_refuses_thresholds_that_change_the_effective_bars():
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": "success"}
+    original = GateThresholds.from_payload(_original_config()["thresholds"])
+    with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
+        service.submit(user_id=4, payload={
+            "searchMode": "ai", "replayJobId": "orig",
+            "thresholds": {"min_icir": original.min_icir + 0.1},
+        })
+
+
+def test_replay_takes_uncompared_fields_from_the_record():
+    """Only the six run-shape fields are compared; anything else the record owns silently."""
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": "success"}
+    service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig",
+                                       "seed": 999, "groups": 3})
+    assert service.jobs[-1]["request"]["seed"] == 42
+    assert service.jobs[-1]["request"]["groups"] == 5
+
+
+def test_replay_refuses_a_run_that_did_not_succeed():
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": "failed"}
+    with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
+        service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+
+
+def test_replay_refuses_proposals_the_current_dsl_cannot_read():
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": "success"}
+    service.repository.proposals[9] = [
+        {"expression": {"op": "close"}, "dslVersion": DSL_VERSION + 1},
+    ]
+    with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
+        service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+
+
+def test_an_ai_run_records_that_it_replayed_nothing():
+    service = _service(run_result=_ai_run_result())
+    service.submit(user_id=4, payload=_payload(searchMode="ai"))
+    result = service.jobs[-1]["runner"](service.jobs[-1]["request"], None)
+    assert result["summary"]["ai"]["replayOf"] == ""
+    assert result["summary"]["ai"]["snapshotChanged"] is False
+
+
+@pytest.mark.parametrize("snapshot_id,changed", [("b" * 64, False), ("c" * 64, True)],
+                         ids=["same-data", "moved-data"])
+def test_a_replay_records_the_run_it_copied_and_the_snapshot_drift(snapshot_id, changed):
+    service = _service(run_result=_ai_run_result(snapshot_id))
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "snapshotId": "b" * 64, "status": "success"}
+    service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+    result = service.jobs[-1]["runner"](service.jobs[-1]["request"], None)
+    assert result["summary"]["ai"]["replayOf"] == "orig"
+    assert result["summary"]["ai"]["snapshotChanged"] is changed
+
+
+def test_the_replay_payload_covers_every_field_a_recorded_config_carries():
+    """The hand-written replay list must not fall behind ``MiningConfig``.
+
+    ``searchMode`` and ``replayJobId`` are the replay's own; the evolution settings are the one
+    explicit exclusion, because a replay is an AI run and never breeds. Everything else a stored
+    config holds has to travel back into the replayed submission.
+    """
+    evolution_only = {"population", "generations", "eliteRatio"}
+    config_fields = {_camel(field.name) for field in fields(MiningConfig)}
+    assert set(mining_service._REPLAY_FIELDS) == config_fields - evolution_only - {
+        "searchMode", "replayJobId",
+    }
+    assert set(mining_service._REPLAY_CONFLICT_FIELDS) == {
+        "market", "timeframe", "startDate", "endDate", "budget", "thresholds",
+    }
