@@ -64,13 +64,13 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 | 组 | 字段 | 市场 |
 | --- | --- | --- |
 | `price_volume` | `open`、`high`、`low`、`close`、`volume` | 全部市场 |
-| `derivatives` | `funding_rate`、`open_interest` | 仅 `Crypto` |
+| `derivatives` | `funding_rate`、`open_interest`、`term_structure`、`roll_cost` | 仅 `Crypto` |
 
 `fields_for(market)` 按组顺序返回这个集合。市场名**按运行时原样精确匹配**（`Crypto`、`USStock`）：不做大小写折叠、不做别名解析，因此 `crypto`——以及空或未知的市场——只会回退到 `price_volume` 组。这个回退是刻意的，方向是「拒绝」而非「放行」：市场名写错只会少字段，不会多字段；而且落在 `fields_for(market)` 之外的字段本来就会在 L1 以 `unknownField` 被拒。
 
-某组存在只说明**数据源能回答**这个字段，不说明每个标的都有值：衍生品序列返回空的标的仍保留它的 frame，该字段是一整列 NaN，由 L2 的覆盖率门槛决定这个缺口算不算问题。`term_structure` 与 `roll_cost` 不在任何组里，因为它们需要的期货多合约数据面尚不存在（见第 11 节）。
+某组存在只说明**数据源能回答**这个字段，不说明每个标的都有值：衍生品序列返回空的标的仍保留它的 frame，该字段是一整列 NaN，由 L2 的覆盖率门槛决定这个缺口算不算问题。`term_structure` 与 `roll_cost` 来自 Deribit 的 BTC、ETH 月度交割合约：交易所把每根日线的戳记放在当日 08:00 UTC 开盘，因此一根日线的 close 要到 tick + 1 天 08:00 UTC 才可知，两条序列都按这个更晚的时点索引。主力腿是距到期至少 7 天的最近月度合约，远月腿是它的下一个；`term_structure` 是按两个到期日之间的日历天数年化的远月/主力价差，`roll_cost` 是同一价差未年化的值。只有 BTC 与 ETH 有这类合约，其余 `Crypto` 标的保留整列 NaN。两条腿都是 Deribit 合约，币种差异大部分抵消，但成员可能在其他场所报价（例如 USDT 永续），因此这是跨场所基差而非严格的同场所价差。写成公式：`term_structure = (far / main - 1) * 365 / d`，其中 `d` 是两个到期日之间的日历天数；`roll_cost = far / main - 1`，不做年化；合约只在上市到到期之间进入池子。由于只有 BTC 与 ETH 成员带这两个字段，依赖其中任一字段的候选，只有在 BTC/ETH 成员占活跃宇宙的比例达到 L2 覆盖率门槛（默认 0.60）时才能通过；`min_coverage` 可由运行参数覆盖。
 
-`GET /catalog` 按市场提供这份清单：`?market=Crypto` 返回两个组共七个字段；不带 `market`（或带一个本版本不认识的市场名）返回价量五个字段。
+`GET /catalog` 按市场提供这份清单：`?market=Crypto` 返回两个组共九个字段；不带 `market`（或带一个本版本不认识的市场名）返回价量五个字段。
 
 ### 3.2 算子（31 个）
 
@@ -369,8 +369,6 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 - **不接入策略运行时**：挖掘结果无法被策略引用，也没有用户作用域的读取路径。
 - **不做 AI 提案**：候选全部来自模板参数展开（v3 再考虑）。
 - **只存数据指纹**：没有可重放的面板副本，因此历史运行无法离线重跑。
-- **`term_structure` 与 `roll_cost` 不在本次范围内，也不在白名单里。** 这里先把语义定死，免得将来另起计划时还要重吵一遍：**`term_structure`** 是近月与远月合约之间的年化价差，**`roll_cost`** 是按既定换月规则切换主力合约的成本。两者都**和其他所有字段一样必须回答「哪个时点可知」**——将来要进白名单，就得先证明点时可用性，并同样走完 L1–L6 这道阶梯。
-
-  本计划不实现它们，因为需要一条**当前还不存在的数据面**：本仓的期货数据源只提供单合约的 ticker 与 kline，而期限结构需要同一标的的多个合约同时报价。要做出来，得先有单独的数据源计划，以及本版本无处安放的合约元数据——主力合约判定、换月规则、价格复权口径，三者中的任何一个变了，这个字段报出的数就变了，而两个实现各按各的口径就会在同一个字段名下静默报出不同的因子。在这条数据面与这套元数据就绪之前，这两个字段不进任何 `FIELD_GROUPS` 条目：`fields_for(market)` 永远不会返回它们，L1 会把命名它们的候选以 `unknownField` 拒绝，也就没有任何运行会被定价在一条没人能填的数据上。
+- **传统期货的期限结构与换月成本仍不在范围内**，需要一条期货多合约数据面。加密交割合约已由 Deribit 月度合约提供：`term_structure` 与 `roll_cost` 已进入 `Crypto` 白名单，点时口径见第 3.1 节。
 
 相关：[策略工作流](STRATEGY_WORKFLOW_CN.md)、[回测中心](BACKTEST_CENTER_CN.md)、[Strategy API V2 开发指南](../trading/STRATEGY_DEV_GUIDE_CN.md)、[实盘安全](../trading/LIVE_TRADING_SAFETY_CN.md)。

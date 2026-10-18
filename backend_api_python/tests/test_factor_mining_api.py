@@ -354,6 +354,9 @@ def test_catalog_fields_follow_the_market_the_caller_is_about_to_run(app):
     assert "funding_rate" in crypto.get_json()["data"]["fields"]
     plain = _invoke(app, mining_routes.factor_mining_catalog, path="/?market=USStock")
     assert "funding_rate" not in plain.get_json()["data"]["fields"]
+    assert "term_structure" in crypto.get_json()["data"]["fields"]
+    assert "roll_cost" in crypto.get_json()["data"]["fields"]
+    assert "term_structure" not in plain.get_json()["data"]["fields"]
     unknown = _invoke(app, mining_routes.factor_mining_catalog, path="/?market=crypto")
     assert unknown.get_json()["data"]["fields"] == _invoke(
         app, mining_routes.factor_mining_catalog).get_json()["data"]["fields"]

@@ -29,14 +29,14 @@ MAX_LOOKBACK = 504
 # ``fields_for(market)`` admits it at once.
 FIELD_GROUPS: dict[str, tuple[str, ...]] = {
     "price_volume": ("open", "high", "low", "close", "volume"),
-    "derivatives": ("funding_rate", "open_interest"),
+    "derivatives": ("funding_rate", "open_interest", "term_structure", "roll_cost"),
 }
 # The price-volume group under its v1 name: a bare ``normalize_expression`` call defaults to it,
 # and importers that spelled the constant this way keep reading the same tuple.
 PRICE_VOLUME_FIELDS = FIELD_GROUPS["price_volume"]
 # The markets whose panel carries the derivatives group. Membership says the data exists, not that
-# a run would like it to: a field joins a market's set once a source can answer for it, which is
-# also why futures' term structure and roll cost are in no group yet.
+# a run would like it to: a field joins a market's set once a source can answer for it. Crypto's
+# group is filled by Deribit's BTC/ETH monthly contracts (``data_sources.futures_curve``).
 _DERIVATIVES_MARKETS = frozenset({"Crypto"})
 WINDOW_PARAM = "n"
 

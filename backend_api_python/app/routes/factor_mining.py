@@ -80,7 +80,7 @@ def factor_mining_catalog():
     """The DSL's own vocabulary: searchable fields, operators, and hypothesis templates."""
     # ``fields`` is the *market's* set, not the price-volume group: a client that is about to
     # submit a run already holds the market (``/run`` requires it), and a Crypto run's editor
-    # otherwise offers five of the seven fields its candidates may name. The optional ``market``
+    # otherwise offers only the price-volume group among the fields its candidates may name. The optional ``market``
     # query argument is read through the same ``fields_for`` the validator uses, so what this
     # advertises and what L1 admits cannot drift apart. Absent and unrecognised both take
     # ``fields_for``'s own fallback -- the price-volume group, which refuses rather than admits.
