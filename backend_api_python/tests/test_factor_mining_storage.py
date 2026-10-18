@@ -440,15 +440,27 @@ def test_update_proposal_status_skips_the_database_for_an_empty_ordinal_list(mon
 
 
 def test_failure_summary_never_crosses_tenants(monkeypatch):
-    cur = _record(monkeypatch, rows=[_OWNED_RUN])
-    repo = FactorMiningRepository()
-    repo.failure_summary(user_id=4, market="USStock", timeframe="1d",
-                         exclude_run_id=9, history_runs=5, max_expressions=10)
+    cur = _record(monkeypatch)
+    summary = FactorMiningRepository().failure_summary(
+        user_id=4, market="USStock", timeframe="1d",
+        exclude_run_id=9, history_runs=5, max_expressions=10)
     statements = [sql for sql, _params in cur.statements]
     assert any("qd_factor_trials" in sql for sql in statements)
     for sql, params in cur.statements:
         if "user_id" in sql:
             assert 4 in params
+
+    # The run window is what makes the summary "recent successful runs in this market" rather
+    # than every run the tenant ever had, so each clause is pinned with its bound value.
+    run_sql, run_params = cur.statements[0]
+    for fragment in ("status = 'success'", "market = ?", "timeframe = ?", "id <> ?", "LIMIT ?"):
+        assert fragment in run_sql
+    assert run_params == (4, "USStock", "1d", 9, 5)
+    assert "qd_factor_candidates" in cur.statements[2][0]
+    assert cur.statements[2][1][-1] == 10  # max_expressions
+
+    assert set(summary) == {"runIds", "stageCounts", "recentFailures"}
+    assert summary == {"runIds": [], "stageCounts": [], "recentFailures": []}
 
 
 def test_get_run_by_job_id_scopes_by_user(monkeypatch):
