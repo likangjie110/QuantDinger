@@ -32,6 +32,7 @@ _RUN_FIELDS = frozenset({
     "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio",
     "budget", "seed", "templateIds", "groups", "holdingPeriod", "commission", "slippage",
     "neutralizeIndustry", "thresholds", "searchMode", "population", "generations", "eliteRatio",
+    "aiRounds", "aiProposalsPerRound", "replayJobId", "researchNotes",
 })
 
 
@@ -158,6 +159,33 @@ def cancel_factor_mining_job(job_id: str):
     if not job:
         return jsonify({"code": 0, "msg": "factorMining.jobNotFound", "data": None}), 404
     return jsonify({"code": 1, "msg": "common.success", "data": _iso_timestamps(job)})
+
+
+@factor_mining_blp.route("/jobs/<job_id>/proposals", methods=["GET"])
+@login_required
+def list_factor_mining_proposals(job_id: str):
+    """The proposals one AI job's run recorded, in generation order.
+
+    A running job answers what it has written so far -- possibly nothing -- so a caller can
+    watch the rounds arrive; an unknown job, another tenant's, and a job that never opened a
+    run are all not found.
+    """
+    try:
+        items = get_factor_mining_service().get_job_proposals(
+            job_id,
+            user_id=int(g.user_id),
+            limit=max(1, min(_query_int("limit") or 50, 200)),
+            offset=max(0, _query_int("offset") or 0),
+        )
+    except ValueError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    if items is None:
+        response = jsonify({"code": 0, "msg": "factorMining.jobNotFound", "data": None})
+        response.status_code = 404
+        return response
+    return jsonify({"code": 1, "msg": "common.success", "data": {
+        "items": [_iso_timestamps(item) for item in items],
+    }})
 
 
 @factor_mining_blp.route("/candidates", methods=["GET"])

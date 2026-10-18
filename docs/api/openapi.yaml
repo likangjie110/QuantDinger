@@ -3188,6 +3188,46 @@ paths:
       schema:
         type: string
         minLength: 1
+  /api/factor-mining/jobs/{job_id}/proposals:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: The proposals one AI job's run recorded, in generation order.
+      description: 'A running job answers what it has written so far -- possibly nothing
+        -- so a caller can
+
+        watch the rounds arrive; an unknown job, another tenant''s, and a job that
+        never opened a
+
+        run are all not found.'
+      tags:
+      - FactorMining
+      operationId: getApiFactorMiningJobsJobIdProposals
+      parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      x-visibility: internal
+    parameters:
+    - in: path
+      name: job_id
+      required: true
+      schema:
+        type: string
+        minLength: 1
   /api/factor-mining/candidates:
     get:
       responses:

@@ -50,6 +50,10 @@ class _StubService:
     def cancel_job(self, job_id, *, user_id):
         return self._reply("cancel_job", job_id=job_id, user_id=user_id)
 
+    def get_job_proposals(self, job_id, *, user_id, limit, offset):
+        return self._reply("get_job_proposals", job_id=job_id, user_id=user_id,
+                           limit=limit, offset=offset)
+
     def list_candidates(self, *, user_id, run_id=None, status="", market="", limit=50, offset=0):
         return self._reply(
             "list_candidates", user_id=user_id, run_id=run_id,
@@ -77,11 +81,24 @@ def service(monkeypatch):
     return install
 
 
-def _invoke(app, view, *args, path="/", **request_kwargs):
-    """Call a view directly, past ``login_required``, in a request context as ``USER_ID``."""
+def _invoke(app, view, *args, path="/", job_id=None, **request_kwargs):
+    """Call a view directly, past ``login_required``, in a request context as ``USER_ID``.
+
+    ``job_id`` is a path parameter some views take by keyword; it is read here so it reaches the
+    view rather than ``test_request_context``, which would refuse it as an unknown argument.
+    """
+    if job_id is not None:
+        args = (*args, job_id)
     with app.test_request_context(path, **request_kwargs):
         g.user_id = USER_ID
         return inspect.unwrap(view)(*args)
+
+
+def _patch_service(monkeypatch, *, proposals=None, **responses):
+    """Install a service double for one test; ``proposals`` is the proposals read's reply."""
+    stub = _StubService(get_job_proposals=proposals, **responses)
+    monkeypatch.setattr(mining_routes, "get_factor_mining_service", lambda: stub)
+    return stub
 
 
 def _camel(name: str) -> str:
@@ -188,10 +205,13 @@ def test_run_field_whitelist_matches_the_config_it_feeds():
     The service keeps a second hand-copied whitelist of its own -- the keys a run config is echoed
     back under -- and the two have to name the same fields or a key the route lets through
     disappears from the receipt. Asserting them against each other pins that, so the pair can only
-    drift together, which the first assertion would catch.
+    drift together, which the first assertion would catch. ``researchNotes`` is the one route key
+    that is not a config field: it travels in the job's request and nowhere else, so it must not
+    be echoed back as config either.
     """
-    assert {_camel(field.name) for field in dataclasses.fields(MiningConfig)} == mining_routes._RUN_FIELDS
-    assert set(mining_routes._RUN_FIELDS) == set(mining_service._JOB_CONFIG_KEYS)
+    config_fields = {_camel(field.name) for field in dataclasses.fields(MiningConfig)}
+    assert config_fields | {"researchNotes"} == mining_routes._RUN_FIELDS
+    assert config_fields == set(mining_service._JOB_CONFIG_KEYS)
 
 
 def test_estimate_prices_the_search_and_drops_unknown_keys(app, service):
@@ -277,6 +297,27 @@ def test_cancel_returns_the_receipt_and_404s_for_an_unknown_job(app, service):
     response, status = _invoke(app, mining_routes.cancel_factor_mining_job, "job-404")
     assert status == 404
     assert response.get_json()["msg"] == "factorMining.jobNotFound"
+
+
+def test_proposals_endpoint_returns_the_runs_proposals(app, monkeypatch):
+    _patch_service(monkeypatch, proposals=[{"round": 1, "ordinal": 1, "hypothesis": "h",
+                                            "status": "evaluated"}])
+    response = _invoke(app, mining_routes.list_factor_mining_proposals, job_id="job-1")
+    assert response.status_code == 200
+    assert response.get_json()["data"]["items"][0]["hypothesis"] == "h"
+
+
+def test_proposals_endpoint_hides_another_tenants_job(app, monkeypatch):
+    _patch_service(monkeypatch, proposals=None)
+    response = _invoke(app, mining_routes.list_factor_mining_proposals, job_id="other")
+    assert response.status_code == 404
+
+
+def test_proposals_endpoint_returns_partial_proposals_for_a_running_job(app, monkeypatch):
+    _patch_service(monkeypatch, proposals=[{"round": 1, "ordinal": 1, "status": "proposed"}])
+    response = _invoke(app, mining_routes.list_factor_mining_proposals, job_id="running")
+    assert response.status_code == 200
+    assert response.get_json()["data"]["items"][0]["status"] == "proposed"
 
 
 def test_candidate_list_forwards_the_library_filters(app, service):

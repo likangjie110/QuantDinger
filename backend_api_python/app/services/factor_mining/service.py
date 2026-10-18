@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -40,12 +41,17 @@ from typing import Any
 
 from app.markets.registry import list_market_keys
 from app.services.backtest_execution import DEFAULT_COMMISSION, DEFAULT_SLIPPAGE
-from app.services.factor_mining.dsl import fields_for
+from app.services.factor_mining.dsl import DSL_VERSION, fields_for
 from app.services.factor_mining.engine import (
+    MAX_AI_PROPOSALS_PER_ROUND,
+    MAX_AI_ROUNDS,
+    SEARCH_MODE_AI,
+    AISearchOptions,
     FactorMiningEngine,
     MiningConfig,
     MiningDataProvider,
 )
+from app.services.factor_mining.proposals import LLMProposer, RESEARCH_NOTES_MAX_CHARS
 from app.services.factor_mining.storage import FactorMiningRepository
 from app.services.factor_mining.templates import (
     DEFAULT_BUDGET,
@@ -85,7 +91,21 @@ _JOB_CONFIG_KEYS = (
     "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio",
     "budget", "seed", "templateIds", "groups", "holdingPeriod", "commission", "slippage",
     "neutralizeIndustry", "thresholds", "searchMode", "population", "generations", "eliteRatio",
+    "aiRounds", "aiProposalsPerRound", "replayJobId",
 )
+
+# The run fields a replay copies from the recorded run, in the spelling a submission uses.
+# ``searchMode`` and ``replayJobId`` are added by the replay itself; ``researchNotes`` is the
+# caller's own and never part of the recorded config.
+_REPLAY_FIELDS = (
+    "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio",
+    "budget", "seed", "templateIds", "groups", "holdingPeriod", "commission", "slippage",
+    "neutralizeIndustry", "thresholds", "aiRounds", "aiProposalsPerRound",
+)
+
+# One AI run's own bounds make its proposal count at most this, so a replay reads the whole
+# record rather than a first page. The public list endpoint clamps to its own page sizes.
+_REPLAY_PROPOSAL_LIMIT = MAX_AI_ROUNDS * MAX_AI_PROPOSALS_PER_ROUND
 
 
 class FactorMiningService:
@@ -103,18 +123,31 @@ class FactorMiningService:
         engine_factory: Callable[..., FactorMiningEngine] | None = None,
         repository: FactorMiningRepository | None = None,
         backtest_service: StrategyV2BacktestService | None = None,
+        proposer_factory: Callable[[], Any] = LLMProposer,
     ) -> None:
         self._engine_factory = engine_factory or FactorMiningEngine
         self._repository = repository or FactorMiningRepository()
         self._backtest_service = backtest_service or StrategyV2BacktestService()
+        # Built per AI run from the injected factory, so a test can hand over a fake and
+        # production gets the adapter that calls the configured model.
+        self._proposer_factory = proposer_factory
 
     def estimate(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Validate a payload and price its search statically: no source read, no panel, no job.
 
         The candidate count is the expansion's own rather than the budget: the budget is a cap,
-        and a template set that cannot fill it is what the caller needs to see.
+        and a template set that cannot fill it is what the caller needs to see. An AI run
+        expands no templates at all: its candidates are what the model proposes, and the two
+        AI bounds cap that stream exactly the way the engine's own source does.
         """
         config = self._config(payload)
+        if config.search_mode == SEARCH_MODE_AI:
+            return {
+                "templateCount": 0,
+                "candidateBudget": min(
+                    config.ai_rounds * config.ai_proposals_per_round, config.budget,
+                ),
+            }
         seeds = expand_candidates(
             template_ids=config.template_ids or None,
             budget=config.budget,
@@ -132,10 +165,16 @@ class FactorMiningService:
         """Queue one mining run and return its job receipt.
 
         The ``__`` prefix is the job store's own channel -- ``__billing`` is refunded from the
-        stored request, ``__userId`` scopes the run -- so a client-supplied one is dropped here,
+        stored request, ``__userId`` scopes the run, and ``__jobId`` is the id generated here so
+        the run row can name the job that drives it -- so a client-supplied one is dropped here,
         where the untrusted mapping enters, rather than in ``submit_job``, which cannot tell a
-        client's key from the ``__userId`` this method is about to inject. Order matters: strip
-        first, then inject.
+        client's key from the one this method is about to inject. Order matters: strip first,
+        then inject.
+
+        A replay is resolved before the payload is validated: the recorded run's config *is* the
+        submission, so validating the client's two-key request against a run config it does not
+        carry could only refuse a legal replay. A field the client repeats must agree with the
+        record; the recorded value wins whenever it does.
 
         The concurrency gate counts this feature's own jobs. Counting every kind would let a
         running backtest answer ``factorMining.concurrentLimit`` -- a key that says the caller
@@ -145,23 +184,110 @@ class FactorMiningService:
         request_payload = {
             key: value for key, value in (payload or {}).items() if not str(key).startswith("__")
         }
-        self._config(request_payload)
+        request_payload = self._replay_request(request_payload, int(user_id))
+        config = self._config(request_payload)
+        self._research_notes(request_payload, config)
         if agent_jobs.count_active_jobs(user_id=int(user_id), kind=JOB_KIND):
             raise ValueError("factorMining.concurrentLimit")
-        stored = {**request_payload, "__userId": int(user_id)}
+        job_id = uuid.uuid4().hex
+        stored = {**request_payload, "__userId": int(user_id), "__jobId": job_id}
         receipt = agent_jobs.submit_job(
             user_id=int(user_id),
             agent_token_id=None,
             kind=JOB_KIND,
             request_payload=stored,
             runner=self._run_mining_job,
+            job_id=job_id,
         )
         # The job store's receipt names the job and nothing else -- it carries no ``request`` -- so
         # the config the caller just submitted is attached here. A receipt that cannot say what was
         # accepted is not a receipt, and the caller would otherwise have to poll the job to learn
         # whether their own market and window were the ones queued. ``_job_config`` still reads it
-        # through the whitelist, so ``__userId`` does not travel with it.
+        # through the whitelist, so ``__userId`` and ``__jobId`` do not travel with it.
         return _public_job({**receipt, "request": stored})
+
+    def get_job_proposals(
+        self, job_id: str, *, user_id: int, limit: int = 50, offset: int = 0,
+    ) -> list[dict[str, Any]] | None:
+        """The proposals one AI job's run recorded; not the caller's job reads as ``None``.
+
+        The job is checked first because it is what the caller holds: another tenant's id and an
+        id of another feature both read as absent. A job that has not opened its run yet -- still
+        queued -- reads as absent too, while a running one answers whatever rows it has written
+        so far, which may be none.
+        """
+        job = agent_jobs.get_job(str(job_id), user_id=int(user_id))
+        if not job or job.get("kind") != JOB_KIND:
+            return None
+        run = self._repository.get_run_by_job_id(str(job_id), user_id=int(user_id))
+        if run is None:
+            return None
+        return self._repository.list_proposals(
+            int(run["id"]), user_id=int(user_id), limit=int(limit), offset=int(offset),
+        )
+
+    def _replay_request(self, request: Mapping[str, Any], user_id: int) -> dict[str, Any]:
+        """A replay request rewritten to the recorded run's config; anything else is unchanged.
+
+        Beyond the run id the client may add only its own research notes. A run field it repeats
+        is compared with the record and refused on disagreement -- silently accepting either side
+        would make a replay of one run search another, which is the one thing the mode's name
+        promises it cannot do.
+        """
+        replay_job_id = str(request.get("replayJobId") or "").strip()
+        if not replay_job_id:
+            return dict(request)
+        mode = str(request.get("searchMode") or "").strip()
+        if mode and mode != SEARCH_MODE_AI:
+            raise ValueError("factorMining.invalidParameter")
+        original, _proposals = self._replay_source(replay_job_id, user_id)
+        replay = _replay_fields(original, replay_job_id)
+        for key in _REPLAY_FIELDS:
+            if key in request and request[key] != replay[key]:
+                raise ValueError("factorMining.aiReplayIncompatible")
+        if "researchNotes" in request:
+            replay["researchNotes"] = request["researchNotes"]
+        return replay
+
+    def _replay_source(self, job_id: str, user_id: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """The run a replay copies and its proposal rows, or the key that refuses the replay.
+
+        The run has to be a finished success: replaying a failed run would copy a record whose
+        proposals were never fully evaluated, and the proposals have to be readable by the
+        current DSL. A row without a version is read as current -- every stored row carries one,
+        and a hand-built record cannot say otherwise.
+        """
+        run = self._repository.get_run_by_job_id(str(job_id), user_id=int(user_id))
+        if not run:
+            raise ValueError("factorMining.aiReplayNotFound")
+        if str(run.get("status") or "") != "success":
+            raise ValueError("factorMining.aiReplayIncompatible")
+        proposals = self._repository.list_proposals(
+            int(run["id"]), user_id=int(user_id), limit=_REPLAY_PROPOSAL_LIMIT, offset=0,
+        )
+        for proposal in proposals:
+            if int(proposal.get("dslVersion", DSL_VERSION)) != DSL_VERSION:
+                raise ValueError("factorMining.aiReplayIncompatible")
+        return run, proposals
+
+    @staticmethod
+    def _research_notes(payload: Mapping[str, Any], config: MiningConfig) -> str:
+        """The caller's notes for the AI model: optional, bounded, and AI-only.
+
+        Notes on a run that names no AI mode are refused rather than dropped: the caller wrote
+        them for a model call that run will never make, and a stored request carrying them would
+        read as a search that consulted them.
+        """
+        notes = payload.get("researchNotes")
+        if notes is None:
+            return ""
+        if not isinstance(notes, str):
+            raise ValueError("factorMining.invalidParameter")
+        if len(notes) > RESEARCH_NOTES_MAX_CHARS:
+            raise ValueError("factorMining.invalidParameter")
+        if notes and config.search_mode != SEARCH_MODE_AI:
+            raise ValueError("factorMining.invalidParameter")
+        return notes
 
     def get_job(self, job_id: str, *, user_id: int) -> dict[str, Any] | None:
         """One of the caller's mining jobs; another tenant's or another feature's job is not found."""
@@ -231,10 +357,17 @@ class FactorMiningService:
         that ended it -- and the exception is re-raised afterwards so ``agent_jobs`` records the
         job failure too. Nothing is swallowed: a review that cannot run leaves a failed run, not a
         run whose candidates quietly stay frozen.
+
+        An AI job builds the source's options here, because the run id and the recorded
+        proposals only exist at this point: the id is the row opened just above, and a replay's
+        proposals are re-read and re-validated from the run it names rather than trusted from
+        the submission, which may be older than the record.
         """
         request_payload = dict(payload or {})
         user_id = int(request_payload.pop("__userId"))
+        job_id = str(request_payload.pop("__jobId", ""))
         config = self._config(request_payload)
+        notes = self._research_notes(request_payload, config)
         source = get_script_source_service().get_source(config.source_id, user_id=user_id)
         if not source:
             raise ValueError("factorMining.sourceNotFound")
@@ -250,15 +383,35 @@ class FactorMiningService:
             # backfills the fingerprint from the result.
             snapshot_id="",
             manifest=compile_strategy_v2(code).manifest.metadata(),
+            # The id the job was submitted under, so a proposal lookup works from either side
+            # while the job runs and after it failed.
+            job_id=job_id,
         )
         result: dict[str, Any] = {}
+        original: dict[str, Any] | None = None
         try:
+            ai = None
+            if config.search_mode == SEARCH_MODE_AI:
+                replay_proposals: tuple[Mapping[str, Any], ...] = ()
+                if config.replay_job_id:
+                    original, rows = self._replay_source(config.replay_job_id, user_id)
+                    replay_proposals = tuple(rows)
+                ai = AISearchOptions(
+                    run_id=run_id,
+                    research_notes=notes,
+                    proposer=self._proposer_factory(),
+                    repository=self._repository,
+                    replay_proposals=replay_proposals,
+                )
             engine = self._engine_factory(
                 data_provider=MiningDataProvider(backtest_service=self._backtest_service),
                 on_progress=on_progress,
             )
             search = engine.run(user_id=user_id, code=code, config=config,
-                                search_mode=config.search_mode)
+                                search_mode=config.search_mode, ai=ai)
+            # The record names the run it belongs to, so a job result is auditable by itself.
+            search["runId"] = run_id
+            _record_ai_summary(search, config, original)
             self._repository.save_trials(run_id, user_id=user_id, trials=search["trials"])
             # The counts may only be persisted once the ledger holds them: a run row closed before
             # its trials were written would claim evaluations the ledger never received.
@@ -358,6 +511,59 @@ def run_mining_job(
     run the same implementation with the same collaborators.
     """
     return get_factor_mining_service()._run_mining_job(payload, on_progress)
+
+
+def _replay_fields(run: Mapping[str, Any], replay_job_id: str) -> dict[str, Any]:
+    """The recorded run's config, spelled as the submission payload a replay submits.
+
+    The config is the source rather than the run's denormalised columns: it is the record the
+    search actually read, and it carries every field on its own. Dates are cut back to the day
+    because ``config_json`` stores ISO datetimes while the payload reader accepts ``YYYY-MM-DD``
+    only; ``from_payload`` restores the end date to its day's end, so the cut loses nothing.
+    """
+    config = run.get("config")
+    config = config if isinstance(config, Mapping) else {}
+    return {
+        "sourceId": config.get("source_id"),
+        "sourceName": str(config.get("source_name") or ""),
+        "market": str(config.get("market") or ""),
+        "timeframe": str(config.get("timeframe") or ""),
+        "startDate": str(config.get("start_date") or "")[:10],
+        "endDate": str(config.get("end_date") or "")[:10],
+        "freezeRatio": config.get("freeze_ratio"),
+        "budget": config.get("budget"),
+        "seed": config.get("seed"),
+        "templateIds": list(config.get("template_ids") or ()),
+        "groups": config.get("groups"),
+        "holdingPeriod": config.get("holding_period"),
+        "commission": config.get("commission"),
+        "slippage": config.get("slippage"),
+        "neutralizeIndustry": bool(config.get("neutralize_industry", False)),
+        "thresholds": dict(config.get("thresholds") or {}),
+        "aiRounds": config.get("ai_rounds"),
+        "aiProposalsPerRound": config.get("ai_proposals_per_round"),
+        "searchMode": SEARCH_MODE_AI,
+        "replayJobId": replay_job_id,
+    }
+
+
+def _record_ai_summary(
+    search: Mapping[str, Any], config: MiningConfig, original: Mapping[str, Any] | None,
+) -> None:
+    """Write the replay facts an AI run's summary carries: what it copied and whether the data moved.
+
+    ``snapshotChanged`` compares the panel this run searched with the original run's recorded
+    fingerprint. It is the reading a replay is for: the same proposals evaluated over different
+    data are a different result, and the summary has to say which of the two happened.
+    """
+    summary = search.get("summary")
+    ai_summary = summary.get("ai") if isinstance(summary, Mapping) else None
+    if not isinstance(ai_summary, dict):
+        return
+    ai_summary["replayOf"] = config.replay_job_id
+    ai_summary["snapshotChanged"] = bool(
+        original and summary.get("snapshotId") != original.get("snapshotId")
+    )
 
 
 def _is_stale_running_job(row: Mapping[str, Any]) -> bool:
