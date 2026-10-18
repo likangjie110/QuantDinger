@@ -215,3 +215,45 @@ def test_prompts_are_deterministic():
     first = proposals.build_prompts(_context(), round_no=1, last_feedback=None)
     second = proposals.build_prompts(_context(), round_no=1, last_feedback=None)
     assert first == second
+
+
+class _FakeLLM:
+    def __init__(self, text="{\"proposals\": []}"):
+        self.text = text
+        self.calls = []
+        self.last_model_used = "fake-model"
+        self.last_provider_used = "fake-provider"
+        self.model_fallback_used = False
+
+    def is_configured(self, provider=None):
+        return True
+
+    def call_llm_api(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        if isinstance(self.text, Exception):
+            raise self.text
+        return self.text
+
+
+def test_proposer_refuses_an_unconfigured_service():
+    fake = _FakeLLM()
+    fake.is_configured = lambda provider=None: False
+    with pytest.raises(proposals.ProposalGenerationError):
+        proposals.LLMProposer(service=fake)("s", "u")
+    assert fake.calls == []
+
+
+def test_proposer_returns_text_and_records_the_answering_model():
+    fake = _FakeLLM()
+    batch = proposals.LLMProposer(service=fake)( "sys", "user")
+    assert batch.text == "{\"proposals\": []}"
+    assert batch.model == "fake-model" and batch.provider == "fake-provider"
+    assert fake.calls[0][0][0]["role"] == "system"
+    assert fake.calls[0][1]["use_json_mode"] is True
+    assert fake.calls[0][1]["timeout_seconds"] == 60.0
+
+
+def test_proposer_raises_the_closed_key_on_transport_failure():
+    with pytest.raises(proposals.ProposalGenerationError) as exc:
+        proposals.LLMProposer(service=_FakeLLM(RuntimeError("down")))("s", "u")
+    assert str(exc.value) == "factorMining.aiProposalFailed"

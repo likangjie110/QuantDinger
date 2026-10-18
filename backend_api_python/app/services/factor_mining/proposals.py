@@ -2,9 +2,9 @@
 
 A proposal round is one model call whose answer becomes candidate expressions. This module
 owns the three pure steps around that call: the prompt the model reads, the JSON it must
-answer with, and the structured summary of what the previous round rejected. It never calls
-a model, reads a clock, or touches a database -- the proposal source passes it text and
-outcomes.
+answer with, and the structured summary of what the previous round rejected. :class:`LLMProposer`
+is the thin adapter that performs the call over an injected service; the pure steps read no
+clock and touch no database -- the proposal source passes them text and outcomes.
 
 Trust boundary: research notes, historical failures, and previous feedback are written by
 users or by earlier runs, so the system prompt declares them data and the user prompt wraps
@@ -473,3 +473,56 @@ def render_feedback(feedback: Mapping[str, Any]) -> str:
             payload[key].pop()
             text = _json(payload)
     return text[:FEEDBACK_MAX_CHARS]
+
+
+@dataclass(frozen=True)
+class ProposalBatch:
+    """One model answer and the model/provider identity that produced it."""
+
+    text: str
+    model: str
+    provider: str
+    fallback_used: bool
+
+
+class ProposalGenerationError(ValueError):
+    """The proposal round could not be generated; the caller may retry the round."""
+
+    def __init__(self, reason: str = "factorMining.aiProposalFailed") -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class LLMProposer:
+    """Call the configured model once per round; retries belong to the proposal source.
+
+    The adapter neither parses nor retries: it reports the raw text plus the identity of the
+    model that answered, so the source can hash the prompt and retry a failed round as a whole.
+    """
+
+    def __init__(self, service: Any = None, *, timeout_seconds: float = 60.0) -> None:
+        if service is None:
+            # Lazy import keeps the pure prompt/parse helpers free of the LLM stack.
+            from app.services.llm import LLMService
+            service = LLMService()
+        self._service = service
+        self._timeout_seconds = timeout_seconds
+
+    def __call__(self, system_prompt: str, user_prompt: str) -> ProposalBatch:
+        if not self._service.is_configured():
+            raise ProposalGenerationError()
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            text = self._service.call_llm_api(
+                messages, use_json_mode=True, timeout_seconds=self._timeout_seconds)
+        except Exception as exc:
+            raise ProposalGenerationError() from exc
+        return ProposalBatch(
+            text=str(text or ""),
+            model=str(getattr(self._service, "last_model_used", "") or ""),
+            provider=str(getattr(self._service, "last_provider_used", "") or ""),
+            fallback_used=bool(getattr(self._service, "model_fallback_used", False)),
+        )
