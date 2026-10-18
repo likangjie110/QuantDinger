@@ -484,3 +484,28 @@ def test_ai_summary_stores_an_empty_hash_for_empty_notes():
         context=_context(rounds=1), repository=_Repo(),
         proposer=lambda s, u: None, outcome=lambda fp: None)
     assert source.ai_summary()["researchNotesSha256"] == ""
+
+
+def test_finish_closes_a_partially_consumed_round_once():
+    """A capped consumer stops mid-round; finish closes it, and a second call is a no-op."""
+    rows = [
+        {"round": 1, "ordinal": ordinal,
+         "expression": {"op": "ts_pct_change", "args": ["close"], "params": {"n": window}}}
+        for ordinal, window in ((1, 5), (2, 6))
+    ]
+    fingerprint = normalize_expression(rows[0]["expression"]).fingerprint
+    repo = _Repo()
+    source = proposals.ProposalSource(
+        context=_context(rounds=1, replay=tuple(rows), replay_of="job-1"),
+        repository=repo, proposer=lambda s, u: None,
+        outcome=lambda fp: (
+            {"stage": "L2", "verdict": "reject", "reason": "r", "metrics": {}}
+            if fp == fingerprint else None))
+    seeds = iter(source)
+    assert next(seeds).fingerprint == fingerprint
+
+    source.finish()
+    source.finish()
+
+    assert repo.updated == [(1, (1,), "evaluated")]
+    assert source.ai_summary()["evaluated"] == 1

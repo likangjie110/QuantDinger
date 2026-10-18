@@ -551,6 +551,9 @@ class ProposalSource:
     Replay is the same stream without a model: recorded proposals are re-validated against the
     current DSL, written as a new run's rows, and yielded in ``(round, ordinal)`` order. The
     proposer is never called on this path, even when the recorded run left no proposals.
+
+    ``finish`` exists because a consumer may stop pulling before the stream is drained: a capped
+    run stops at its budget, and the close code lives after the last ``yield``.
     """
 
     def __init__(
@@ -567,6 +570,7 @@ class ProposalSource:
         self._outcome = outcome
         self._seen: set[str] = set()
         self._last_feedback: dict[str, Any] | None = None
+        self._open_rounds: list[tuple[int, list[dict[str, Any]]]] = []
         self._rounds = 0
         self._proposals = 0
         self._l1_rejected = 0
@@ -613,6 +617,19 @@ class ProposalSource:
             "snapshotChanged": False,
         }
 
+    def finish(self) -> None:
+        """Close every round the stream left open. Idempotent; a drained stream is a no-op.
+
+        A capped consumer stops pulling at its cap, which is before the generator reaches the
+        close code after its last ``yield`` -- so the last round's evaluated rows would stay
+        ``proposed`` and its feedback would never be built. The caller invokes this after its
+        loop rather than pulling once more, because one more pull can spend a model call on the
+        next round.
+        """
+        open_rounds, self._open_rounds = self._open_rounds, []
+        for round_no, rows in open_rounds:
+            self._last_feedback = self._close_round(round_no, rows)
+
     def _iter_rounds(self) -> Iterator[CandidateSeed]:
         yielded = False
         for round_no in range(1, max(0, int(self._context.rounds)) + 1):
@@ -623,6 +640,10 @@ class ProposalSource:
             self._fallback_used = bool(batch.fallback_used)
             self._prompt_hashes.append(prompt_hash)
             rows, seeds = self._record(round_no, parsed, batch, prompt_hash)
+            if seeds:
+                # Registered before the first yield: a cap can suspend the stream here, and
+                # finish() must still find the round.
+                self._open_rounds.append((round_no, rows))
             for seed in seeds:
                 yielded = True
                 yield seed
@@ -630,6 +651,8 @@ class ProposalSource:
                 # Nothing legal to evaluate: further rounds would only spend model calls.
                 break
             self._last_feedback = self._close_round(round_no, rows)
+            if self._open_rounds and self._open_rounds[-1][0] == round_no:
+                self._open_rounds.pop()
         if not yielded:
             raise ProposalGenerationError("factorMining.aiNoValidProposals")
 
@@ -640,6 +663,7 @@ class ProposalSource:
         )
         rows: list[dict[str, Any]] = []
         seeds: list[CandidateSeed] = []
+        seed_rounds: list[int] = []
         rounds: list[int] = []
         for entry in entries:
             round_no = int(entry.get("round") or 0)
@@ -659,7 +683,9 @@ class ProposalSource:
                 "status": "proposed",
                 "reason": "",
             }
+            before = len(seeds)
             self._classify(row, seeds)
+            seed_rounds.extend([round_no] * (len(seeds) - before))
             rows.append(row)
         self._rounds = len(rounds)
         self._count_rows(rows)
@@ -672,10 +698,14 @@ class ProposalSource:
             self._context.run_id, self._context.replay_of, len(rows),
             self._l1_rejected, self._duplicates,
         )
-        for seed in seeds:
+        for seed, round_no in zip(seeds, seed_rounds):
+            if not self._open_rounds or self._open_rounds[-1][0] != round_no:
+                self._open_rounds.append(
+                    (round_no, [row for row in rows if row["round"] == round_no]))
             yield seed
         for round_no in rounds:
             self._close_round(round_no, [row for row in rows if row["round"] == round_no])
+        self._open_rounds = []
         if not seeds and not self._context.replay:
             raise ProposalGenerationError("factorMining.aiNoValidProposals")
 

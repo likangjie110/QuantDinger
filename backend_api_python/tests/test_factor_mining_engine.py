@@ -1666,6 +1666,7 @@ class _FakeRepo:
     def __init__(self):
         self.history_calls: list[dict] = []
         self.saved: list[tuple] = []
+        self.status_updates: list[dict] = []
 
     def failure_summary(self, **kwargs):
         self.history_calls.append(kwargs)
@@ -1675,7 +1676,10 @@ class _FakeRepo:
         self.saved.append((run_id, user_id, proposals))
 
     def update_proposal_status(self, run_id, *, user_id, round_no, ordinals, status):
-        pass
+        self.status_updates.append({
+            "run_id": run_id, "user_id": user_id, "round_no": round_no,
+            "ordinals": tuple(ordinals), "status": status,
+        })
 
 
 @pytest.fixture
@@ -1729,6 +1733,9 @@ def test_every_yielded_ai_seed_gets_a_trial(_engine_fixture, monkeypatch):
                 expression={"op": "ts_pct_change", "args": ["close"], "params": {"n": 5}},
                 fingerprint="a" * 64, template_id="", origin="ai", params={})
 
+        def finish(self):
+            pass
+
         def ai_summary(self):
             return {"enabled": True, "proposals": 1, "evaluated": 1}
 
@@ -1759,6 +1766,9 @@ def test_a_seeds_outcome_is_complete_before_the_source_resumes(_engine_fixture, 
             captured["before"] = captured["outcome"](seed.fingerprint)
             yield seed
             resumed.append(captured["outcome"](seed.fingerprint))
+
+        def finish(self):
+            pass
 
         def ai_summary(self):
             return {"enabled": True}
@@ -1841,6 +1851,9 @@ def test_ai_outcomes_keep_only_the_feedback_metrics(_engine_fixture, monkeypatch
         def __iter__(self):
             yield seed
 
+        def finish(self):
+            pass
+
         def ai_summary(self):
             return {"enabled": True}
 
@@ -1903,6 +1916,9 @@ def test_ai_context_budget_is_the_effective_cap(monkeypatch):
         def __iter__(self):
             return iter(())
 
+        def finish(self):
+            pass
+
         def ai_summary(self):
             return {"enabled": True}
 
@@ -1919,3 +1935,52 @@ def test_ai_context_budget_is_the_effective_cap(monkeypatch):
     assert captured["context"].budget == 2
     assert total == 2
     assert list(source) == []
+
+
+def test_a_capped_ai_run_closes_the_last_round():
+    """A cap stops the stream before its close code; the run must close the round itself."""
+    entries = tuple(
+        {"round": 1, "ordinal": ordinal,
+         "expression": {"op": "ts_pct_change", "args": ["close"], "params": {"n": window}}}
+        for ordinal, window in enumerate((2, 3, 4, 5, 6), start=1)
+    )
+    repo = _FakeRepo()
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    result = engine.run(
+        user_id=4, code="code",
+        config=_config(budget=2, ai_rounds=2, ai_proposals_per_round=5),
+        search_mode=SEARCH_MODE_AI,
+        ai=_ai_options(run_id=9, repository=repo, replay_proposals=entries),
+    )
+
+    assert result["summary"]["ai"]["evaluated"] == len(result["trials"]) == 2
+    assert repo.status_updates == [{
+        "run_id": 9, "user_id": 4, "round_no": 1,
+        "ordinals": (1, 2), "status": "evaluated",
+    }]
+    rows = repo.saved[-1][2]
+    assert [row["status"] for row in rows] == [
+        "evaluated", "evaluated", "proposed", "proposed", "proposed",
+    ]
+
+
+def test_a_full_budget_ai_run_closes_its_last_round():
+    """The default configuration hits the cap exactly, so no further pull ever closes the tail."""
+    entries = tuple(
+        {"round": (ordinal - 1) // 5 + 1, "ordinal": (ordinal - 1) % 5 + 1,
+         "expression": {"op": "ts_pct_change", "args": ["close"], "params": {"n": window}}}
+        for ordinal, window in enumerate(range(2, 12), start=1)
+    )
+    repo = _FakeRepo()
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    result = engine.run(
+        user_id=4, code="code",
+        config=_config(budget=10, ai_rounds=2, ai_proposals_per_round=5),
+        search_mode=SEARCH_MODE_AI,
+        ai=_ai_options(run_id=9, repository=repo, replay_proposals=entries),
+    )
+
+    assert result["summary"]["ai"]["evaluated"] == len(result["trials"]) == 10
+    assert [(call["round_no"], call["ordinals"]) for call in repo.status_updates] == [
+        (1, (1, 2, 3, 4, 5)), (2, (1, 2, 3, 4, 5)),
+    ]

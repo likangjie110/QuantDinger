@@ -934,6 +934,9 @@ class FactorMiningEngine:
             self._progress(evaluated, total)
         summary = self._summary(config, panel, trials, candidates, comparison)
         if search_mode == SEARCH_MODE_AI:
+            # A capped stream stops before the source's own close code, so its last round is
+            # still open; close it before the summary counts what was evaluated.
+            source.finish()
             summary["ai"] = source.ai_summary()
         return {
             "config": self._config_payload(config),
@@ -1645,8 +1648,9 @@ class _CappedSource:
     """An AI proposal stream cut at the run's budget, with its summary still reachable.
 
     ``itertools.islice`` stops pulling at the cap -- which matters, because resuming the source
-    can spend a model call on the next round -- but it drops the ``ai_summary`` the run record
-    needs afterwards. This keeps both: the slice is the stream, the wrapped source is the summary.
+    can spend a model call on the next round -- but it drops the ``ai_summary`` and ``finish``
+    the run record needs afterwards. This keeps both: the slice is the stream, the wrapped source
+    is the rest.
     """
 
     def __init__(self, source: Any, limit: int) -> None:
@@ -1655,6 +1659,9 @@ class _CappedSource:
 
     def __iter__(self):
         return self._seeds
+
+    def finish(self) -> None:
+        self._source.finish()
 
     def ai_summary(self) -> dict[str, Any]:
         return self._source.ai_summary()
