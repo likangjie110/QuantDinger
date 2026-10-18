@@ -871,150 +871,143 @@ git commit -m "feat: 因子挖掘作业支持 AI 提案、重放与提案查询�
 
 ---
 
-### 任务 7：前端 AI 模式与提案列表
+### 任务 7：主产品 QuantDinger-Vue 的 AI 模式与提案列表
 
-**文件：**
-- 修改：`frontend-factor-mining/src/components/SubmitJob.vue`
-- 修改：`frontend-factor-mining/src/components/JobDetail.vue`
-- 修改：`frontend-factor-mining/src/api/factorMining.js`
-- 修改：`frontend-factor-mining/src/i18n/zh-CN.js`
-- 修改：`frontend-factor-mining/package.json`、`package-lock.json`（Playwright + axe devDependencies）
-- 创建：`frontend-factor-mining/playwright.config.js`
-- 创建：`frontend-factor-mining/e2e/factor-mining-ai.spec.js`
-- 创建：`docs/web_doc/factor-mining-ai.md`
+**目标仓库（独立 git 仓库，不提交到本仓库）：** `G:\project\windows\PycharmProjects\QuantDinger\frontend-vue`（`origin = OpenByteInc/QuantDinger-Vue`，Vue 2.7 + Ant Design Vue，HEAD `ddfe11f`，工作树干净，包管理器 pnpm 10.33.4）。
+在独立仓库创建本地分支 `feat/factor-mining-v3-ui`；只提交，不推送。独立页 `frontend-factor-mining/` 保持原样。
 
-**前端门禁（全局 CLAUDE.md，本任务必须满足）：**
+**文件（主产品仓库内）：**
+- 修改：`src/views/factor-mining/components/SubmitJob.vue`
+- 修改：`src/views/factor-mining/components/JobList.vue`（作业详情是内联 `a-modal`，没有独立 JobDetail）
+- 修改：`src/api/factor-mining.js`
+- 修改：`src/locales/factor-mining-overrides.js`
+- 修改：`tests/unit/factorMiningLocaleContract.test.mjs`
+- 创建：`src/views/factor-mining/aiPayload.js`（纯函数：按模式裁剪提交 payload）
+- 创建：`tests/unit/factorMiningAiPayload.test.mjs`
+- 更新（主仓库治理文档，未跟踪，属当前治理会话工作树）：`doc/web_doc/06-factor-mining.md`、`doc/web_doc/03-state-and-api.md`
 
-- **三面清单**：API（`/run` 的 `searchMode/aiRounds/aiProposalsPerRound/researchNotes`、`/jobs/<id>` 的 `summary.ai`、`/jobs/<id>/proposals`、错误键与 404）；UI（提交页 AI 模式、作业详情 AI 摘要与提案表）；契约（OpenAPI 已由任务 6 更新，前端只消费）。
-- **状态矩阵**：提交页 loading / error（run 失败）/ success；详情页 loading / empty（无提案）/ error（接口失败）/ no-permission（404）/ success。每个状态都要有可见反馈，不允许静默空白。
-- **复用**：Element Plus 现有组件、`App.vue` 的 tab 结构、现有 API client 与 i18n；不引入 shadcn/Tailwind 或新设计体系。
-- **响应式**：1440×900 与 390×844 两个视口都要可用；表格在窄屏可横向滚动，表单不溢出。
-- **a11y**：表单控件有标签、键盘可操作、焦点可见、状态标签语义清晰、对比度沿用 Element Plus 主题；E2E 用 axe 检查无 critical 违规。
-- **i18n**：只加 `zh-CN` 键；不硬编码中文/英文文案。
-- **浏览器证据**：Playwright E2E 覆盖主流程 + 截图 + console 无错误 + 关键 network 请求/响应；纯构建输出不算完成证据。
-- 编码前加载 `frontend-design` skill；不要引入 shadcn/Tailwind（项目是 Vue 3 + Element Plus）。
+**前端门禁（全局 CLAUDE.md + 项目 AGENTS.md）：**
+- **三面清单**：API（`/run` 的 AI 字段、`/jobs/<id>` 的 `summary.ai`、`/jobs/<id>/proposals`、错误键、404/401/403）；UI（提交页 AI 模式、作业详情 AI 摘要 + 提案表）；契约（OpenAPI 由任务 6 更新，主产品只消费）。
+- **五态**：提交页 estimating/submitting、估价空态、参数/网络/provider 错误、成功回执；详情页 modal loading、提案空态、详情/提案接口失败、404/越权、成功。每个状态可见，不能用 toast 代替详情错误块。
+- **复用**：Ant Design Vue 现有组件（`a-form-model`、`a-select`、`a-input-number`、`a-table`、`a-modal`、`a-descriptions`、`a-tag`、`a-alert`）、`qd-workspace-page`/`qd-page-frame`、现有 `--qd-*` token、`src/utils/request.js`；不引入 Element Plus/shadcn/Tailwind。
+- **响应式**：1440×900 与 390×844；详情 modal 在窄屏改为接近全宽（`width` 用 `min(860px, calc(100vw - 32px))` 或等价的响应式写法），提案表横向滚动。
+- **a11y**：`a-form-model-item` 标签、键盘顺序、可见焦点、modal 打开/关闭焦点、状态不只靠颜色（tag 文字）、错误可被读屏感知。
+- **i18n**：只改 `src/locales/factor-mining-overrides.js` 的 `en-US` 与 `zh-CN` 两个块；同步 `factorMiningLocaleContract.test.mjs` 的 `BACKEND_KEYS`/`REJECT_KEYS` 与 UI 键；不新增嵌套对象（override 是 shallow merge）。
+- **浏览器证据**：优先跑治理工具 `tools/frontend-verification/verify.mjs --target main`；若其 mock fixtures 尚不覆盖 AI/proposals，用 Playwright MCP 对同一主产品页面做 mock 流程，并在报告里记录“治理工具未覆盖”的缺口。截图、console、network、axe 分开保存；mock 不能冒充 integration。
+- 编码前加载 `frontend-design` skill；主产品是 Vue 2.7/Ant Design Vue，不套用独立页的 Element Plus 写法。
 
-- [ ] **步骤 1：改 API client**
+- [ ] **步骤 1：API client**
 
-在 `factorMining.js` 增加：
+在 `src/api/factor-mining.js` 增加：
 
 ```js
-getJobProposals(jobId, params = {}) {
-  return api.get(`/factor-mining/jobs/${jobId}/proposals`, { params })
+export function getJobProposals(jobId, params = {}) {
+  return request({
+    url: `/api/factor-mining/jobs/${jobId}/proposals`,
+    method: 'get',
+    params
+  })
 }
 ```
 
-- [ ] **步骤 2：改提交表单**
+- [ ] **步骤 2：提交 payload 纯函数 + 单测**
 
-`SubmitJob.vue`：
-
-- `form` 增加：`searchMode: 'enumeration'`、`aiRounds: 2`、`aiProposalsPerRound: 10`、`researchNotes: ''`。
-- 模板增加模式下拉（`enumeration` / `ai`）；AI 字段只在 `form.searchMode === 'ai'` 时显示：
-  - `el-input-number` for `aiRounds`（1–3）。
-  - `el-input-number` for `aiProposalsPerRound`（1–20）。
-  - `el-input type="textarea"` for `researchNotes`（maxlength 8000, show-word-limit）。
-- 校验：AI 模式下两个数字在范围内；笔记 ≤8000。
-- 提交与估价发送 payload，但非 AI 模式必须删掉 AI 字段（后端对非 AI 模式携带 AI 字段返回 `invalidParameter`）：
+`src/views/factor-mining/aiPayload.js`：
 
 ```js
-const payload = { ...form }
-if (form.searchMode !== 'ai') {
-  delete payload.aiRounds
-  delete payload.aiProposalsPerRound
-  delete payload.researchNotes
-  delete payload.replayJobId
+export function buildRunPayload(form) {
+  const payload = { ...form }
+  if (payload.searchMode !== 'ai') {
+    delete payload.aiRounds
+    delete payload.aiProposalsPerRound
+    delete payload.researchNotes
+    delete payload.replayJobId
+  }
+  return payload
 }
 ```
 
-AI 模式下后端 `/estimate` 返回 AI 上界。
+`tests/unit/factorMiningAiPayload.test.mjs`：枚举模式不含 AI 键；AI 模式保留四个键；不修改输入对象。用 `node --test` 运行。
 
-- [ ] **步骤 3：改作业详情**
+- [ ] **步骤 3：SubmitJob.vue**
 
-`JobDetail.vue`：
+- `form` 增加 `searchMode: 'enumeration'`、`aiRounds: 2`、`aiProposalsPerRound: 10`、`researchNotes: ''`。
+- 主表单增加搜索模式 `a-select`（`enumeration` / `ai`）；AI 字段只在 `searchMode === 'ai'` 时显示：
+  - `a-input-number` 轮次（1–3）。
+  - `a-input-number` 每轮条数（1–20）。
+  - `a-textarea` 研究笔记（maxlength 8000，show-word-limit）。
+- 估价与提交改用 `buildRunPayload(this.form)`；非 AI 模式不带 AI 键。
+- 估价回执：AI 模式显示候选上限（后端 `candidateBudget`）；`templateCount` 为 0 时不显示模板数。
+- 错误：沿用 `$message.error(message(key))`，保留表单；提交/估价按钮 loading 不变。
+- 校验：AI 模式轮次/条数在范围内、笔记 ≤8000；不合法时阻止提交并给可见提示。
 
-- 读取 `const ai = computed(() => job.value?.result?.summary?.ai)`。
-- `ai` 存在时增加「AI 摘要」区块：轮次、提案、L1 拒绝、重复、评估、模型/provider、`replayOf`、`snapshotChanged`。
-- 作业详情加载时调用 `factorMiningApi.getJobProposals(props.jobId)`，展示提案表：`round`、`ordinal`、`hypothesis`、`status`、`reason`；状态用 `el-tag`（proposed/evaluated/l1_rejected/duplicate）。
-- 运行中或尚未创建 run 的作业返回部分/空列表；404、空列表都显示「暂无提案」，不弹错误。
+- [ ] **步骤 4：JobList.vue 详情 modal**
 
-- [ ] **步骤 4：补 i18n**
+- 保留现有基本配置与 `summary` 块；在下方增加 AI 摘要（`detail.result?.summary?.ai` 存在时）：
+  - 轮次、提案、L1 拒绝、重复、评估、model/provider、`replayOf`、`snapshotChanged`。
+- 增加「提案」区块：详情加载后调用 `getJobProposals(detail.jobId)`；`a-table` 列 `round/ordinal/hypothesis/status/reason`，状态用 `a-tag`（proposed/evaluated/l1_rejected/duplicate）。
+- 状态：modal 打开时设置 `detailLoading`；详情失败在 modal 内显示 `a-alert` + 重试按钮（不只 toast）；提案为空显示 `a-empty`；提案接口 404/失败显示区块级提示，不阻塞详情其他内容。
+- 404/越权：沿用 `getJobDetail` 的 `jobNotFound` 提示；不泄露存在性。
+- 窄屏：提案表加 `:scroll="{ x: 720 }"`；modal 宽度响应式。
 
-`src/i18n/zh-CN.js` 增加：
+- [ ] **步骤 5：i18n 与 locale 契约测试**
 
-- `submit.searchMode`、`submit.modeEnumeration`、`submit.modeAi`、`submit.aiRounds`、`submit.aiProposalsPerRound`、`submit.researchNotes`。
-- `jobDetail.aiSummary`、`jobDetail.aiRounds`、`jobDetail.aiProposals`、`jobDetail.aiL1Rejected`、`jobDetail.aiDuplicates`、`jobDetail.aiEvaluated`、`jobDetail.aiModel`、`jobDetail.aiReplayOf`、`jobDetail.aiSnapshotChanged`。
-- `proposals.title`、`proposals.round`、`proposals.ordinal`、`proposals.hypothesis`、`proposals.status`、`proposals.reason`、`proposals.pending`。
-- `errors['factorMining.aiProposalFailed']`、`errors['factorMining.aiNoValidProposals']`、`errors['factorMining.aiReplayNotFound']`、`errors['factorMining.aiReplayIncompatible']`。
+`src/locales/factor-mining-overrides.js` 的 `en-US`/`zh-CN` 增加：
 
-- [ ] **步骤 5：状态矩阵、响应式与 a11y**
+- `factorMining.submit.searchMode`、`modeEnumeration`、`modeAi`、`aiRounds`、`aiProposalsPerRound`、`researchNotes`。
+- `factorMining.ai.summary`、`rounds`、`proposals`、`l1Rejected`、`duplicates`、`evaluated`、`model`、`replayOf`、`snapshotChanged`。
+- `factorMining.proposals.title`、`round`、`ordinal`、`hypothesis`、`status`、`reason`、`empty`、`failed`、`retry`。
+- `factorMining.proposalStatus.proposed/evaluated/l1Rejected/duplicate`。
+- 错误键：`factorMining.aiProposalFailed`、`aiNoValidProposals`、`aiReplayNotFound`、`aiReplayIncompatible`、`factorMining.reject.duplicateProposal`。
 
-- 提交页：AI 模式字段切换、loading 按钮、run 失败时 `el-alert` 显示 `errors[msg]`；枚举模式提交 payload 不含 AI 字段。
-- 详情页：加载中 `v-loading`；提案为空显示 `proposals.pending` 空态；接口失败显示错误与重试；404 按空态处理；成功显示 AI 摘要 + 提案表。
-- 窄屏：提案表加 `overflow-x: auto`；表单栅格在 390px 下单列。
-- 表单控件补 `aria-label`/`label`；状态标签不只靠颜色区分（文字 + tag type）。
+同步 `tests/unit/factorMiningLocaleContract.test.mjs`：
 
-- [ ] **步骤 6：Playwright E2E（mock API）**
+- `BACKEND_KEYS` 增加四个 `ai*` 键；`REJECT_KEYS` 增加 `duplicateProposal`。
+- 新增 UI 键在 en/zh 都有非空值、键集相同、值不等于键。
+- 不新增嵌套对象；只允许 `factorMining.*` 与 `menu.dashboard.factorMining`。
 
-`playwright.config.js`：
+- [ ] **步骤 6：主产品测试与构建**
 
-- `webServer`：`npm run dev -- --port 3000`，`url: http://localhost:3000`，`reuseExistingServer: true`。
-- 单 project：chromium；默认 viewport 1440×900。
-- `testDir: './e2e'`。
-
-`e2e/factor-mining-ai.spec.js` 必须覆盖：
-
-1. `test('submits an AI run with the AI fields')`：mock catalog/estimate/run；选 AI、填 2/10/notes、提交；断言 `POST /run` body 含 `searchMode:"ai"`、`aiRounds:2`、`aiProposalsPerRound:10`、`researchNotes`。
-2. `test('shows the AI summary and proposals')`：mock `GET /jobs/job-1`（`result.summary.ai`）与 `GET /jobs/job-1/proposals`；断言摘要字段与提案行；截图。
-3. `test('shows an error alert when the run fails')`：mock `/run` 500 或 `code:0`；断言可见错误。
-4. `test('renders empty proposals as an empty state')`：mock proposals `{items:[]}`；断言空态文案。
-5. `test('has no critical axe violations')`：对提交页与详情页跑 `@axe-core/playwright`，断言无 critical。
-6. `test('screenshots at 1440x900 and 390x844')`：两视口 `page.screenshot` 到 `frontend-factor-mining/test-results/`；断言无横向溢出（`document.documentElement.scrollWidth <= innerWidth`）。
-7. 全程收集 `page.on('console')`/`page.on('pageerror')`，断言无 error；mock 之外的请求不应出现 4xx/5xx。
-
-安装依赖与脚本：
+在 `frontend-vue`：
 
 ```bash
-cd frontend-factor-mining
-npm i -D @playwright/test @axe-core/playwright
+pnpm run lint:nofix
+pnpm run test:unit
+pnpm run build
 ```
 
-在 `package.json` scripts 增加 `"test:e2e": "playwright test"`。
+预期：全部通过。`typecheck` 主产品当前没有脚本；按 `doc/web_doc/04-test-map.md` 记为 **blocked**，不得用 build 冒充 typecheck。
 
-运行：
+- [ ] **步骤 7：浏览器验收**
+
+优先用治理工具（mock，自动注入虚构登录态）：
 
 ```bash
-cd frontend-factor-mining
-npm ci        # 无 lockfile 时用 npm install
-npx playwright install chromium
-npm run test:e2e
+node tools/frontend-verification/verify.mjs --target main --source G:/project/windows/PycharmProjects/QuantDinger/frontend-vue --source-revision <完整 SHA> --mode mock --output-dir tools/frontend-verification/artifacts/main
 ```
 
-预期：全部 PASS；截图生成；console/network 断言通过。
+- 若工具 mock 已覆盖 `POST /api/factor-mining/run`、`GET /jobs/<id>`、`GET /jobs/<id>/proposals`，用它产出 `browser-report.json`、`console.json`、`network.json`、`axe.json` 与 1440×900/390×844 截图。
+- 若未覆盖，用 Playwright MCP 对同一主产品路由 `/#/factor-mining` 做 mock：填 AI 模式、提交、打开详情、查看 AI 摘要与提案表；保存两视口截图、console、network、axe（若可用），并在报告中标注「治理工具未覆盖 AI 流程」。
+- 必查：五态、无 console error、无非预期 4xx/5xx、无横向溢出、401/403 不泄露、404 不泄露存在性。
+- 不得把 mock 结果报告为 integration/部署完成；integration 需要显式测试后端与隔离账户，本次若不具备则记 blocked。
 
-- [ ] **步骤 7：构建与 lint**
+- [ ] **步骤 8：治理文档（主仓库工作树）**
+
+- 更新 `doc/web_doc/06-factor-mining.md`：FM-01 加入 AI 提交、FM-02 记录 `enumeration/ai`（evolution 仍缺）、FM-03 加入 AI 摘要与提案表、FM-06 加入 AI 错误键；状态矩阵补充 AI 提交/提案空态/失败/404。
+- 更新 `doc/web_doc/03-state-and-api.md`：加入 `GET /jobs/<id>/proposals`、`summary.ai` 字段、AI 请求字段与错误键。
+- 这些文件是当前治理会话的未跟踪工作树产物；只做增量编辑，不覆盖其他模块；若文件在编辑期间被其他会话改动，停止并报告。
+
+- [ ] **步骤 9：独立仓库提交（不推送）**
 
 ```bash
-cd frontend-factor-mining
-npm run build
-npm run lint
+cd G:/project/windows/PycharmProjects/QuantDinger/frontend-vue
+git checkout -b feat/factor-mining-v3-ui
+git add src/views/factor-mining src/api/factor-mining.js src/locales/factor-mining-overrides.js tests/unit/factorMiningLocaleContract.test.mjs tests/unit/factorMiningAiPayload.test.mjs
+git commit -m "feat: 因子挖掘主产品支持 AI 模式与提案列表"
 ```
 
-预期：退出码 0。
+报告：外部仓库 base/head、分支名、命令输出、测试/构建/浏览器证据路径、typecheck/integration blocked 状态、治理文档改动清单。
 
-- [ ] **步骤 8：浏览器人工验收（可用 Playwright MCP 或 agent-browser）**
-
-启动前端 dev server 与后端（或沿用 E2E mock）；打开提交页与详情页，按状态矩阵逐项检查；保存 1440×900 与 390×844 截图；确认 console 无错误、无意外 4xx/5xx。截图路径写进报告。
-
-- [ ] **步骤 9：页面文档**
-
-创建 `docs/web_doc/factor-mining-ai.md`：路由/tab、组件、五态、API 映射（含错误键）、Playwright 测试映射、i18n 键、响应式与 a11y 说明、截图路径。
-
-- [ ] **步骤 10：Commit**
-
-```bash
-git add frontend-factor-mining/src/components/SubmitJob.vue frontend-factor-mining/src/components/JobDetail.vue frontend-factor-mining/src/api/factorMining.js frontend-factor-mining/src/i18n/zh-CN.js frontend-factor-mining/package.json frontend-factor-mining/package-lock.json frontend-factor-mining/playwright.config.js frontend-factor-mining/e2e/factor-mining-ai.spec.js docs/web_doc/factor-mining-ai.md
-git commit -m "feat: 因子挖掘前端支持 AI 模式、提案列表与浏览器验收"
-```
 
 ---
 
@@ -1024,7 +1017,7 @@ git commit -m "feat: 因子挖掘前端支持 AI 模式、提案列表与浏览�
 - 修改：`docs/product/FACTOR_MINING.md:31,609`、`docs/product/FACTOR_MINING_CN.md:21,370`
 - 修改：`docs/superpowers/specs/2026-10-13-factor-mining.md:217`
 - 修改：`docs/api/openapi.yaml`（若任务 6 未提交）
-- 验证：`docs/web_doc/factor-mining-ai.md`（任务 7 创建）
+- 验证：`doc/web_doc/06-factor-mining.md`、`doc/web_doc/03-state-and-api.md`（任务 7 在主仓库工作树更新；属前端治理会话的未跟踪文档）
 
 - [ ] **步骤 1：同步产品文档**
 
@@ -1052,20 +1045,27 @@ cd backend_api_python
 
 预期：全部 PASS。
 
-前端（在 `frontend-factor-mining`）：
+主产品前端（独立仓库 `frontend-vue`，分支 `feat/factor-mining-v3-ui`）：
 
 ```bash
-npm ci
-npm run lint
-npm run build
-npm run test:e2e
+pnpm run lint:nofix
+pnpm run test:unit
+pnpm run build
 ```
 
-预期：全部 PASS；截图生成在 `frontend-factor-mining/test-results/`。
+预期：全部 PASS；`typecheck` 主产品当前无脚本，按 `doc/web_doc/04-test-map.md` 记为 **blocked**。
+
+浏览器（主仓库根，mock 模式）：
+
+```bash
+node tools/frontend-verification/verify.mjs --target main --source G:/project/windows/PycharmProjects/QuantDinger/frontend-vue --source-revision <完整 SHA> --mode mock --output-dir tools/frontend-verification/artifacts/main
+```
+
+预期：`browser-report.json`、`console.json`、`network.json`、`axe.json` 与 1440×900 / 390×844 截图生成；若治理工具未覆盖 AI/proposals，用 Playwright MCP 补测并记录缺口。
 
 - [ ] **步骤 5：UI 证据**
 
-最终报告增加「UI 证据」：提交页/详情页路由（tab）、`npm run test:e2e` 命令、1440×900 与 390×844 截图路径、console 无错误、关键 network 请求/响应、五态覆盖、axe 结果、未覆盖项。纯后端命令输出不算前端完成证据。
+最终报告增加「UI 证据」：主产品路由 `/#/factor-mining`、外部仓库 `frontend-vue` 的分支/commit、`pnpm run lint:nofix`/`test:unit`/`build` 结果、`tools/frontend-verification`（或 Playwright MCP）命令、1440×900 与 390×844 截图路径、console/network/axe 结果、五态覆盖、typecheck blocked、integration/部署未验证、未覆盖项。纯后端命令或 mock 不能冒充 integration/部署。
 
 - [ ] **步骤 6：真实数据验收（手工，需要 provider）**
 
@@ -1092,11 +1092,12 @@ git commit -m "docs: 登记因子挖掘 v3 AI 提案与失败反馈循环"
 3. `replayJobId` 重放不产生任何 LLM 调用；提案与原始 run 的 L1 状态一致。
 4. 另一个租户的 jobId/runId：提案端点 404，重放 400/`aiReplayNotFound`。
 5. 非 AI 模式（enumeration/evolution）的作业结果、候选与台账与升级前一致。
-6. 前端：任务 7 的 Playwright E2E 全绿；提交页/详情页五态、1440×900 与 390×844 两视口、console 无错误、无意外 4xx/5xx、axe 无 critical。
+6. 前端：主产品 `/#/factor-mining` 的 AI 模式与提案表在 1440×900 / 390×844 两视口可用；五态、console 无错误、无意外 4xx/5xx、axe 无 critical；typecheck/integration 若 blocked 如实记录。
 
 ## 未决与已知限制
 
-- 前端本次只提供 `enumeration` / `ai` 两种模式；`evolution` 仍可走 API。前端暂不提供 `replayJobId` 输入，重放走 API（后续可加按钮）。
+- 前端交付目标是主产品 QuantDinger-Vue（`frontend-vue` 独立仓库，单独分支提交、不推送）；独立页 `frontend-factor-mining` 保持原样。主产品只提供 `enumeration` / `ai` 两种模式；`evolution` 仍可走 API；前端暂不提供 `replayJobId` 输入，重放走 API（后续可加按钮）。
+- 主产品当前没有 `typecheck` 脚本，按测试映射记为 **blocked**；integration/部署证据需要隔离测试后端，本次若不具备则保持未验证，mock 不能替代。
 - 模型/provider 由服务端配置，单次运行不能指定；provider 不可用时 AI 作业失败，不回退模板。
 - 不抓外部论文/研报；研究笔记随 `qd_agent_jobs.request` 落库（租户作用域），AI 摘要只存 hash/长度。
 - `qd_factor_mining_runs` 新增 `job_id` 列（新增列，不改既有列），用于 job→run 映射；运行中/失败的作业也能读到已写入的提案。这是规格 §6.1 之外的加法，写入本计划的迁移。
