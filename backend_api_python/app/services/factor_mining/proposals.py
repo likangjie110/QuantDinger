@@ -16,20 +16,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from app.services.factor_mining.dsl import (
+    DSL_VERSION,
     MAX_DEPTH,
     MAX_NODES,
     OPERATOR_SPECS,
     WINDOW_MAX,
     WINDOW_MIN,
+    ExpressionError,
+    normalize_expression,
 )
-from app.services.factor_mining.templates import TEMPLATES, template_catalog
+from app.services.factor_mining.templates import TEMPLATES, CandidateSeed, template_catalog
+
+logger = logging.getLogger(__name__)
 
 # Per-round prompt and summary allowances. A caller may pass more; assembly truncates in the
 # documented order instead of refusing, so a large notes block never costs the constraints.
@@ -526,3 +532,282 @@ class LLMProposer:
             provider=str(getattr(self._service, "last_provider_used", "") or ""),
             fallback_used=bool(getattr(self._service, "model_fallback_used", False)),
         )
+
+
+_DUPLICATE_REASON = "factorMining.reject.duplicateProposal"
+_ROUND_ATTEMPTS = 2
+
+
+class ProposalSource:
+    """The candidate stream of one AI run: rounds in, evaluated seeds out.
+
+    The source owns everything the model call does not: it builds each round's prompts from the
+    previous round's feedback, retries a broken answer once, validates every expression at L1,
+    deduplicates by fingerprint, and closes the round once its seeds have been evaluated. Closing
+    reads the engine's in-memory outcomes rather than the trial table -- trials are written only
+    after the search returns -- and flips the rows to ``evaluated`` before
+    :func:`build_feedback` aggregates them, so a rejection reaches the next prompt in the same run.
+
+    Replay is the same stream without a model: recorded proposals are re-validated against the
+    current DSL, written as a new run's rows, and yielded in ``(round, ordinal)`` order. The
+    proposer is never called on this path, even when the recorded run left no proposals.
+    """
+
+    def __init__(
+        self,
+        *,
+        context: ProposalContext,
+        repository: Any,
+        proposer: Callable[[str, str], ProposalBatch],
+        outcome: Callable[[str], Mapping[str, Any] | None],
+    ) -> None:
+        self._context = context
+        self._repository = repository
+        self._proposer = proposer
+        self._outcome = outcome
+        self._seen: set[str] = set()
+        self._last_feedback: dict[str, Any] | None = None
+        self._rounds = 0
+        self._proposals = 0
+        self._l1_rejected = 0
+        self._duplicates = 0
+        self._evaluated = 0
+        self._model = ""
+        self._provider = ""
+        self._fallback_used = False
+        self._prompt_hashes: list[str] = []
+
+    def __iter__(self) -> Iterator[CandidateSeed]:
+        # ``replay_of`` names the run being replayed even when it recorded no proposals; that
+        # path must still stay offline rather than fall back to a live model call.
+        if self._context.replay or self._context.replay_of:
+            yield from self._iter_replay()
+        else:
+            yield from self._iter_rounds()
+
+    def ai_summary(self) -> dict[str, Any]:
+        """What this run's proposal rounds did, for the job result.
+
+        Counts are this run's own rows. ``rounds`` is how many rounds actually ran (a round with
+        no valid proposal ends the stream early); model identity is the last answering batch, so
+        a replay -- which calls no model -- reports empty strings. The notes are hashed, never
+        copied into the summary.
+        """
+        notes = str(self._context.research_notes or "")
+        return {
+            "enabled": True,
+            "rounds": self._rounds,
+            "proposals": self._proposals,
+            "l1Rejected": self._l1_rejected,
+            "duplicates": self._duplicates,
+            "evaluated": self._evaluated,
+            "model": self._model,
+            "provider": self._provider,
+            "modelFallbackUsed": self._fallback_used,
+            "promptHashes": list(self._prompt_hashes),
+            "researchNotesSha256": (
+                hashlib.sha256(notes.encode("utf-8")).hexdigest() if notes else ""
+            ),
+            "researchNotesLength": len(notes),
+            "replayOf": self._context.replay_of,
+            "snapshotChanged": False,
+        }
+
+    def _iter_rounds(self) -> Iterator[CandidateSeed]:
+        yielded = False
+        for round_no in range(1, max(0, int(self._context.rounds)) + 1):
+            self._rounds += 1
+            batch, parsed, prompt_hash = self._generate_round(round_no)
+            self._model = str(batch.model or "")
+            self._provider = str(batch.provider or "")
+            self._fallback_used = bool(batch.fallback_used)
+            self._prompt_hashes.append(prompt_hash)
+            rows, seeds = self._record(round_no, parsed, batch, prompt_hash)
+            for seed in seeds:
+                yielded = True
+                yield seed
+            if not seeds:
+                # Nothing legal to evaluate: further rounds would only spend model calls.
+                break
+            self._last_feedback = self._close_round(round_no, rows)
+        if not yielded:
+            raise ProposalGenerationError("factorMining.aiNoValidProposals")
+
+    def _iter_replay(self) -> Iterator[CandidateSeed]:
+        entries = sorted(
+            self._context.replay,
+            key=lambda entry: (int(entry.get("round") or 0), int(entry.get("ordinal") or 0)),
+        )
+        rows: list[dict[str, Any]] = []
+        seeds: list[CandidateSeed] = []
+        rounds: list[int] = []
+        for entry in entries:
+            round_no = int(entry.get("round") or 0)
+            if not rounds or rounds[-1] != round_no:
+                rounds.append(round_no)
+            row = {
+                "round": round_no,
+                "ordinal": int(entry.get("ordinal") or 0),
+                "expression": entry.get("expression") or {},
+                "fingerprint": "",
+                "hypothesis": str(entry.get("hypothesis") or ""),
+                "model": str(entry.get("model") or ""),
+                "provider": str(entry.get("provider") or ""),
+                "promptHash": str(entry.get("promptHash") or ""),
+                "dslVersion": DSL_VERSION,
+                "source": "replay",
+                "status": "proposed",
+                "reason": "",
+            }
+            self._classify(row, seeds)
+            rows.append(row)
+        self._rounds = len(rounds)
+        self._count_rows(rows)
+        if rows:
+            self._repository.save_proposals(
+                self._context.run_id, user_id=self._context.user_id, proposals=rows)
+        logger.info(
+            "factor mining ai replay run_id=%s replay_of=%s proposal_count=%s "
+            "l1_rejected=%s duplicates=%s",
+            self._context.run_id, self._context.replay_of, len(rows),
+            self._l1_rejected, self._duplicates,
+        )
+        for seed in seeds:
+            yield seed
+        for round_no in rounds:
+            self._close_round(round_no, [row for row in rows if row["round"] == round_no])
+        if not seeds and not self._context.replay:
+            raise ProposalGenerationError("factorMining.aiNoValidProposals")
+
+    def _generate_round(
+        self, round_no: int
+    ) -> tuple[ProposalBatch, list[dict[str, Any]], str]:
+        """One round's batch, parsed proposals, and prompt hash; at most two model calls."""
+        system, user = build_prompts(
+            self._context, round_no=round_no, last_feedback=self._last_feedback)
+        prompt_hash = proposal_prompt_hash(system, user)
+        failure: Exception | None = None
+        for _ in range(_ROUND_ATTEMPTS):
+            try:
+                batch = self._proposer(system, user)
+                parsed = parse_proposals(
+                    batch.text, limit=self._context.proposals_per_round)
+            except (ProposalGenerationError, ProposalFormatError) as exc:
+                failure = exc
+                continue
+            return batch, parsed, prompt_hash
+        raise ProposalGenerationError("factorMining.aiProposalFailed") from failure
+
+    def _record(
+        self,
+        round_no: int,
+        parsed: Sequence[Mapping[str, Any]],
+        batch: ProposalBatch,
+        prompt_hash: str,
+    ) -> tuple[list[dict[str, Any]], list[CandidateSeed]]:
+        """Validate a round's answer, persist one row per proposal, and log the round."""
+        rows: list[dict[str, Any]] = []
+        seeds: list[CandidateSeed] = []
+        for ordinal, proposal in enumerate(parsed, start=1):
+            row = {
+                "round": int(round_no),
+                "ordinal": ordinal,
+                "expression": proposal.get("expression") or {},
+                "fingerprint": "",
+                "hypothesis": str(proposal.get("hypothesis") or ""),
+                "model": str(batch.model or ""),
+                "provider": str(batch.provider or ""),
+                "promptHash": prompt_hash,
+                "dslVersion": DSL_VERSION,
+                "source": "llm",
+                "status": "proposed",
+                "reason": "",
+            }
+            self._classify(row, seeds)
+            rows.append(row)
+        self._count_rows(rows)
+        if rows:
+            self._repository.save_proposals(
+                self._context.run_id, user_id=self._context.user_id, proposals=rows)
+        logger.info(
+            "factor mining ai round run_id=%s round=%s proposal_count=%s "
+            "l1_rejected=%s duplicates=%s model=%s provider=%s prompt_hash=%s",
+            self._context.run_id, round_no, len(rows),
+            sum(1 for row in rows if row["status"] == "l1_rejected"),
+            sum(1 for row in rows if row["status"] == "duplicate"),
+            batch.model, batch.provider, prompt_hash,
+        )
+        return rows, seeds
+
+    def _classify(
+        self, row: dict[str, Any], seeds: list[CandidateSeed]
+    ) -> None:
+        """Set ``row``'s final status from the DSL, and append a seed when it is legal."""
+        try:
+            normalized = normalize_expression(
+                row["expression"], allowed_fields=self._context.fields)
+        except ExpressionError as exc:
+            row["status"] = "l1_rejected"
+            row["reason"] = exc.code
+            return
+        row["fingerprint"] = normalized.fingerprint
+        if normalized.fingerprint in self._seen:
+            row["status"] = "duplicate"
+            row["reason"] = _DUPLICATE_REASON
+            return
+        self._seen.add(normalized.fingerprint)
+        row["status"] = "proposed"
+        if row["source"] != "replay":
+            # Normal spellings of one expression must persist as one canonical row; replay is an
+            # audit copy and keeps the recorded expression verbatim.
+            row["expression"] = normalized.node
+        seeds.append(CandidateSeed(
+            expression=normalized.node,
+            fingerprint=normalized.fingerprint,
+            template_id="",
+            origin="ai",
+            params={},
+        ))
+
+    def _count_rows(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        self._proposals += len(rows)
+        self._l1_rejected += sum(1 for row in rows if row["status"] == "l1_rejected")
+        self._duplicates += sum(1 for row in rows if row["status"] == "duplicate")
+
+    def _close_round(
+        self, round_no: int, rows: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Fold the engine's in-memory outcomes into ``rows``, then compute the round's feedback.
+
+        Runs after the round's seeds have been yielded and evaluated. A row whose fingerprint has
+        an outcome becomes ``evaluated`` -- in memory before the aggregation, so
+        :func:`build_feedback` counts its stage and failure, and in the ledger afterwards.
+        """
+        outcomes: dict[str, Mapping[str, Any]] = {}
+        evaluated: list[int] = []
+        for row in rows:
+            if row["status"] != "proposed":
+                continue
+            fingerprint = str(row["fingerprint"])
+            outcome = self._outcome(fingerprint)
+            if not isinstance(outcome, Mapping):
+                continue
+            outcomes[fingerprint] = outcome
+            row["status"] = "evaluated"
+            evaluated.append(int(row["ordinal"]))
+            self._evaluated += 1
+        feedback = build_feedback(
+            round_no=round_no,
+            proposals=rows,
+            outcomes=outcomes,
+            thresholds=self._context.thresholds,
+        )
+        if evaluated:
+            self._repository.update_proposal_status(
+                self._context.run_id,
+                user_id=self._context.user_id,
+                round_no=round_no,
+                ordinals=evaluated,
+                status="evaluated",
+            )
+        return feedback
