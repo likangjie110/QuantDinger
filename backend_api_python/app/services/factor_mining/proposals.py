@@ -380,6 +380,10 @@ def build_feedback(
 ) -> dict[str, Any]:
     """One round's structured result: gate counts, duplicates, failures, and near misses.
 
+    ``proposals`` is every row of the round, and each row counts by its own status: an L1
+    rejection comes from the row, an evaluated row from its outcome, a duplicate only from
+    ``duplicates``, a still-proposed row never. A duplicate shares the fingerprint of an
+    evaluated row, so gating by status is what keeps one evaluation from counting twice.
     ``outcomes`` is the engine's in-memory verdict per fingerprint; trials are not in the
     database yet when this runs. Stage counts sort by ``(stage, verdict, reason)``, failures by
     ``(stage, reason, expressionHash)``, near misses by relative distance to the bars, so the
@@ -392,37 +396,44 @@ def build_feedback(
     for row in proposals:
         status = str(row.get("status") or "")
         if status == "duplicate":
+            # A duplicate shares the fingerprint of an evaluated row; counting its outcome
+            # again would double the same evaluation, and it never reached a gate itself.
             duplicates += 1
+            continue
+        if status == "l1_rejected":
+            key = ("L1", "reject", str(row.get("reason") or ""))
+            counts[key] = counts.get(key, 0) + 1
+            continue
+        if status != "evaluated":
+            continue
         fingerprint = str(row.get("fingerprint") or row.get("expressionHash") or "")
         outcome = outcomes.get(fingerprint) if fingerprint else None
-        if isinstance(outcome, Mapping):
-            stage = str(outcome.get("stage") or "")
-            verdict = str(outcome.get("verdict") or "")
-            reason = str(outcome.get("reason") or "")
-            key = (stage, verdict, reason)
-            counts[key] = counts.get(key, 0) + 1
-            if status == "evaluated" and verdict == "reject":
-                expression = row.get("expression") or {}
-                failures.append({
+        if not isinstance(outcome, Mapping):
+            continue
+        stage = str(outcome.get("stage") or "")
+        verdict = str(outcome.get("verdict") or "")
+        reason = str(outcome.get("reason") or "")
+        key = (stage, verdict, reason)
+        counts[key] = counts.get(key, 0) + 1
+        if verdict == "reject":
+            expression = row.get("expression") or {}
+            failures.append({
+                "expressionHash": fingerprint,
+                "stage": stage,
+                "reason": reason,
+                "expression": expression,
+            })
+            metrics = outcome.get("metrics")
+            score = _near_miss_score(metrics, thresholds) if isinstance(metrics, Mapping) else None
+            if score is not None:
+                near_misses.append((score, {
                     "expressionHash": fingerprint,
                     "stage": stage,
                     "reason": reason,
                     "expression": expression,
-                })
-                metrics = outcome.get("metrics")
-                score = _near_miss_score(metrics, thresholds) if isinstance(metrics, Mapping) else None
-                if score is not None:
-                    near_misses.append((score, {
-                        "expressionHash": fingerprint,
-                        "stage": stage,
-                        "reason": reason,
-                        "expression": expression,
-                        "metrics": _reported_metrics(metrics),
-                        "score": score,
-                    }))
-        elif status == "l1_rejected":
-            key = ("L1", "reject", str(row.get("reason") or ""))
-            counts[key] = counts.get(key, 0) + 1
+                    "metrics": _reported_metrics(metrics),
+                    "score": score,
+                }))
 
     failures.sort(key=lambda item: (item["stage"], item["reason"], item["expressionHash"]))
     near_misses.sort(key=lambda item: (

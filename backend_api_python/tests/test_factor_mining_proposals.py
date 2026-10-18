@@ -118,6 +118,31 @@ def test_l1_rejections_are_counted_and_failures_are_sorted_deterministically():
     assert [item["expressionHash"] for item in feedback["failures"]] == ["d" * 64, "c" * 64]
 
 
+def test_duplicate_rows_do_not_double_count_a_shared_outcome():
+    rows = [
+        {"ordinal": 1, "expression": {"op": "close"}, "fingerprint": "a" * 64,
+         "status": "evaluated", "reason": ""},
+        {"ordinal": 2, "expression": {"op": "close"}, "fingerprint": "a" * 64,
+         "status": "duplicate", "reason": "factorMining.reject.duplicateProposal"},
+        {"ordinal": 3, "expression": {"op": "bad"}, "fingerprint": "",
+         "status": "l1_rejected", "reason": "factorMining.reject.invalid:unknownOperator"},
+    ]
+    outcomes = {"a" * 64: {"stage": "L2", "verdict": "reject",
+                          "reason": "factorMining.reject.lowCoverage",
+                          "metrics": {"rankIc": 0.01, "icir": 0.1}}}
+    feedback = proposals.build_feedback(
+        round_no=1, proposals=rows, outcomes=outcomes,
+        thresholds={"min_abs_rank_ic": 0.02, "min_icir": 0.30})
+    assert feedback["stageCounts"] == [
+        {"stage": "L1", "verdict": "reject",
+         "reason": "factorMining.reject.invalid:unknownOperator", "count": 1},
+        {"stage": "L2", "verdict": "reject",
+         "reason": "factorMining.reject.lowCoverage", "count": 1},
+    ]
+    assert feedback["duplicates"] == 1
+    assert len(feedback["failures"]) == 1
+
+
 def test_near_misses_skip_missing_or_zero_thresholds():
     rows = [{"ordinal": 1, "expression": {}, "fingerprint": "a" * 64, "status": "evaluated", "reason": ""}]
     outcomes = {"a" * 64: {"stage": "L2", "verdict": "reject",
