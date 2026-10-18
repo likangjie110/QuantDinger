@@ -641,6 +641,7 @@ class ProposalSource:
   - 否则 → `status="proposed"`，加入 `seen`；yield 的 `CandidateSeed` 使用 `normalize_expression` 返回的 canonical expression 与 fingerprint。
 - 每条都写 `save_proposals`（`source="llm"`，`model/provider/promptHash/dslVersion`）；只 yield `status=="proposed"` 的 `CandidateSeed(origin="ai", template_id="")`。
 - `yield from` 后计算本轮反馈：对每个 yield 的指纹调用 `outcome(fp)`；**先在内存里把有 outcome 的 `proposed` 行置为 `evaluated`**（`l1_rejected`/`duplicate` 保持原状态），把**全部 `round_rows`** 传给 `build_feedback(round_no, proposals=round_rows, outcomes=..., thresholds=self._context.thresholds)`——由 `build_feedback` 按状态聚合：L1 拒绝计 L1、evaluated 计 outcome、duplicate 单独计数、proposed 跳过；随后把置为 evaluated 的 ordinals `update_proposal_status(..., status="evaluated")` 持久化；保存 `self._last_feedback` 供下一轮 `build_prompts`。
+- **源暴露幂等 `finish()`**：关闭当前未关闭的轮（同一套状态翻转 + `build_feedback` + `update_proposal_status`）。cap 截断后引擎不再 pull 内层生成器，必须由引擎显式调用 `finish()`，否则最后一轮的 evaluated 少计、已评估行停在 `proposed`。
 - 单轮零合法提案 → break；全部轮次零合法提案且 `context.replay` 为空 → 抛 `aiNoValidProposals`。
 - 重放：遍历 `context.replay`，按 `(round, ordinal)`；重新 `normalize_expression`，状态按当前 DSL 重算；写新行 `source="replay"`，保留原 `model/provider/promptHash/hypothesis/expression`；不调用 proposer；只 yield `proposed`。
 - `ai_summary()`：`enabled, rounds, proposals, l1Rejected, duplicates, evaluated, model, provider, modelFallbackUsed, promptHashes, researchNotesSha256, researchNotesLength, replayOf, snapshotChanged(False)`；计数来自本次记录；模型取最后一次 batch；笔记 hash 为空串时存 `""`。
@@ -736,9 +737,9 @@ class AISearchOptions:
   - `outcomes: dict[str, dict] = {}`；`outcome(fp)` 返回 `outcomes.get(fp)`。**只有 AI 模式保留 outcomes**，且 metrics 只留反馈实际读取的 `rankIc`/`icir`（完整 metrics 单条可达 0.78 MB，非 AI 模式保留会随 budget 线性膨胀）。
   - `_candidate_source(config, fitness, user_id=..., search_mode=..., ai=ai, outcome=outcome)`。
   - 每次 `_evaluate` 后且 `ai is not None`：`outcomes[seed.fingerprint] = {"stage": verdict.stage, "verdict": "pass" if verdict.passed else "reject", "reason": verdict.reason, "metrics": {"rankIc": metrics.get("rankIc"), "icir": metrics.get("icir")}}`。
-  - 循环后：`summary = self._summary(...)`；AI 模式 `summary["ai"] = source.ai_summary()`。
+  - 循环后：AI 模式先 `source.finish()`（关闭 cap 截断后仍未关闭的最后一轮），再 `summary["ai"] = source.ai_summary()`；非 AI 不调用。
 - `_candidate_source(..., *, user_id, ai=None, outcome=None)`：
-  - AI 模式：`cap = min(config.ai_rounds * config.ai_proposals_per_round, config.budget)`；`history = ai.repository.failure_summary(...)`；构造 `ProposalContext(budget=cap, ...)`；返回 `itertools.islice(ProposalSource(...), cap), cap`——即使源产出更多，评估数也不超过 run 的候选预算。
+  - AI 模式：`cap = min(config.ai_rounds * config.ai_proposals_per_round, config.budget)`；`history = ai.repository.failure_summary(...)`；构造 `ProposalContext(budget=cap, ...)`；返回 `_CappedSource(ProposalSource(...), cap), cap`——迭代走 `itertools.islice(inner, cap)`，并转发 `finish()` 与 `ai_summary()`；即使源产出更多，评估数也不超过 run 的候选预算。
   - 枚举/进化路径不变。
 - `_warmup_bars`：`search_mode in (SEARCH_MODE_EVOLUTION, SEARCH_MODE_AI)` → `MAX_LOOKBACK`。
 - `review_frozen` 已接受任意 `_SEARCH_MODES`；`prepare_freeze` 的 warmup 走 `_warmup_bars`，无需额外改动。
