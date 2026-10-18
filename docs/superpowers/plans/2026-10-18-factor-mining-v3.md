@@ -733,12 +733,12 @@ class AISearchOptions:
 - `_replay_job_id`：非空且非 AI 模式 → `invalidParameter`。
 - `run(..., ai: AISearchOptions | None = None)`：
   - AI 模式且 `ai is None` → `invalidParameter`；非 AI 模式且 `ai is not None` → `invalidParameter`。
-  - `outcomes: dict[str, dict] = {}`；`outcome(fp)` 返回 `outcomes.get(fp)`。
-  - `_candidate_source(config, search_mode, fitness, ai=ai, outcome=outcome)`。
-  - 每次 `_evaluate` 后：`outcomes[seed.fingerprint] = {"stage": verdict.stage, "verdict": "pass" if verdict.passed else "reject", "reason": verdict.reason, "metrics": metrics}`。
+  - `outcomes: dict[str, dict] = {}`；`outcome(fp)` 返回 `outcomes.get(fp)`。**只有 AI 模式保留 outcomes**，且 metrics 只留反馈实际读取的 `rankIc`/`icir`（完整 metrics 单条可达 0.78 MB，非 AI 模式保留会随 budget 线性膨胀）。
+  - `_candidate_source(config, fitness, user_id=..., search_mode=..., ai=ai, outcome=outcome)`。
+  - 每次 `_evaluate` 后且 `ai is not None`：`outcomes[seed.fingerprint] = {"stage": verdict.stage, "verdict": "pass" if verdict.passed else "reject", "reason": verdict.reason, "metrics": {"rankIc": metrics.get("rankIc"), "icir": metrics.get("icir")}}`。
   - 循环后：`summary = self._summary(...)`；AI 模式 `summary["ai"] = source.ai_summary()`。
-- `_candidate_source(..., *, ai=None, outcome=None)`：
-  - AI 模式：`history = ai.repository.failure_summary(user_id=user_id, market=config.market, timeframe=config.timeframe, exclude_run_id=ai.run_id)`。注意 `_candidate_source` 当前没有 `user_id`；把 `user_id` 传给 `_candidate_source`（新增关键字参数）。构造 `ProposalContext(fields=fields_for(config.market), thresholds=asdict(config.thresholds), history=history, replay=ai.replay_proposals, replay_of=config.replay_job_id, ...)`；返回 `ProposalSource(...), config.ai_rounds * config.ai_proposals_per_round`。
+- `_candidate_source(..., *, user_id, ai=None, outcome=None)`：
+  - AI 模式：`cap = min(config.ai_rounds * config.ai_proposals_per_round, config.budget)`；`history = ai.repository.failure_summary(...)`；构造 `ProposalContext(budget=cap, ...)`；返回 `itertools.islice(ProposalSource(...), cap), cap`——即使源产出更多，评估数也不超过 run 的候选预算。
   - 枚举/进化路径不变。
 - `_warmup_bars`：`search_mode in (SEARCH_MODE_EVOLUTION, SEARCH_MODE_AI)` → `MAX_LOOKBACK`。
 - `review_frozen` 已接受任意 `_SEARCH_MODES`；`prepare_freeze` 的 warmup 走 `_warmup_bars`，无需额外改动。
