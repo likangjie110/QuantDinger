@@ -883,14 +883,15 @@ class FactorMiningEngine:
                 return None
             return measured.get(fingerprint)
 
-        outcomes: dict[str, dict] = {}
+        ai_outcomes: dict[str, dict] = {}
 
-        def outcome(fingerprint: str) -> dict | None:
+        def ai_outcome(fingerprint: str) -> dict | None:
             """What this run measured for ``fingerprint``, for a source closing its round."""
-            return outcomes.get(fingerprint)
+            return ai_outcomes.get(fingerprint)
 
         source, total = _candidate_source(
-            config, search_mode, fitness, user_id=user_id, ai=ai, outcome=outcome,
+            config, search_mode, fitness, user_id=user_id, ai=ai,
+            outcome=ai_outcome if ai is not None else None,
         )
         trials: list[dict[str, Any]] = []
         candidates: list[dict[str, Any]] = []
@@ -898,14 +899,17 @@ class FactorMiningEngine:
             verdict, metrics = self._evaluate(
                 seed.expression, evaluator, config, split, panel, members, comparison,
             )
-            # Written before the loop pulls again: resuming the AI source closes its round and
-            # reads these, and the next round's prompt is built from them.
-            outcomes[seed.fingerprint] = {
-                "stage": verdict.stage,
-                "verdict": "pass" if verdict.passed else "reject",
-                "reason": verdict.reason,
-                "metrics": metrics,
-            }
+            if ai is not None:
+                # Written before the loop pulls again: resuming the AI source closes its round
+                # and reads these, and the next round's prompt is built from them. Only the two
+                # metrics the feedback reads are kept -- the full payload is up to 0.78 MB per
+                # candidate and this dict lives for the whole run.
+                ai_outcomes[seed.fingerprint] = {
+                    "stage": verdict.stage,
+                    "verdict": "pass" if verdict.passed else "reject",
+                    "reason": verdict.reason,
+                    "metrics": {"rankIc": metrics.get("rankIc"), "icir": metrics.get("icir")},
+                }
             value = metrics.get(FITNESS_METRIC)
             if isinstance(value, float) and math.isfinite(value):
                 measured[seed.fingerprint] = value
@@ -1637,6 +1641,25 @@ def _portfolio_manifest(code: str) -> StrategyManifest:
     return manifest
 
 
+class _CappedSource:
+    """An AI proposal stream cut at the run's budget, with its summary still reachable.
+
+    ``itertools.islice`` stops pulling at the cap -- which matters, because resuming the source
+    can spend a model call on the next round -- but it drops the ``ai_summary`` the run record
+    needs afterwards. This keeps both: the slice is the stream, the wrapped source is the summary.
+    """
+
+    def __init__(self, source: Any, limit: int) -> None:
+        self._source = source
+        self._seeds = itertools.islice(source, limit)
+
+    def __iter__(self):
+        return self._seeds
+
+    def ai_summary(self) -> dict[str, Any]:
+        return self._source.ai_summary()
+
+
 def _candidate_source(
     config: MiningConfig,
     search_mode: str,
@@ -1659,15 +1682,17 @@ def _candidate_source(
     stored run reports are the ones the search actually used.
 
     AI is neither: the source is the proposal stream, whose history is this tenant's prior
-    failures in the same market and timeframe (this run excluded), and whose length is the rounds
-    times the proposals per round. ``outcome`` is how a closed round reads this run's own
-    verdicts -- the trials are written only after the search returns, so the source cannot read
-    them from the store.
+    failures in the same market and timeframe (this run excluded), and whose length is the
+    smaller of the rounds times the proposals per round and the run's budget. ``outcome`` is
+    how a closed round reads this run's own verdicts -- the trials are written only after the
+    search returns, so the source cannot read them from the store.
     """
     if search_mode == SEARCH_MODE_AI:
         if ai is None:
             raise ValueError("factorMining.invalidParameter")
-        budget = config.ai_rounds * config.ai_proposals_per_round
+        # The run's candidate budget caps what the proposal rounds may evaluate: the rounds and
+        # proposals bound the source, the budget bounds the run.
+        budget = min(config.ai_rounds * config.ai_proposals_per_round, config.budget)
         context = ProposalContext(
             user_id=user_id,
             run_id=ai.run_id,
@@ -1691,11 +1716,14 @@ def _candidate_source(
             replay_of=config.replay_job_id,
         )
         return (
-            ProposalSource(
-                context=context,
-                repository=ai.repository,
-                proposer=ai.proposer,
-                outcome=outcome or (lambda fingerprint: None),
+            _CappedSource(
+                ProposalSource(
+                    context=context,
+                    repository=ai.repository,
+                    proposer=ai.proposer,
+                    outcome=outcome or (lambda fingerprint: None),
+                ),
+                budget,
             ),
             budget,
         )

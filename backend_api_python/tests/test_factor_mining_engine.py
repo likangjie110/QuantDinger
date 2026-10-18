@@ -1780,7 +1780,8 @@ def test_a_seeds_outcome_is_complete_before_the_source_resumes(_engine_fixture, 
 
 def test_the_ai_candidate_source_reads_scoped_history_and_returns_a_proposal_stream():
     """The history is the tenant's own, this run excluded, and the total is the AI budget."""
-    config = _config(search_mode=SEARCH_MODE_AI, ai_rounds=3, ai_proposals_per_round=5)
+    config = _config(search_mode=SEARCH_MODE_AI, ai_rounds=3, ai_proposals_per_round=5,
+                     budget=20)
     repo = _FakeRepo()
     source, total = engine_module._candidate_source(
         config, SEARCH_MODE_AI, lambda expression: None,
@@ -1827,3 +1828,94 @@ def test_ai_settings_default_and_bounds():
 def test_replay_is_refused_outside_ai_mode():
     with pytest.raises(ValueError, match="factorMining.invalidParameter"):
         _config_from(_payload(replayJobId="job-1"))
+
+
+def test_ai_outcomes_keep_only_the_feedback_metrics(_engine_fixture, monkeypatch):
+    """The per-round outcome lives for the whole run, so it keeps only what feedback reads."""
+    engine, config = _engine_fixture
+    seed = CandidateSeed(expression=_MOMENTUM_5, fingerprint="a" * 64, template_id="",
+                         origin="ai", params={})
+    captured: dict = {}
+
+    class _Source:
+        def __iter__(self):
+            yield seed
+
+        def ai_summary(self):
+            return {"enabled": True}
+
+    def fake_source(*args, **kwargs):
+        captured.update(kwargs)
+        return _Source(), 1
+
+    monkeypatch.setattr(engine_module, "_candidate_source", fake_source)
+    result = engine.run(user_id=4, code="code", config=config, search_mode=SEARCH_MODE_AI,
+                        ai=_ai_options())
+
+    outcome = captured["outcome"](seed.fingerprint)
+    assert set(outcome) == {"stage", "verdict", "reason", "metrics"}
+    assert set(outcome["metrics"]) == {"rankIc", "icir"}
+    assert outcome["metrics"]["rankIc"] == result["trials"][0]["metrics"]["rankIc"]
+    assert outcome["metrics"]["icir"] == result["trials"][0]["metrics"]["icir"]
+
+
+def test_non_ai_runs_do_not_retain_outcomes(_engine_fixture, monkeypatch):
+    """Enumeration and evolution must not hold a per-candidate copy of the full metrics."""
+    engine, config = _engine_fixture
+    captured: dict = {}
+
+    def fake_source(*args, **kwargs):
+        captured.update(kwargs)
+        return iter(()), 0
+
+    monkeypatch.setattr(engine_module, "_candidate_source", fake_source)
+    engine.run(user_id=4, code="code", config=config)
+    assert captured["outcome"] is None
+
+
+def test_ai_evaluation_is_capped_by_the_run_budget(monkeypatch):
+    """The rounds bound the source; the run's candidate budget bounds what is evaluated."""
+    entries = tuple(
+        {"round": 1, "ordinal": ordinal,
+         "expression": {"op": "ts_pct_change", "args": ["close"], "params": {"n": window}}}
+        for ordinal, window in enumerate((2, 3, 4, 5, 6), start=1)
+    )
+    seen: list[dict] = []
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()),
+                                on_progress=seen.append)
+    monkeypatch.setattr(engine_module, "PROGRESS_EVERY", 1)
+    result = engine.run(
+        user_id=4, code="code",
+        config=_config(budget=2, ai_rounds=2, ai_proposals_per_round=5),
+        search_mode=SEARCH_MODE_AI,
+        ai=_ai_options(replay_proposals=entries),
+    )
+    assert len(result["trials"]) == 2
+    assert [event["evaluated"] for event in seen] == [1, 2]
+    assert {event["total"] for event in seen} == {2}
+
+
+def test_ai_context_budget_is_the_effective_cap(monkeypatch):
+    """The prompt reports the budget the run will actually evaluate, not the raw product."""
+    captured: dict = {}
+
+    class _Source:
+        def __iter__(self):
+            return iter(())
+
+        def ai_summary(self):
+            return {"enabled": True}
+
+    def fake_source(**kwargs):
+        captured.update(kwargs)
+        return _Source()
+
+    monkeypatch.setattr(engine_module, "ProposalSource", fake_source)
+    source, total = engine_module._candidate_source(
+        _config(budget=2, ai_rounds=2, ai_proposals_per_round=5), SEARCH_MODE_AI,
+        lambda expression: None, user_id=4, ai=_ai_options(),
+        outcome=lambda fingerprint: None,
+    )
+    assert captured["context"].budget == 2
+    assert total == 2
+    assert list(source) == []
