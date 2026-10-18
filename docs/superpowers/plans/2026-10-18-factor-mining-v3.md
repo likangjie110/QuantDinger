@@ -640,7 +640,7 @@ class ProposalSource:
   - 指纹已在本次 run 出现 → `status="duplicate"`, `reason="factorMining.reject.duplicateProposal"`。
   - 否则 → `status="proposed"`，加入 `seen`；yield 的 `CandidateSeed` 使用 `normalize_expression` 返回的 canonical expression 与 fingerprint。
 - 每条都写 `save_proposals`（`source="llm"`，`model/provider/promptHash/dslVersion`）；只 yield `status=="proposed"` 的 `CandidateSeed(origin="ai", template_id="")`。
-- `yield from` 后计算本轮反馈：对每个 yield 的指纹调用 `outcome(fp)`；`build_feedback(round_no, proposals=round_rows, outcomes=..., thresholds=self._context.thresholds)`；只把**有 outcome** 的 `proposed` 行 `update_proposal_status(..., status="evaluated")`；保存 `self._last_feedback` 供下一轮 `build_prompts`。
+- `yield from` 后计算本轮反馈：对每个 yield 的指纹调用 `outcome(fp)`；**先在内存里把有 outcome 的 `proposed` 行置为 `evaluated`**，再用这些行 `build_feedback(round_no, proposals=round_rows, outcomes=..., thresholds=self._context.thresholds)`（`build_feedback` 只统计 evaluated 行）；随后把同样的 ordinals `update_proposal_status(..., status="evaluated")` 持久化；保存 `self._last_feedback` 供下一轮 `build_prompts`。
 - 单轮零合法提案 → break；全部轮次零合法提案且 `context.replay` 为空 → 抛 `aiNoValidProposals`。
 - 重放：遍历 `context.replay`，按 `(round, ordinal)`；重新 `normalize_expression`，状态按当前 DSL 重算；写新行 `source="replay"`，保留原 `model/provider/promptHash/hypothesis/expression`；不调用 proposer；只 yield `proposed`。
 - `ai_summary()`：`enabled, rounds, proposals, l1Rejected, duplicates, evaluated, model, provider, modelFallbackUsed, promptHashes, researchNotesSha256, researchNotesLength, replayOf, snapshotChanged(False)`；计数来自本次记录；模型取最后一次 batch；笔记 hash 为空串时存 `""`。
