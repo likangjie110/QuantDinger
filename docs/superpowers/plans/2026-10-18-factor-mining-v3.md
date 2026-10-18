@@ -878,6 +878,21 @@ git commit -m "feat: 因子挖掘作业支持 AI 提案、重放与提案查询�
 - 修改：`frontend-factor-mining/src/components/JobDetail.vue`
 - 修改：`frontend-factor-mining/src/api/factorMining.js`
 - 修改：`frontend-factor-mining/src/i18n/zh-CN.js`
+- 修改：`frontend-factor-mining/package.json`、`package-lock.json`（Playwright + axe devDependencies）
+- 创建：`frontend-factor-mining/playwright.config.js`
+- 创建：`frontend-factor-mining/e2e/factor-mining-ai.spec.js`
+- 创建：`docs/web_doc/factor-mining-ai.md`
+
+**前端门禁（全局 CLAUDE.md，本任务必须满足）：**
+
+- **三面清单**：API（`/run` 的 `searchMode/aiRounds/aiProposalsPerRound/researchNotes`、`/jobs/<id>` 的 `summary.ai`、`/jobs/<id>/proposals`、错误键与 404）；UI（提交页 AI 模式、作业详情 AI 摘要与提案表）；契约（OpenAPI 已由任务 6 更新，前端只消费）。
+- **状态矩阵**：提交页 loading / error（run 失败）/ success；详情页 loading / empty（无提案）/ error（接口失败）/ no-permission（404）/ success。每个状态都要有可见反馈，不允许静默空白。
+- **复用**：Element Plus 现有组件、`App.vue` 的 tab 结构、现有 API client 与 i18n；不引入 shadcn/Tailwind 或新设计体系。
+- **响应式**：1440×900 与 390×844 两个视口都要可用；表格在窄屏可横向滚动，表单不溢出。
+- **a11y**：表单控件有标签、键盘可操作、焦点可见、状态标签语义清晰、对比度沿用 Element Plus 主题；E2E 用 axe 检查无 critical 违规。
+- **i18n**：只加 `zh-CN` 键；不硬编码中文/英文文案。
+- **浏览器证据**：Playwright E2E 覆盖主流程 + 截图 + console 无错误 + 关键 network 请求/响应；纯构建输出不算完成证据。
+- 编码前加载 `frontend-design` skill；不要引入 shadcn/Tailwind（项目是 Vue 3 + Element Plus）。
 
 - [ ] **步骤 1：改 API client**
 
@@ -931,23 +946,74 @@ AI 模式下后端 `/estimate` 返回 AI 上界。
 - `proposals.title`、`proposals.round`、`proposals.ordinal`、`proposals.hypothesis`、`proposals.status`、`proposals.reason`、`proposals.pending`。
 - `errors['factorMining.aiProposalFailed']`、`errors['factorMining.aiNoValidProposals']`、`errors['factorMining.aiReplayNotFound']`、`errors['factorMining.aiReplayIncompatible']`。
 
-- [ ] **步骤 5：构建验证**
+- [ ] **步骤 5：状态矩阵、响应式与 a11y**
+
+- 提交页：AI 模式字段切换、loading 按钮、run 失败时 `el-alert` 显示 `errors[msg]`；枚举模式提交 payload 不含 AI 字段。
+- 详情页：加载中 `v-loading`；提案为空显示 `proposals.pending` 空态；接口失败显示错误与重试；404 按空态处理；成功显示 AI 摘要 + 提案表。
+- 窄屏：提案表加 `overflow-x: auto`；表单栅格在 390px 下单列。
+- 表单控件补 `aria-label`/`label`；状态标签不只靠颜色区分（文字 + tag type）。
+
+- [ ] **步骤 6：Playwright E2E（mock API）**
+
+`playwright.config.js`：
+
+- `webServer`：`npm run dev -- --port 3000`，`url: http://localhost:3000`，`reuseExistingServer: true`。
+- 单 project：chromium；默认 viewport 1440×900。
+- `testDir: './e2e'`。
+
+`e2e/factor-mining-ai.spec.js` 必须覆盖：
+
+1. `test('submits an AI run with the AI fields')`：mock catalog/estimate/run；选 AI、填 2/10/notes、提交；断言 `POST /run` body 含 `searchMode:"ai"`、`aiRounds:2`、`aiProposalsPerRound:10`、`researchNotes`。
+2. `test('shows the AI summary and proposals')`：mock `GET /jobs/job-1`（`result.summary.ai`）与 `GET /jobs/job-1/proposals`；断言摘要字段与提案行；截图。
+3. `test('shows an error alert when the run fails')`：mock `/run` 500 或 `code:0`；断言可见错误。
+4. `test('renders empty proposals as an empty state')`：mock proposals `{items:[]}`；断言空态文案。
+5. `test('has no critical axe violations')`：对提交页与详情页跑 `@axe-core/playwright`，断言无 critical。
+6. `test('screenshots at 1440x900 and 390x844')`：两视口 `page.screenshot` 到 `frontend-factor-mining/test-results/`；断言无横向溢出（`document.documentElement.scrollWidth <= innerWidth`）。
+7. 全程收集 `page.on('console')`/`page.on('pageerror')`，断言无 error；mock 之外的请求不应出现 4xx/5xx。
+
+安装依赖与脚本：
+
+```bash
+cd frontend-factor-mining
+npm i -D @playwright/test @axe-core/playwright
+```
+
+在 `package.json` scripts 增加 `"test:e2e": "playwright test"`。
 
 运行：
 
 ```bash
 cd frontend-factor-mining
 npm ci        # 无 lockfile 时用 npm install
-npm run build
+npx playwright install chromium
+npm run test:e2e
 ```
 
-预期：退出码 0，`dist/` 生成。
+预期：全部 PASS；截图生成；console/network 断言通过。
 
-- [ ] **步骤 6：Commit**
+- [ ] **步骤 7：构建与 lint**
 
 ```bash
-git add frontend-factor-mining/src/components/SubmitJob.vue frontend-factor-mining/src/components/JobDetail.vue frontend-factor-mining/src/api/factorMining.js frontend-factor-mining/src/i18n/zh-CN.js
-git commit -m "feat: 因子挖掘前端支持 AI 模式与提案列表"
+cd frontend-factor-mining
+npm run build
+npm run lint
+```
+
+预期：退出码 0。
+
+- [ ] **步骤 8：浏览器人工验收（可用 Playwright MCP 或 agent-browser）**
+
+启动前端 dev server 与后端（或沿用 E2E mock）；打开提交页与详情页，按状态矩阵逐项检查；保存 1440×900 与 390×844 截图；确认 console 无错误、无意外 4xx/5xx。截图路径写进报告。
+
+- [ ] **步骤 9：页面文档**
+
+创建 `docs/web_doc/factor-mining-ai.md`：路由/tab、组件、五态、API 映射（含错误键）、Playwright 测试映射、i18n 键、响应式与 a11y 说明、截图路径。
+
+- [ ] **步骤 10：Commit**
+
+```bash
+git add frontend-factor-mining/src/components/SubmitJob.vue frontend-factor-mining/src/components/JobDetail.vue frontend-factor-mining/src/api/factorMining.js frontend-factor-mining/src/i18n/zh-CN.js frontend-factor-mining/package.json frontend-factor-mining/package-lock.json frontend-factor-mining/playwright.config.js frontend-factor-mining/e2e/factor-mining-ai.spec.js docs/web_doc/factor-mining-ai.md
+git commit -m "feat: 因子挖掘前端支持 AI 模式、提案列表与浏览器验收"
 ```
 
 ---
@@ -958,6 +1024,7 @@ git commit -m "feat: 因子挖掘前端支持 AI 模式与提案列表"
 - 修改：`docs/product/FACTOR_MINING.md:31,609`、`docs/product/FACTOR_MINING_CN.md:21,370`
 - 修改：`docs/superpowers/specs/2026-10-13-factor-mining.md:217`
 - 修改：`docs/api/openapi.yaml`（若任务 6 未提交）
+- 验证：`docs/web_doc/factor-mining-ai.md`（任务 7 创建）
 
 - [ ] **步骤 1：同步产品文档**
 
@@ -985,7 +1052,22 @@ cd backend_api_python
 
 预期：全部 PASS。
 
-- [ ] **步骤 5：真实数据验收（手工，需要 provider）**
+前端（在 `frontend-factor-mining`）：
+
+```bash
+npm ci
+npm run lint
+npm run build
+npm run test:e2e
+```
+
+预期：全部 PASS；截图生成在 `frontend-factor-mining/test-results/`。
+
+- [ ] **步骤 5：UI 证据**
+
+最终报告增加「UI 证据」：提交页/详情页路由（tab）、`npm run test:e2e` 命令、1440×900 与 390×844 截图路径、console 无错误、关键 network 请求/响应、五态覆盖、axe 结果、未覆盖项。纯后端命令输出不算前端完成证据。
+
+- [ ] **步骤 6：真实数据验收（手工，需要 provider）**
 
 用服务端配置的 provider 提交一次 AI run（Crypto 或 USStock，预算 ≥ 20，2 轮 × 5 条），确认：
 
@@ -994,7 +1076,7 @@ cd backend_api_python
 3. 用 `replayJobId` 重跑，proposer 不被调用（日志/计数证据），提案与 L1 状态一致。
 4. 非 AI 模式（enumeration/evolution）回归一次，结果不受影响。
 
-- [ ] **步骤 6：Commit**
+- [ ] **步骤 7：Commit**
 
 ```bash
 git add docs/product/FACTOR_MINING.md docs/product/FACTOR_MINING_CN.md docs/superpowers/specs/2026-10-13-factor-mining.md docs/api/openapi.yaml
@@ -1010,6 +1092,7 @@ git commit -m "docs: 登记因子挖掘 v3 AI 提案与失败反馈循环"
 3. `replayJobId` 重放不产生任何 LLM 调用；提案与原始 run 的 L1 状态一致。
 4. 另一个租户的 jobId/runId：提案端点 404，重放 400/`aiReplayNotFound`。
 5. 非 AI 模式（enumeration/evolution）的作业结果、候选与台账与升级前一致。
+6. 前端：任务 7 的 Playwright E2E 全绿；提交页/详情页五态、1440×900 与 390×844 两视口、console 无错误、无意外 4xx/5xx、axe 无 critical。
 
 ## 未决与已知限制
 
