@@ -1,6 +1,7 @@
 """AI proposal prompts, JSON parsing, and failure feedback summaries."""
 
 import hashlib
+import json
 from datetime import datetime
 
 import pandas as pd
@@ -326,6 +327,37 @@ def test_l1_rejected_and_duplicate_proposals_are_recorded_but_not_yielded():
     assert len(seeds) == 1
     statuses = [row["status"] for row in repo.saved[0][2]]
     assert statuses == ["l1_rejected", "proposed", "duplicate"]
+
+
+def test_seeds_and_rows_use_the_canonical_expression():
+    raw = {"op": "abs", "args": ["close"], "params": {}}
+    canonical = json.loads(normalize_expression(raw).canonical)
+    repo = _Repo()
+    source = proposals.ProposalSource(
+        context=_context(rounds=1), repository=repo,
+        proposer=lambda s, u: proposals.ProposalBatch(
+            json.dumps({"proposals": [{"hypothesis": "h", "expression": raw}]}),
+            "m", "p", False),
+        outcome=lambda fp: None)
+    seeds = list(source)
+    assert seeds[0].expression == canonical
+    saved = repo.saved[0][2][0]
+    assert saved["expression"] == canonical
+    assert "params" not in seeds[0].expression
+    assert "params" not in saved["expression"]
+
+
+def test_replay_seeds_are_canonical_while_the_row_keeps_the_recorded_expression():
+    raw = {"op": "abs", "args": ["close"], "params": {}}
+    rows = [{"round": 1, "ordinal": 1, "expression": raw, "hypothesis": "h",
+             "model": "m", "provider": "p", "promptHash": "b" * 64}]
+    repo = _Repo()
+    source = proposals.ProposalSource(
+        context=_context(rounds=1, replay=tuple(rows), replay_of="job-1"),
+        repository=repo, proposer=lambda s, u: None, outcome=lambda fp: None)
+    seeds = list(source)
+    assert seeds[0].expression == json.loads(normalize_expression(raw).canonical)
+    assert repo.saved[0][2][0]["expression"] == raw
 
 
 def test_replay_yields_recorded_proposals_without_calling_the_proposer():

@@ -751,18 +751,21 @@ class ProposalSource:
             row["reason"] = exc.code
             return
         row["fingerprint"] = normalized.fingerprint
+        # ``normalize_expression`` returns the input as ``node``; the canonical spelling (sorted
+        # keys, empty params dropped) is only encoded in ``canonical``. Seeds and live rows must
+        # carry that canonical tree, not a spelling variant the model happened to send. Replay is
+        # an audit copy and keeps the recorded expression verbatim.
+        expression = json.loads(normalized.canonical)
+        if row["source"] != "replay":
+            row["expression"] = expression
         if normalized.fingerprint in self._seen:
             row["status"] = "duplicate"
             row["reason"] = _DUPLICATE_REASON
             return
         self._seen.add(normalized.fingerprint)
         row["status"] = "proposed"
-        if row["source"] != "replay":
-            # Normal spellings of one expression must persist as one canonical row; replay is an
-            # audit copy and keeps the recorded expression verbatim.
-            row["expression"] = normalized.node
         seeds.append(CandidateSeed(
-            expression=normalized.node,
+            expression=expression,
             fingerprint=normalized.fingerprint,
             template_id="",
             origin="ai",
