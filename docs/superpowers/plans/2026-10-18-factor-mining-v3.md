@@ -21,7 +21,7 @@
 - 失败反馈：run 内用引擎内存 `outcome` 回调，跨 run 才查库；不注入原始全量 trial 表。
 - 提案固化在 `qd_factor_proposals`；`replayJobId` 重放不调用 LLM，`dsl_version` 不同拒绝重放。
 - 租户隔离：所有 proposal、失败摘要、重放查询带 `user_id`；越权一律 404。
-- 单测不得触网：`LLMService` / proposer 全部注入 fake；`tests/conftest.py` 的 `_block_network` 仍生效。
+- 单测不得触网：`LLMService` / proposer 全部注入 fake。注意 `tests/conftest.py` 只拦 `requests.get`/`requests.request`，而 `LLMService` 走 `requests.post`——AI 测试不能依赖网络护栏，必须显式注入 fake proposer/LLMService。
 - 本 worktree 没有 `.venv`；测试从本 worktree 的 `backend_api_python` 目录运行，解释器用主仓库的：
   `/g/project/windows/PycharmProjects/QuantDinger/backend_api_python/.venv/Scripts/python.exe -m pytest ...`。
 - 前端 worktree 没有 `node_modules`；先 `npm ci`（有 lockfile）或 `npm install`，再 `npm run build`。
@@ -432,11 +432,21 @@ class _FakeLLM:
         self.last_provider_used = "fake-provider"
         self.model_fallback_used = False
 
+    def is_configured(self, provider=None):
+        return True
+
     def call_llm_api(self, messages, **kwargs):
         self.calls.append((messages, kwargs))
         if isinstance(self.text, Exception):
             raise self.text
         return self.text
+
+def test_proposer_refuses_an_unconfigured_service():
+    fake = _FakeLLM()
+    fake.is_configured = lambda provider=None: False
+    with pytest.raises(proposals.ProposalGenerationError):
+        proposals.LLMProposer(service=fake)("s", "u")
+    assert fake.calls == []
 
 def test_proposer_returns_text_and_records_the_answering_model():
     fake = _FakeLLM()
@@ -476,7 +486,7 @@ class LLMProposer:
     def __call__(self, system_prompt: str, user_prompt: str) -> ProposalBatch: ...
 ```
 
-- `service or LLMService()`；调用 `call_llm_api([{"role":"system",...},{"role":"user",...}], use_json_mode=True, timeout_seconds=60.0)`。
+- `service or LLMService()`；先 `service.is_configured()`，为 False 直接抛 `ProposalGenerationError("factorMining.aiProposalFailed")`，不发起请求。再调用 `call_llm_api([{"role":"system",...},{"role":"user",...}], use_json_mode=True, timeout_seconds=60.0)`。
 - 异常 → `ProposalGenerationError("factorMining.aiProposalFailed")`；**不在这里重试**，重试由 `ProposalSource` 统一做（每次 run 每轮最多 2 次调用）。
 - 返回 `ProposalBatch(text, service.last_model_used, service.last_provider_used, service.model_fallback_used)`。
 
@@ -842,7 +852,7 @@ def test_proposals_endpoint_returns_partial_proposals_for_a_running_job(app, mon
   - `_run_mining_job`：`job_id = str(request_payload.pop("__jobId", ""))`；`config = self._config(request_payload)`；`notes = self._research_notes(request_payload, config)`；`run_id = persist_run(..., job_id=job_id)`；`result = {"runId": run_id}`。重放时用 `get_run_by_job_id(replay_job_id, user_id)` 取原 run，校验 status/dsl_version，取 `list_proposals(original_run_id)`；构造 `AISearchOptions(run_id=run_id, research_notes=notes, proposer=self._proposer_factory(), repository=self._repository, replay_proposals=tuple(rows))`；`engine.run(..., ai=ai)`；`search["runId"] = run_id`；AI 摘要补写 `replayOf` 与 `snapshotChanged`（新 `summary.snapshotId` 与原 run 的 `snapshotId` 比较）。
   - `get_job_proposals(job_id, *, user_id, limit, offset)`：`agent_jobs.get_job` 校验 kind 与租户；`run = repository.get_run_by_job_id(job_id, user_id)`；无 run → `None`；有 → `repository.list_proposals(run["id"], user_id=..., limit, offset)`；运行中返回已写入的部分（可为空）。
   - `estimate`：`config.search_mode == ai` 时返回 `{"templateCount": 0, "candidateBudget": min(config.ai_rounds * config.ai_proposals_per_round, config.budget)}`，不展开模板。
-  - `FactorMiningService.__init__` 增加 `proposer_factory: Callable[[], Any] = LLMProposer`；服务测试注入 fake。
+  - `FactorMiningService.__init__` 增加 `proposer_factory: Callable[[], Any] = LLMProposer`；服务测试必须注入 `proposer_factory=lambda: fake_proposer`，默认 `LLMProposer` 只在生产使用。
 - `engine.run` 的 `ai` 选项由服务构造；非 AI 模式传 `None`。
 - `docs/api/openapi.yaml`：运行 `scripts/export_openapi.py` 重新导出；新增路径与描述。
 
