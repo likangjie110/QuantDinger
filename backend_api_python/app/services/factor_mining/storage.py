@@ -1,12 +1,14 @@
 """Persistence for factor mining runs, candidates, and the trial ledger.
 
-Three lifetimes in three tables. A **run** is one job: its config, the fingerprint of the panel it
+Four lifetimes in four tables. A **run** is one job: its config, the fingerprint of the panel it
 searched, and the counts it ended with. A **candidate** converges -- ``(user_id, expression_hash)``
 is unique, so the same expression evaluated by a later run updates that row instead of adding a
 second one, and ``run_id`` keeps pointing at the run that judged it last. A **trial** does not
 converge: one row per evaluation, rejected candidates included, because that count is the
 deflated-Sharpe denominator the frozen review prices the search with, and a ledger missing its
-failures would understate exactly the bias the correction exists for.
+failures would understate exactly the bias the correction exists for. A **proposal** is what an AI
+run asked to evaluate, kept even when the evaluator never saw it, so a run can be audited and
+replayed from the record rather than from a fresh model call.
 
 Serialization happens here and nowhere else. The engine's record mixes timestamp styles by design
 -- ``config`` is a ``MiningConfig`` dumped by ``asdict``, so it carries native ``datetime`` objects
@@ -61,6 +63,11 @@ _CANDIDATE_COLUMNS = """
     timeframe, status, reject_reason, metrics_json, out_of_sample_json, created_at, updated_at
 """
 
+_PROPOSAL_COLUMNS = """
+    id, user_id, run_id, round, ordinal, expression_json, expression_hash, hypothesis,
+    model, provider, prompt_hash, dsl_version, source, status, reject_reason, created_at
+"""
+
 # Column -> the key callers read. The API speaks camelCase; the tables keep the house snake_case.
 _RUN_KEYS = {
     "id": "id",
@@ -95,6 +102,23 @@ _CANDIDATE_KEYS = {
     "updated_at": "updatedAt",
 }
 
+_PROPOSAL_KEYS = {
+    "id": "id",
+    "run_id": "runId",
+    "round": "round",
+    "ordinal": "ordinal",
+    "expression_hash": "expressionHash",
+    "hypothesis": "hypothesis",
+    "model": "model",
+    "provider": "provider",
+    "prompt_hash": "promptHash",
+    "dsl_version": "dslVersion",
+    "source": "source",
+    "status": "status",
+    "reject_reason": "reason",
+    "created_at": "createdAt",
+}
+
 
 class FactorMiningRepository:
     def _assert_run_owner(self, cur: Any, run_id: int, user_id: int) -> None:
@@ -121,6 +145,7 @@ class FactorMiningRepository:
         snapshot_id: str,
         manifest: Mapping[str, Any],
         status: str = "running",
+        job_id: str = "",
     ) -> int:
         """Open a run row and return its id.
 
@@ -128,6 +153,8 @@ class FactorMiningRepository:
         ``engine.run`` returns -- which is where the denormalised market and window columns are
         read from. ``snapshot_id`` is usually empty here: the panel is prepared inside the search,
         after this row exists, so ``finish_run`` backfills the fingerprint from the result.
+        ``job_id`` is the agent job that drives this run; it is what lets a proposal lookup work
+        while the job is still running or after it failed.
         """
         with get_db_connection() as db:
             cur = db.cursor()
@@ -135,16 +162,16 @@ class FactorMiningRepository:
                 """
                 INSERT INTO qd_factor_mining_runs
                 (user_id, source_id, source_name, market, timeframe, start_date, end_date,
-                 snapshot_id, config_json, manifest_json, result_json, status,
+                 snapshot_id, config_json, manifest_json, result_json, status, job_id,
                  trials_count, candidates_count, frozen_count, error_message, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, 0, 0, 0, '', NOW())
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, 0, 0, 0, '', NOW())
                 """,
                 (
                     int(user_id), int(source_id), str(source_name or ""),
                     str(config.get("market") or ""), str(config.get("timeframe") or ""),
                     _window_text(config.get("start_date")), _window_text(config.get("end_date")),
                     str(snapshot_id or ""), _dump(dict(config)), _dump(dict(manifest)),
-                    str(status or "running"),
+                    str(status or "running"), str(job_id or ""),
                 ),
             )
             run_id = int(cur.lastrowid or 0)
@@ -312,6 +339,99 @@ class FactorMiningRepository:
                 cur.close()
         return len(rows)
 
+    def save_proposals(
+        self,
+        run_id: int,
+        *,
+        user_id: int,
+        proposals: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Record an AI round's proposals and return how many rows were attempted.
+
+        One row per generated proposal, including the ones that never reach the evaluator:
+        ``l1_rejected`` and ``duplicate`` are outcomes worth auditing, and ``proposed`` marks a row
+        the crash-recovery sweep can tell apart from one whose round result was written back.
+        ``(run_id, round, ordinal)`` is the identity, so a retried batch inserts nothing twice.
+        The return value is the batch length for the same reason ``save_trials`` reports it: the
+        caller records it as what was generated, and a foreign run raises rather than silently
+        storing zero rows.
+        """
+        rows = [
+            (
+                int(user_id), int(run_id), int(proposal.get("round") or 0),
+                int(proposal.get("ordinal") or 0),
+                _dump(proposal.get("expression") or {}),
+                str(proposal.get("fingerprint") or ""),
+                str(proposal.get("hypothesis") or ""),
+                str(proposal.get("model") or ""),
+                str(proposal.get("provider") or ""),
+                str(proposal.get("promptHash") or ""),
+                int(proposal.get("dslVersion") or 1),
+                str(proposal.get("source") or "llm"),
+                str(proposal.get("status") or "proposed"),
+                str(proposal.get("reason") or ""),
+            )
+            for proposal in proposals
+        ]
+        if not rows:
+            return 0
+        with get_db_connection() as db:
+            cur = db.cursor()
+            try:
+                self._assert_run_owner(cur, run_id, user_id)
+                cur.executemany(
+                    """
+                    INSERT INTO qd_factor_proposals
+                    (user_id, run_id, round, ordinal, expression_json, expression_hash,
+                     hypothesis, model, provider, prompt_hash, dsl_version, source, status,
+                     reject_reason)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (run_id, round, ordinal) DO NOTHING
+                    """,
+                    rows,
+                )
+                db.commit()
+            finally:
+                cur.close()
+        return len(rows)
+
+    def update_proposal_status(
+        self,
+        run_id: int,
+        *,
+        user_id: int,
+        round_no: int,
+        ordinals: Sequence[int],
+        status: str,
+    ) -> int:
+        """Move a round's proposals to their final state and return how many rows changed.
+
+        Only ``proposed`` rows are written by ``save_proposals``; the round's evaluation results
+        then mark the ones that reached the evaluator as ``evaluated``. Scoped by the run's owner
+        in the statement itself, so a foreign run raises before anything is touched.
+        """
+        values = [int(ordinal) for ordinal in ordinals]
+        if not values:
+            return 0
+        marks = ", ".join("?" for _ in values)
+        with get_db_connection() as db:
+            cur = db.cursor()
+            try:
+                self._assert_run_owner(cur, run_id, user_id)
+                cur.execute(
+                    f"""
+                    UPDATE qd_factor_proposals
+                    SET status = ?
+                    WHERE run_id = ? AND user_id = ? AND round = ? AND ordinal IN ({marks})
+                    """,
+                    (str(status or ""), int(run_id), int(user_id), int(round_no), *values),
+                )
+                updated = int(cur.rowcount)
+                db.commit()
+            finally:
+                cur.close()
+        return updated
+
     def count_trials(self, run_id: int, *, user_id: int) -> int:
         """The run's whole ledger: the denominator the out-of-sample review is priced by.
 
@@ -366,6 +486,29 @@ class FactorMiningRepository:
             row = cur.fetchone()
             cur.close()
         return self._hydrate_run(row, include_result=True) if row else None
+
+    def get_run_by_job_id(self, job_id: str, *, user_id: int) -> dict[str, Any] | None:
+        """The newest run a job opened, hydrated like a summary read.
+
+        A job maps to a run through the ``job_id`` column rather than through the job store, so the
+        lookup works while the job is running and after it failed. The scope is the caller's: a
+        job id belonging to another tenant reads as absent.
+        """
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                f"""
+                SELECT {_RUN_COLUMNS}
+                FROM qd_factor_mining_runs
+                WHERE job_id = ? AND user_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (str(job_id or ""), int(user_id)),
+            )
+            row = cur.fetchone()
+            cur.close()
+        return self._hydrate_run(row) if row else None
 
     def list_candidates(
         self,
@@ -429,6 +572,114 @@ class FactorMiningRepository:
             cur.close()
         return self._hydrate_candidate(row) if row else None
 
+    def list_proposals(
+        self,
+        run_id: int,
+        *,
+        user_id: int,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """A run's proposals in the order they were generated: ``(round, ordinal)``.
+
+        The round/ordinal order is the record's chronology, and the replay source depends on it:
+        replaying a run copies these rows back into the same rounds in this exact sequence.
+        """
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                f"""
+                SELECT {_PROPOSAL_COLUMNS}
+                FROM qd_factor_proposals
+                WHERE run_id = ? AND user_id = ?
+                ORDER BY round, ordinal
+                LIMIT ? OFFSET ?
+                """,
+                (int(run_id), int(user_id), int(limit), int(offset)),
+            )
+            rows = cur.fetchall() or []
+            cur.close()
+        return [self._hydrate_proposal(row) for row in rows]
+
+    def failure_summary(
+        self,
+        *,
+        user_id: int,
+        market: str,
+        timeframe: str,
+        exclude_run_id: int,
+        history_runs: int = 5,
+        max_expressions: int = 10,
+    ) -> dict[str, Any]:
+        """What the same tenant's recent successful runs in this market failed on.
+
+        Cross-run evidence only -- a run's own results arrive through the engine's outcome callback,
+        not from these tables, because trials are written after the search returns. Every query is
+        scoped by ``user_id``, and the run scope also pins ``market``/``timeframe`` and skips the
+        run being planned, so a summary cannot summarise another tenant's search.
+        """
+        recent_runs = """
+            SELECT id
+            FROM qd_factor_mining_runs
+            WHERE user_id = ? AND market = ? AND timeframe = ?
+              AND status = 'success' AND id <> ?
+            ORDER BY id DESC
+            LIMIT ?
+        """
+        scope = (
+            int(user_id), str(market or ""), str(timeframe or ""), int(exclude_run_id),
+            max(0, int(history_runs)),
+        )
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(f"SELECT id FROM ({recent_runs}) AS recent", scope)
+            run_ids = [_count(row.get("id")) for row in cur.fetchall() or []]
+            cur.execute(
+                f"""
+                SELECT stage, verdict, reject_reason AS reason, COUNT(*) AS count
+                FROM qd_factor_trials
+                WHERE user_id = ? AND run_id IN ({recent_runs})
+                GROUP BY stage, verdict, reject_reason
+                ORDER BY stage, verdict, reject_reason
+                """,
+                (int(user_id), *scope),
+            )
+            stage_counts = [
+                {
+                    "stage": str(row.get("stage") or ""),
+                    "verdict": str(row.get("verdict") or ""),
+                    "reason": str(row.get("reason") or ""),
+                    "count": _count(row.get("count")),
+                }
+                for row in cur.fetchall() or []
+            ]
+            cur.execute(
+                f"""
+                SELECT expression_json, expression_hash, status, reject_reason, metrics_json
+                FROM qd_factor_candidates
+                WHERE user_id = ? AND run_id IN ({recent_runs}) AND status <> 'frozen'
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (int(user_id), *scope, max(0, int(max_expressions))),
+            )
+            recent_failures = [
+                {
+                    "expression": _expression_node(row.get("expression_json")),
+                    "expressionHash": str(row.get("expression_hash") or ""),
+                    "status": str(row.get("status") or ""),
+                    "reason": str(row.get("reject_reason") or ""),
+                    "metrics": _json_mapping(row.get("metrics_json")),
+                }
+                for row in cur.fetchall() or []
+            ]
+            cur.close()
+        return {
+            "runIds": run_ids,
+            "stageCounts": stage_counts,
+            "recentFailures": recent_failures,
+        }
+
     @staticmethod
     def _hydrate_run(row: Mapping[str, Any], *, include_result: bool = False) -> dict[str, Any]:
         """One run row as its caller reads it. ``result`` only when the detail view asks for it."""
@@ -456,6 +707,13 @@ class FactorMiningRepository:
         if include_metrics:
             item["metrics"] = _json_mapping(row.get("metrics_json"))
             item["outOfSample"] = _json_mapping(row.get("out_of_sample_json"))
+        return item
+
+    @staticmethod
+    def _hydrate_proposal(row: Mapping[str, Any]) -> dict[str, Any]:
+        """One proposal row as its caller reads it, with its expression tree decoded."""
+        item = {public: row.get(column) for column, public in _PROPOSAL_KEYS.items()}
+        item["expression"] = _expression_node(row.get("expression_json"))
         return item
 
 

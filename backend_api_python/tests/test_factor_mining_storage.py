@@ -25,6 +25,7 @@ class _RecordingCursor:
     def __init__(self, rows=()):
         self.statements = []
         self.lastrowid = 9  # what PostgresCursor exposes after an INSERT .. RETURNING id
+        self.rowcount = 0
         self.rows = list(rows)
 
     def execute(self, sql, params=None):
@@ -37,7 +38,8 @@ class _RecordingCursor:
         return self.rows.pop(0) if self.rows else None
 
     def fetchall(self):
-        return []
+        rows, self.rows = self.rows, []
+        return rows
 
     def close(self):
         pass
@@ -365,3 +367,106 @@ def test_single_row_reads_scope_by_user(monkeypatch):
     assert cursor.statements[1][1] == (7, 4)
     for sql, _params in cursor.statements:
         assert "WHERE id = ? AND user_id = ?" in sql
+
+
+def test_save_proposals_writes_every_row_under_the_owned_run(monkeypatch):
+    cur = _record(monkeypatch, rows=[_OWNED_RUN])
+    repo = FactorMiningRepository()
+    written = repo.save_proposals(9, user_id=4, proposals=[
+        {"round": 1, "ordinal": 1, "expression": {"op": "close", "args": [], "params": {}},
+         "fingerprint": "a" * 64, "hypothesis": "h", "model": "m", "provider": "p",
+         "promptHash": "b" * 64, "dslVersion": 1, "source": "llm",
+         "status": "proposed", "reason": ""},
+    ])
+    assert written == 1
+    sql, params = cur.statements[-1]
+    assert "INSERT INTO qd_factor_proposals" in sql
+    assert "ON CONFLICT (run_id, round, ordinal) DO NOTHING" in sql
+    assert params[0][1] == 9  # run_id
+    assert params[0][2] == 1  # round
+    assert params[0][3] == 1  # ordinal
+
+
+def test_save_proposals_refuses_a_run_that_is_not_the_callers(monkeypatch):
+    """A foreign run raises before anything is written -- never a silent zero-row proposal log."""
+    cursor = _record(monkeypatch, rows=[None])
+
+    with pytest.raises(storage.FactorMiningWriteError, match="factorMining.runNotFound"):
+        FactorMiningRepository().save_proposals(9, user_id=4, proposals=[
+            {"round": 1, "ordinal": 1, "expression": {}, "fingerprint": "a" * 64},
+        ])
+
+    assert len(cursor.statements) == 1  # the ownership check, and no INSERT after it
+
+
+def test_list_proposals_orders_by_round_and_ordinal_and_scopes_by_user(monkeypatch):
+    cur = _record(monkeypatch)
+    cur.rows = [{"id": 1, "user_id": 4, "run_id": 9, "round": 1, "ordinal": 2,
+                 "expression_json": "{}", "expression_hash": "", "hypothesis": "",
+                 "model": "", "provider": "", "prompt_hash": "", "dsl_version": 1,
+                 "source": "llm", "status": "proposed", "reject_reason": "",
+                 "created_at": None}]
+    rows = FactorMiningRepository().list_proposals(9, user_id=4, limit=20, offset=0)
+    sql, params = cur.statements[-1]
+    assert "WHERE run_id = ? AND user_id = ?" in sql
+    assert "ORDER BY round, ordinal" in sql
+    assert params == (9, 4, 20, 0)
+    assert rows[0]["ordinal"] == 2
+
+
+def test_update_proposal_status_scopes_the_update_and_returns_the_row_count(monkeypatch):
+    cursor = _record(monkeypatch, rows=[_OWNED_RUN])
+    cursor.rowcount = 2
+
+    updated = FactorMiningRepository().update_proposal_status(
+        9, user_id=4, round_no=1, ordinals=[1, 2], status="evaluated")
+
+    sql, params = cursor.statements[-1]
+    assert updated == 2
+    assert "SET status = ?" in sql
+    assert "run_id = ? AND user_id = ? AND round = ?" in sql
+    assert "ordinal IN (?, ?)" in sql
+    assert params == ("evaluated", 9, 4, 1, 1, 2)
+
+
+def test_update_proposal_status_skips_the_database_for_an_empty_ordinal_list(monkeypatch):
+    def _forbidden():
+        raise AssertionError("an empty update must not open a connection")
+
+    monkeypatch.setattr(storage, "get_db_connection", _forbidden)
+
+    assert FactorMiningRepository().update_proposal_status(
+        9, user_id=4, round_no=1, ordinals=[], status="evaluated") == 0
+
+
+def test_failure_summary_never_crosses_tenants(monkeypatch):
+    cur = _record(monkeypatch, rows=[_OWNED_RUN])
+    repo = FactorMiningRepository()
+    repo.failure_summary(user_id=4, market="USStock", timeframe="1d",
+                         exclude_run_id=9, history_runs=5, max_expressions=10)
+    statements = [sql for sql, _params in cur.statements]
+    assert any("qd_factor_trials" in sql for sql in statements)
+    for sql, params in cur.statements:
+        if "user_id" in sql:
+            assert 4 in params
+
+
+def test_get_run_by_job_id_scopes_by_user(monkeypatch):
+    cur = _record(monkeypatch)
+    cur.rows = [{"id": 9, "user_id": 4, "job_id": "job-1", "config_json": "{}",
+                 "manifest_json": "{}"}]
+    run = FactorMiningRepository().get_run_by_job_id("job-1", user_id=4)
+    sql, params = cur.statements[-1]
+    assert "WHERE job_id = ? AND user_id = ?" in sql
+    assert params == ("job-1", 4)
+    assert run["id"] == 9
+
+
+def test_persist_run_records_the_job_id(monkeypatch):
+    cur = _record(monkeypatch)
+    FactorMiningRepository().persist_run(
+        user_id=4, config={"market": "USStock", "timeframe": "1d"},
+        source_id=3, source_name="s", snapshot_id="", manifest={}, job_id="job-1")
+    sql, params = cur.statements[-1]
+    assert "job_id" in sql
+    assert "job-1" in params
