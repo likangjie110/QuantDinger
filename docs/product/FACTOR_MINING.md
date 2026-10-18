@@ -461,8 +461,8 @@ the server's model configuration. The run's candidate budget is
 budget still caps it. `/estimate` returns that product as `candidateBudget` and `0` as
 `templateCount`.
 
-**One round, one model call.** Each round's prompt carries the market, timeframe and data window,
-the field catalogue (grouped), the operator catalogue (arity and window), the candidate budget,
+**One round, at most two model calls.** Each round's prompt carries the market, timeframe and data window,
+the field catalogue listed in group order, the operator catalogue (arity and window), the candidate budget,
 the cross-run failure summary, the previous round's feedback, the optional research notes, and up
 to ten template examples as priors. Research notes and all historical material are delimited as
 **data**: instructions inside them are not executed. The model must answer with strict JSON:
@@ -486,12 +486,14 @@ never evaluated.
 
 **Failure feedback.** Feedback has two layers. Within a run, after a round's seeds have been
 evaluated, the engine's in-memory outcomes are aggregated by stage and reject reason, with up to
-10 failed expressions (hash and reason) and up to 5 near misses ordered by their relative distance
-to the threshold; the block is capped at 6000 characters and becomes the next round's `Previous
-round feedback`. It must read the engine, not `qd_factor_trials`: the service writes trials only
-after `engine.run` returns. Across runs, the first round reads the caller's 5 most recent
-**successful** runs on the same market and timeframe -- stage/verdict/reason counts plus up to 10
-failed expressions, capped at 6000 characters. Failed and cancelled runs are not used as history.
+10 failed expressions (hash, stage, reason and the expression itself) and up to 5 near misses
+ordered by their relative distance to the threshold; the block is capped at 6000 characters and
+becomes the next round's `Previous round feedback`. It must read the engine, not
+`qd_factor_trials`: the service writes trials only after `engine.run` returns. Across runs, a live
+run fetches the summary once before the first round from the caller's 5 most recent **successful**
+runs on the same market and timeframe -- stage/verdict/reason counts plus up to 10 failed
+expressions, capped at 6000 characters -- and every round's prompt carries it, space permitting.
+A replay calls no model and reads no history. Failed and cancelled runs are not used as history.
 
 **What is stored.** `qd_factor_proposals` holds one row per proposal (`run_id`, `round`,
 `ordinal`, expression, hash, hypothesis, model, provider, prompt hash, DSL version, source,
@@ -531,7 +533,9 @@ it is not sent to a model. The replay copies the recorded proposals into a new r
 called on this path. Because the panel is refetched, `snapshotChanged` says whether its
 fingerprint differs from the original run's: the proposals and their L1 statuses are reproduced,
 but the metrics are a new measurement. An unknown or other-tenant `replayJobId` is
-`factorMining.aiReplayNotFound`.
+`factorMining.aiReplayNotFound`. A successful run with no recorded proposals (for example a
+non-AI run) has nothing to replay and fails the new job with
+`factorMining.aiNoValidProposals`.
 
 **Limits.**
 
@@ -551,7 +555,7 @@ feature does not fetch papers or reports and has no file/PDF ingestion; only pas
 notes are read. Proposal quality depends on the configured provider and model, and an AI proposal
 still has to pass the unchanged L1-L6 ladder -- AI mode changes where hypotheses come from, not
 what counts as evidence. Simulation/paper-run monitoring is not implemented. The feature remains
-free of charge; each round is one model call and the run is bounded as above.
+free of charge; each round is at most two model calls and the run is bounded as above.
 
 ## 9. Jobs, concurrency, and budget
 

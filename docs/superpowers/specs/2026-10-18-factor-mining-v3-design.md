@@ -297,7 +297,7 @@ CREATE INDEX IF NOT EXISTS idx_factor_proposals_user_hash
 | LLM 超时 | 60s / 次 |
 | 重试 | 1 次（共 2 次尝试/轮） |
 | 研究笔记 | ≤ 8000 字符 |
-| 单轮 prompt | ≤ 24000 字符；超出先截断历史摘要，再截断模板示例 |
+| 单轮 prompt | ≤ 24000 字符；超出时先压缩可选材料（研究笔记/反馈/模板示例/跨 run 历史），system 与字段/算子清单不截断 |
 | 跨 run 历史 | 最近 5 次 run |
 | 反馈摘要 | ≤ 6000 字符 |
 

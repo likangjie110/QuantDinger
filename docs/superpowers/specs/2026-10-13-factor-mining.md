@@ -29,7 +29,7 @@
 ### 2.2 非目标
 
 - **不接入策略运行时**：`StrategyV2BacktestRunner`（`runtime.py:1700`）与 `StrategyV2LiveSession`（`runtime.py:2250`）都没有 `user_id`，`context.factor()` 直连全局 `get_factor()`。让策略调用挖掘因子需要把用户作用域贯穿回测与实盘评估进程，触碰多租户隔离不变量 → 独立高风险计划。
-- **不做 AI/LLM 提案**：属第三版。
+- **v1 不做 AI/LLM 提案**（v3 已落地，见 [v3 设计规格](2026-10-18-factor-mining-v3-design.md)）。
 - **不把通过因子写回 `_FACTORS`**：那是不可变代码注册表，回写源码不可测试、不可回滚、污染仓库。
 - v1 不做跨市场字段适配（加密资金费率/持仓量、期货期限结构）。
 
