@@ -210,7 +210,7 @@ def test_run_field_whitelist_matches_the_config_it_feeds():
     be echoed back as config either.
     """
     config_fields = {_camel(field.name) for field in dataclasses.fields(MiningConfig)}
-    assert config_fields | {"researchNotes"} == mining_routes._RUN_FIELDS
+    assert config_fields | {"researchNotes"} == mining_routes.RUN_FIELDS
     assert config_fields == set(mining_service._JOB_CONFIG_KEYS)
 
 

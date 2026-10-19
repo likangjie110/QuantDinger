@@ -297,6 +297,17 @@ def test_submit_uses_factor_mining_job_kind(monkeypatch):
     assert receipt["jobId"] == "job-1"
 
 
+def test_submit_records_the_agent_token(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        mining_service.agent_jobs, "submit_job",
+        lambda **kwargs: captured.update(kwargs) or {"job_id": "job-1", "status": "queued"},
+    )
+    monkeypatch.setattr(mining_service.agent_jobs, "count_active_jobs", lambda **_: 0)
+    FactorMiningService().submit(user_id=4, payload=_payload(), agent_token_id=9)
+    assert captured["agent_token_id"] == 9
+
+
 def test_submit_rejects_second_concurrent_job(monkeypatch):
     monkeypatch.setattr(mining_service.agent_jobs, "count_active_jobs", lambda **_: 1)
     with pytest.raises(ValueError, match="factorMining.concurrentLimit"):
@@ -375,9 +386,10 @@ def test_a_job_carries_the_config_its_caller_submitted(monkeypatch):
 def test_a_job_carries_the_search_mode_it_was_submitted_with(monkeypatch):
     """A listed job withholds ``result``, so ``config`` is the only place its mode is visible.
 
-    ``_RUN_FIELDS`` lets the mode and the breeding pool into the stored request; a read-back that
-    dropped them would leave a poller unable to tell an evolving job from an enumerating one --
-    the two searches cost different amounts and take different lengths of history.
+    The route's ``RUN_FIELDS`` lets the mode and the breeding pool into the stored request; a
+    read-back that dropped them would leave a poller unable to tell an evolving job from an
+    enumerating one -- the two searches cost different amounts and take different lengths of
+    history.
     """
     monkeypatch.setattr(mining_service.agent_jobs, "get_job", lambda job_id, *, user_id: _job_row(
         job_id=job_id, request={"sourceId": 7, "market": "USStock", "searchMode": "evolution",

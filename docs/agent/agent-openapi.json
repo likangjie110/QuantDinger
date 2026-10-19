@@ -194,6 +194,37 @@
           "param_schema": { "type": "object" },
           "metadata":     { "type": "object" }
         }
+      },
+      "FactorMiningRunRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Normal runs require sourceId, market, startDate, and endDate. AI replay requires searchMode=\"ai\" and replayJobId instead.",
+        "properties": {
+          "sourceId": { "type": "integer", "minimum": 1 },
+          "sourceName": { "type": "string" },
+          "market": { "type": "string" },
+          "timeframe": { "type": "string", "default": "1D" },
+          "startDate": { "type": "string", "format": "date" },
+          "endDate": { "type": "string", "format": "date" },
+          "freezeRatio": { "type": "number" },
+          "budget": { "type": "integer", "minimum": 1 },
+          "seed": { "type": "integer" },
+          "templateIds": { "type": "array", "items": { "type": "string" } },
+          "groups": { "type": "integer" },
+          "holdingPeriod": { "type": "integer" },
+          "commission": { "type": "number" },
+          "slippage": { "type": "number" },
+          "neutralizeIndustry": { "type": "boolean" },
+          "thresholds": { "type": "object" },
+          "searchMode": { "type": "string", "enum": ["enumeration", "evolution", "ai"] },
+          "population": { "type": "integer", "minimum": 1 },
+          "generations": { "type": "integer", "minimum": 1 },
+          "eliteRatio": { "type": "number", "minimum": 0, "exclusiveMaximum": 1 },
+          "aiRounds": { "type": "integer", "minimum": 1, "maximum": 3 },
+          "aiProposalsPerRound": { "type": "integer", "minimum": 1, "maximum": 20 },
+          "researchNotes": { "type": "string", "maxLength": 8000 },
+          "replayJobId": { "type": "string" }
+        }
       }
     }
   },
@@ -592,6 +623,121 @@
         "parameters": [{ "in": "header", "name": "Idempotency-Key", "required": true, "schema": { "type": "string", "maxLength": 120 } }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
         "responses": { "200": { "description": "Removed" } }
+      }
+    },
+    "/api/agent/v1/factor-mining/catalog": {
+      "get": {
+        "summary": "Factor mining DSL vocabulary: fields, operators, and templates",
+        "x-scope-class": "R",
+        "parameters": [
+          { "in": "query", "name": "market", "required": false, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/api/agent/v1/factor-mining/estimate": {
+      "post": {
+        "summary": "Price a factor mining search without submitting it",
+        "x-scope-class": "R",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FactorMiningRunRequest" } } } },
+        "responses": {
+          "200": { "description": "OK" },
+          "400": { "description": "Invalid parameters" }
+        }
+      }
+    },
+    "/api/agent/v1/factor-mining/jobs": {
+      "post": {
+        "summary": "Submit a factor mining run",
+        "x-scope-class": "B",
+        "parameters": [{ "in": "header", "name": "Idempotency-Key", "required": true, "schema": { "type": "string", "maxLength": 120 } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FactorMiningRunRequest" } } } },
+        "responses": {
+          "202": { "description": "Queued" },
+          "400": { "description": "Invalid parameters or missing Idempotency-Key" },
+          "403": { "description": "Token lacks B scope" }
+        }
+      },
+      "get": {
+        "summary": "List the caller's factor mining jobs",
+        "x-scope-class": "R",
+        "parameters": [
+          { "in": "query", "name": "limit", "required": false, "schema": { "type": "integer", "default": 20, "minimum": 1, "maximum": 50 } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/api/agent/v1/factor-mining/jobs/{job_id}": {
+      "get": {
+        "summary": "Get one factor mining job",
+        "x-scope-class": "R",
+        "parameters": [
+          { "in": "path", "name": "job_id", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "OK" },
+          "404": { "description": "Job not found" }
+        }
+      }
+    },
+    "/api/agent/v1/factor-mining/jobs/{job_id}/cancel": {
+      "post": {
+        "summary": "Cancel one of the caller's factor mining jobs",
+        "x-scope-class": "B",
+        "parameters": [
+          { "in": "path", "name": "job_id", "required": true, "schema": { "type": "string" } },
+          { "in": "header", "name": "Idempotency-Key", "required": true, "schema": { "type": "string", "maxLength": 120 } }
+        ],
+        "responses": {
+          "200": { "description": "Cancelled" },
+          "403": { "description": "Token lacks B scope" },
+          "404": { "description": "Job not found" }
+        }
+      }
+    },
+    "/api/agent/v1/factor-mining/jobs/{job_id}/proposals": {
+      "get": {
+        "summary": "List the proposals one AI job's run recorded",
+        "x-scope-class": "R",
+        "parameters": [
+          { "in": "path", "name": "job_id", "required": true, "schema": { "type": "string" } },
+          { "in": "query", "name": "limit", "required": false, "schema": { "type": "integer", "default": 50, "minimum": 1, "maximum": 200 } },
+          { "in": "query", "name": "offset", "required": false, "schema": { "type": "integer", "default": 0, "minimum": 0 } }
+        ],
+        "responses": {
+          "200": { "description": "OK" },
+          "404": { "description": "Job or run not found" }
+        }
+      }
+    },
+    "/api/agent/v1/factor-mining/candidates": {
+      "get": {
+        "summary": "List the caller's factor candidate library",
+        "x-scope-class": "R",
+        "parameters": [
+          { "in": "query", "name": "runId", "required": false, "schema": { "type": "integer" } },
+          { "in": "query", "name": "status", "required": false, "schema": { "type": "string" } },
+          { "in": "query", "name": "market", "required": false, "schema": { "type": "string" } },
+          { "in": "query", "name": "limit", "required": false, "schema": { "type": "integer", "default": 50, "minimum": 1, "maximum": 200 } },
+          { "in": "query", "name": "offset", "required": false, "schema": { "type": "integer", "default": 0, "minimum": 0 } }
+        ],
+        "responses": {
+          "200": { "description": "OK" },
+          "400": { "description": "Invalid runId" }
+        }
+      }
+    },
+    "/api/agent/v1/factor-mining/candidates/{candidate_id}": {
+      "get": {
+        "summary": "Get one factor candidate",
+        "x-scope-class": "R",
+        "parameters": [
+          { "in": "path", "name": "candidate_id", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "OK" },
+          "404": { "description": "Candidate not found" }
+        }
       }
     },
     "/api/agent/v1/trading/accounts": {

@@ -171,7 +171,10 @@ class FactorMiningService:
             "candidateBudget": len(seeds),
         }
 
-    def submit(self, *, user_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def submit(
+        self, *, user_id: int, payload: Mapping[str, Any],
+        agent_token_id: int | None = None,
+    ) -> dict[str, Any]:
         """Queue one mining run and return its job receipt.
 
         The ``__`` prefix is the job store's own channel -- ``__billing`` is refunded from the
@@ -203,7 +206,7 @@ class FactorMiningService:
         stored = {**request_payload, "__userId": int(user_id), "__jobId": job_id}
         receipt = agent_jobs.submit_job(
             user_id=int(user_id),
-            agent_token_id=None,
+            agent_token_id=agent_token_id,
             kind=JOB_KIND,
             request_payload=stored,
             runner=self._run_mining_job,

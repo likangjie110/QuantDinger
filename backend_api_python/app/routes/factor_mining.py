@@ -28,7 +28,7 @@ factor_mining_blp = Blueprint("factor_mining", __name__)
 # The keys ``MiningConfig.from_payload`` reads, and no others. Deliberately a second whitelist
 # next to the service's own ``__`` strip: that one guards where the mapping enters the service,
 # this one guards where the untrusted body enters the process.
-_RUN_FIELDS = frozenset({
+RUN_FIELDS = frozenset({
     "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio",
     "budget", "seed", "templateIds", "groups", "holdingPeriod", "commission", "slippage",
     "neutralizeIndustry", "thresholds", "searchMode", "population", "generations", "eliteRatio",
@@ -40,7 +40,7 @@ def _run_payload() -> dict:
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return {}
-    return {key: value for key, value in body.items() if key in _RUN_FIELDS}
+    return {key: value for key, value in body.items() if key in RUN_FIELDS}
 
 
 def _query_int(name: str) -> int | None:
