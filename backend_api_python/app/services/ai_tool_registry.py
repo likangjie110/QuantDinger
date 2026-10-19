@@ -649,6 +649,15 @@ _MCP_EXTENSION_ROUTES = {
     "set_signal_alert_status": "/api/agent/v1/notifications/signal-alerts/{task_id}/status",
     "delete_signal_alert": "/api/agent/v1/notifications/signal-alerts/{task_id}",
     "run_signal_alert": "/api/agent/v1/notifications/signal-alerts/{task_id}/run",
+    "get_factor_mining_catalog": "/api/agent/v1/factor-mining/catalog",
+    "estimate_factor_mining": "/api/agent/v1/factor-mining/estimate",
+    "submit_factor_mining_run": "/api/agent/v1/factor-mining/jobs",
+    "list_factor_mining_jobs": "/api/agent/v1/factor-mining/jobs",
+    "get_factor_mining_job": "/api/agent/v1/factor-mining/jobs/{job_id}",
+    "list_factor_mining_proposals": "/api/agent/v1/factor-mining/jobs/{job_id}/proposals",
+    "cancel_factor_mining_job": "/api/agent/v1/factor-mining/jobs/{job_id}/cancel",
+    "list_factor_mining_candidates": "/api/agent/v1/factor-mining/candidates",
+    "get_factor_mining_candidate": "/api/agent/v1/factor-mining/candidates/{candidate_id}",
 }
 _MCP_EXTENSION_WRITES = {
     "emergency_stop_trading",
@@ -661,6 +670,8 @@ _MCP_EXTENSION_WRITES = {
     "set_signal_alert_status",
     "delete_signal_alert",
     "run_signal_alert",
+    "submit_factor_mining_run",
+    "cancel_factor_mining_job",
 }
 MCP_AGENT_TOOLS = MCP_AGENT_TOOLS + tuple(
     ToolDefinition(
@@ -670,7 +681,7 @@ MCP_AGENT_TOOLS = MCP_AGENT_TOOLS + tuple(
                 "list_universes", "get_universe", "list_universe_members",
                 "list_factors", "get_factor", "list_watchlist", "add_watchlist",
                 "remove_watchlist",
-            }
+            } or "factor_mining" in name
             else "notifications" if "signal_alert" in name
             else "jobs" if name == "cancel_job"
             else "indicator" if name == "link_indicator_config"
