@@ -1149,8 +1149,18 @@ def list_factor_mining_proposals(job_id: str, limit: int = 50, offset: int = 0) 
 
 
 @_tool
-def cancel_factor_mining_job(job_id: str, idempotency_key: str) -> Any:
-    """Cancel one of the tenant's factor-mining jobs."""
+def cancel_factor_mining_job(
+    job_id: str,
+    idempotency_key: str = "",
+    confirm_cancel: bool = False,
+) -> Any:
+    """Cancel one of the tenant's factor-mining jobs (requires confirmation)."""
+    if not confirm_cancel:
+        return {
+            "error": True,
+            "status": 400,
+            "body": {"message": "Re-call with confirm_cancel=true after explicit user approval."},
+        }
     return _post(
         f"/api/agent/v1/factor-mining/jobs/{job_id}/cancel",
         headers=_idempotency_headers(idempotency_key),

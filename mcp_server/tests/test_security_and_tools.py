@@ -339,6 +339,35 @@ def test_source_restore_and_paper_cancel_require_confirmation(fresh_module):
     assert fresh_module.cancel_open_paper_orders()["error"] is True
 
 
+def test_cancel_factor_mining_job_requires_confirmation(monkeypatch, fresh_module):
+    monkeypatch.setattr(
+        fresh_module,
+        "_post",
+        lambda *a, **k: pytest.fail("unconfirmed cancel reached gateway"),
+    )
+    out = fresh_module.cancel_factor_mining_job("job-1", "cancel-1")
+    assert out["error"] is True
+    assert out["status"] == 400
+    assert "confirm_cancel=true" in out["body"]["message"]
+
+
+def test_cancel_factor_mining_job_posts_with_idempotency_key(monkeypatch, fresh_module):
+    captured = {}
+
+    def fake_post(path, json=None, headers=None):
+        captured.update(path=path, json=json, headers=headers)
+        return {"status": "cancelled"}
+
+    monkeypatch.setattr(fresh_module, "_post", fake_post)
+    out = fresh_module.cancel_factor_mining_job("job-1", "cancel-1", confirm_cancel=True)
+    assert out == {"status": "cancelled"}
+    assert captured == {
+        "path": "/api/agent/v1/factor-mining/jobs/job-1/cancel",
+        "json": None,
+        "headers": {"Idempotency-Key": "cancel-1"},
+    }
+
+
 def test_parse_sse_chunk():
     from quantdinger_mcp.security import parse_sse_chunk
 
