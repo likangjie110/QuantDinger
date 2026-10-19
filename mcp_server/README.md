@@ -34,11 +34,14 @@ Never place an agent token in prompts, logs, screenshots, source control, or MCP
 
 ## Tool surface
 
+The nine factor-mining tools are in the repository head (67 tools total); PyPI `0.6.2` still exposes 58.
+
 | Tool group | Scope | Purpose |
 |---|---:|---|
 | `whoami`, `check_health` | R/public | Identity, allowlists, and liveness |
 | `list_markets`, `search_symbols`, `get_klines`, `get_price` | R | Market discovery and data |
 | Universe and factor tools | R | Point-in-time research inputs |
+| Factor mining tools | R/B | Mining catalog, estimates, runs, and candidate library |
 | `list_watchlist`, `add_watchlist`, `remove_watchlist` | R/W | Watchlist workspace |
 | Indicator authoring, validation, save, link, and read tools | R/W | Chart-only indicators |
 | `list_strategy_templates`, `compile_strategy_code` | R | Strategy API V2 templates and manifest compilation |
