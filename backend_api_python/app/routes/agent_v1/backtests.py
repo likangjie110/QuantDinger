@@ -11,8 +11,7 @@ from typing import Any
 from app.services.strategy_v2 import StrategyV2BacktestService
 from app.services.billing_service import BillingError
 from app.utils.agent_auth import (
-    SCOPE_B, agent_required, current_token, current_user_id,
-    instrument_allowed, market_allowed, with_idempotency,
+    SCOPE_B, agent_required, current_token, current_user_id, with_idempotency,
 )
 from app.utils.agent_jobs import _job_receipt, count_active_jobs, submit_job
 from app.utils.logger import get_logger
@@ -20,7 +19,7 @@ from flask import request
 
 from . import agent_v1_bp
 from ._helpers import envelope, error, get_json_or_400
-from ._security import assert_indicator_code_size
+from ._security import assert_indicator_code_size, manifest_allowlist_error
 
 logger = get_logger(__name__)
 _backtest = StrategyV2BacktestService()
@@ -29,11 +28,6 @@ _BACKTEST_FIELDS = {
     "leverageEnabled", "leverage", "params",
     "instrumentRulesSnapshotId",
 }
-
-
-def _token_has_restricted_allowlist(field: str) -> bool:
-    raw = str(current_token().get(field) or "*").strip()
-    return raw not in {"", "*"}
 
 
 def _validate_request(body: dict) -> tuple[Any, Any]:
@@ -71,46 +65,12 @@ def _validate_request(body: dict) -> tuple[Any, Any]:
         from app.services.strategy_v2 import compile_strategy_v2
 
         program = compile_strategy_v2(code)
-        manifest = program.manifest
-        metadata = manifest.metadata()
     except Exception as exc:
         return None, error(400, str(exc), http=400)
 
-    for market in manifest.markets:
-        if not market_allowed(market):
-            return None, error(403, f"Market not allowed: {market}", http=403)
-
-    instruments: list[dict] = list((metadata.get("universe") or {}).get("instruments") or [])
-    for subscription in metadata.get("subscriptions") or []:
-        instruments.extend(subscription.get("instruments") or [])
-    if isinstance(metadata.get("benchmark"), dict):
-        instruments.append(metadata["benchmark"])
-
-    seen: set[tuple[str, str]] = set()
-    for instrument in instruments:
-        market = str(instrument.get("market") or "")
-        symbol = str(instrument.get("symbol") or "")
-        key = (market, symbol)
-        if key in seen:
-            continue
-        seen.add(key)
-        if market and not market_allowed(market):
-            return None, error(403, f"Market not allowed: {market}", http=403)
-        if symbol and not instrument_allowed(symbol):
-            return None, error(403, f"Instrument not allowed: {symbol}", http=403)
-
-    universe = metadata.get("universe") or {}
-    dynamic_references = [str(universe.get("reference") or "").strip()]
-    dynamic_references.extend(
-        str(item.get("universeReference") or "").strip()
-        for item in metadata.get("subscriptions") or []
-    )
-    if any(dynamic_references) and _token_has_restricted_allowlist("instruments"):
-        return None, error(
-            403,
-            "Dynamic universes require an unrestricted instrument allowlist",
-            http=403,
-        )
+    reason = manifest_allowlist_error(program.manifest)
+    if reason:
+        return None, error(403, reason, http=403)
 
     return program, None
 

@@ -1,5 +1,7 @@
 """Agent Gateway factor-mining surface: same service, agent envelope and scopes."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from app.routes.agent_v1 import factor_mining as route
@@ -145,6 +147,75 @@ def test_submit_surfaces_the_service_key_as_400(client, service):
     assert response.get_json()["message"] == "factorMining.sourceRequired"
 
 
+def test_submit_rejects_a_market_outside_the_token_allowlist(client, service, _authorized):
+    stub = service(submit={"jobId": "job-1", "status": "queued"})
+    _authorized["markets"] = "Crypto"
+    response = client.post(
+        "/api/agent/v1/factor-mining/jobs",
+        headers=_headers("submit-allowlist"),
+        json={"sourceId": 1, "market": "USStock",
+              "startDate": "2023-01-01", "endDate": "2023-12-31"},
+    )
+    assert response.status_code == 403
+    assert "Market not allowed" in response.get_json()["message"]
+    assert "submit" not in stub.calls
+
+
+def test_submit_rejects_a_source_manifest_outside_the_token_allowlist(
+    client, service, _authorized, monkeypatch,
+):
+    stub = service(submit={"jobId": "job-1", "status": "queued"})
+    _authorized["instruments"] = "MSFT"
+
+    class _Manifest:
+        markets = ("USStock",)
+
+        @staticmethod
+        def metadata():
+            return {"universe": {"instruments": [{"market": "USStock", "symbol": "AAPL"}]}}
+
+    monkeypatch.setattr(route, "get_script_source_service", lambda: SimpleNamespace(
+        get_source=lambda source_id, user_id=None: {"code": "print('x')"},
+    ))
+    monkeypatch.setattr(
+        route, "compile_strategy_v2",
+        lambda code: SimpleNamespace(manifest=_Manifest()),
+    )
+    response = client.post(
+        "/api/agent/v1/factor-mining/jobs",
+        headers=_headers("submit-manifest-allowlist"),
+        json={"sourceId": 1, "market": "USStock",
+              "startDate": "2023-01-01", "endDate": "2023-12-31"},
+    )
+    assert response.status_code == 403
+    assert response.get_json()["message"] == "Instrument not allowed: AAPL"
+    assert "submit" not in stub.calls
+
+
+def test_replay_rejects_a_market_outside_the_token_allowlist(client, service, _authorized):
+    stub = service(get_job={"jobId": "old", "config": {"sourceId": 1, "market": "USStock"}})
+    _authorized["markets"] = "Crypto"
+    response = client.post(
+        "/api/agent/v1/factor-mining/jobs",
+        headers=_headers("replay-allowlist"),
+        json={"searchMode": "ai", "replayJobId": "old"},
+    )
+    assert response.status_code == 403
+    assert "submit" not in stub.calls
+
+
+def test_replay_with_an_unrestricted_token_skips_the_allowlist_lookup(client, service):
+    stub = service(submit={"jobId": "job-1", "status": "queued"})
+    response = client.post(
+        "/api/agent/v1/factor-mining/jobs",
+        headers=_headers("replay-unrestricted"),
+        json={"searchMode": "ai", "replayJobId": "old"},
+    )
+    assert response.status_code == 202
+    assert "get_job" not in stub.calls
+    assert "submit" in stub.calls
+
+
 def test_list_jobs_delegates_to_the_service_sweep_path(client, service):
     stub = service(list_jobs=[{"jobId": "job-1", "status": "succeeded"}])
     response = client.get(
@@ -207,6 +278,15 @@ def test_cancel_requires_b_scope(client, service, _authorized):
     )
     assert response.status_code == 403
     assert "cancel_job" not in stub.calls
+
+
+def test_cancel_returns_409_for_a_terminal_job(client, service):
+    service(cancel_job={"jobId": "job-1", "status": "succeeded"})
+    response = client.post(
+        "/api/agent/v1/factor-mining/jobs/job-1/cancel",
+        headers=_headers("cancel-terminal"),
+    )
+    assert response.status_code == 409
 
 
 def test_candidates_forward_filters_and_reject_a_non_integer_run_id(client, service):

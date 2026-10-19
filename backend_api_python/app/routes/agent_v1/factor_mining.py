@@ -6,10 +6,15 @@ from flask import g, request
 from app.routes.factor_mining import RUN_FIELDS
 from app.services.factor_mining import dsl, templates
 from app.services.factor_mining.service import get_factor_mining_service
-from app.utils.agent_auth import SCOPE_B, SCOPE_R, agent_required, current_user_id
+from app.services.script_source import get_script_source_service
+from app.services.strategy_v2.contract import compile_strategy_v2
+from app.utils.agent_auth import (
+    SCOPE_B, SCOPE_R, agent_required, current_user_id, market_allowed,
+)
 
 from . import agent_v1_bp
 from ._helpers import clip_int, envelope, error, get_json_or_400
+from ._security import manifest_allowlist_error, token_has_restricted_allowlist
 
 
 def _run_payload() -> dict:
@@ -17,6 +22,46 @@ def _run_payload() -> dict:
     if not isinstance(body, dict):
         return {}
     return {key: value for key, value in body.items() if key in RUN_FIELDS}
+
+
+def _effective_run_payload(service, payload: dict, user_id: int) -> dict:
+    """The config a replay actually runs with: the recorded run's own config."""
+    replay_id = str(payload.get("replayJobId") or "").strip()
+    if not replay_id:
+        return payload
+    original = service.get_job(replay_id, user_id=user_id)
+    config = (original or {}).get("config") or {}
+    return dict(config) if config else payload
+
+
+def _allowlist_rejection(payload: dict, user_id: int):
+    """403 when a restricted token asks outside its market/instrument allowlist."""
+    if not (
+        token_has_restricted_allowlist("markets")
+        or token_has_restricted_allowlist("instruments")
+    ):
+        return None
+    market = str(payload.get("market") or "")
+    if market and not market_allowed(market):
+        return error(403, f"Market not allowed: {market}", http=403)
+    try:
+        source_id = int(payload.get("sourceId") or 0)
+    except (TypeError, ValueError):
+        return None
+    if source_id <= 0:
+        return None
+    source = get_script_source_service().get_source(source_id, user_id=user_id)
+    code = str((source or {}).get("code") or "")
+    if not code:
+        return None
+    try:
+        program = compile_strategy_v2(code)
+    except Exception as exc:
+        return error(400, str(exc), http=400)
+    reason = manifest_allowlist_error(program.manifest)
+    if reason:
+        return error(403, reason, http=403)
+    return None
 
 
 @agent_v1_bp.route("/factor-mining/catalog", methods=["GET"])
@@ -44,10 +89,26 @@ def estimate_factor_mining():
 @agent_v1_bp.route("/factor-mining/jobs", methods=["POST"])
 @agent_required(SCOPE_B)
 def submit_factor_mining_job():
+    body, err = get_json_or_400()
+    if err:
+        return err
+    payload = {key: value for key, value in body.items() if key in RUN_FIELDS}
+    service = get_factor_mining_service()
+    user_id = current_user_id()
+    rejection = None
+    if (
+        token_has_restricted_allowlist("markets")
+        or token_has_restricted_allowlist("instruments")
+    ):
+        rejection = _allowlist_rejection(
+            _effective_run_payload(service, payload, user_id), user_id,
+        )
+    if rejection:
+        return rejection
     try:
-        data = get_factor_mining_service().submit(
-            user_id=current_user_id(),
-            payload=_run_payload(),
+        data = service.submit(
+            user_id=user_id,
+            payload=payload,
             agent_token_id=int(g.agent_token["id"]),
         )
     except ValueError as exc:
@@ -79,6 +140,8 @@ def cancel_factor_mining_job(job_id: str):
     job = get_factor_mining_service().cancel_job(job_id, user_id=current_user_id())
     if job is None:
         return error(404, "factorMining.jobNotFound", http=404)
+    if job.get("status") != "cancelled":
+        return error(409, f"Job is already {job.get('status')}", http=409)
     return envelope(job, message="cancelled")
 
 

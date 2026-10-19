@@ -1,7 +1,9 @@
-"""Agent Gateway security helpers for secret redaction and payload bounds."""
+"""Agent Gateway security helpers for secret redaction, payload bounds, and allowlists."""
 from __future__ import annotations
 
 from typing import Any, Mapping, MutableMapping
+
+from app.utils.agent_auth import current_token, instrument_allowed, market_allowed
 
 # Upper bound for indicator Python source accepted via agent/MCP paths.
 MAX_SOURCE_CODE_BYTES = 512 * 1024
@@ -31,6 +33,45 @@ def assert_strategy_code_size(code: str) -> None:
         raise ValueError(
             f"Strategy code exceeds {MAX_SOURCE_CODE_BYTES // 1024} KiB limit"
         )
+
+
+def token_has_restricted_allowlist(field: str) -> bool:
+    raw = str(current_token().get(field) or "*").strip()
+    return raw not in {"", "*"}
+
+
+def manifest_allowlist_error(manifest) -> str | None:
+    """The first allowlist violation in a compiled strategy manifest, or None."""
+    metadata = manifest.metadata()
+    for market in manifest.markets:
+        if not market_allowed(market):
+            return f"Market not allowed: {market}"
+    instruments: list[dict] = list((metadata.get("universe") or {}).get("instruments") or [])
+    for subscription in metadata.get("subscriptions") or []:
+        instruments.extend(subscription.get("instruments") or [])
+    if isinstance(metadata.get("benchmark"), dict):
+        instruments.append(metadata["benchmark"])
+    seen: set[tuple[str, str]] = set()
+    for instrument in instruments:
+        market = str(instrument.get("market") or "")
+        symbol = str(instrument.get("symbol") or "")
+        key = (market, symbol)
+        if key in seen:
+            continue
+        seen.add(key)
+        if market and not market_allowed(market):
+            return f"Market not allowed: {market}"
+        if symbol and not instrument_allowed(symbol):
+            return f"Instrument not allowed: {symbol}"
+    universe = metadata.get("universe") or {}
+    dynamic_references = [str(universe.get("reference") or "").strip()]
+    dynamic_references.extend(
+        str(item.get("universeReference") or "").strip()
+        for item in metadata.get("subscriptions") or []
+    )
+    if any(dynamic_references) and token_has_restricted_allowlist("instruments"):
+        return "Dynamic universes require an unrestricted instrument allowlist"
+    return None
 
 
 def redact_secrets(value: Any, *, depth: int = 0, max_depth: int = 6) -> Any:
