@@ -1,10 +1,11 @@
 """AI factor proposals: prompt assembly, response parsing, and failure feedback.
 
-A proposal round is one model call whose answer becomes candidate expressions. This module
-owns the three pure steps around that call: the prompt the model reads, the JSON it must
-answer with, and the structured summary of what the previous round rejected. :class:`LLMProposer`
-is the thin adapter that performs the call over an injected service; the pure steps read no
-clock and touch no database -- the proposal source passes them text and outcomes.
+A proposal round is at most two model calls (one retry) whose answer becomes candidate
+expressions. This module owns the three pure steps around those calls: the prompt the model
+reads, the JSON it must answer with, and the structured summary of what the previous round
+rejected. :class:`LLMProposer` is the thin adapter that performs the call over an injected
+service; the pure steps read no clock and touch no database -- the proposal source passes them
+text and outcomes.
 
 Trust boundary: research notes, historical failures, and previous feedback are written by
 users or by earlier runs, so the system prompt declares them data and the user prompt wraps
@@ -50,7 +51,9 @@ MAX_HISTORY_RUNS = 5
 HYPOTHESIS_MAX_CHARS = 500
 
 _NOTES_OPEN = "<research_notes>\n"
-_NOTES_CLOSE = "\n</research_notes>"
+_NOTES_CLOSE_TAG = "</research_notes>"
+_NOTES_CLOSE = "\n" + _NOTES_CLOSE_TAG
+_ESCAPED_NOTES_CLOSE = "&lt;/research_notes&gt;"
 _TAIL = "Return the JSON object now."
 
 # One English sentence per field the DSL can admit. The prompt lists only the fields the run's
@@ -81,6 +84,7 @@ class ProposalContext:
     budget: int
     rounds: int
     proposals_per_round: int
+    holding_period: int
     research_notes: str
     fields: tuple[str, ...]
     thresholds: Mapping[str, Any]
@@ -171,6 +175,7 @@ def _run_parameters(context: ProposalContext, round_no: int) -> str:
         f"- timeframe: {context.timeframe}\n"
         f"- data range: {context.start_date.strftime('%Y-%m-%d')} to "
         f"{context.end_date.strftime('%Y-%m-%d')}\n"
+        f"- holding period: {int(context.holding_period)} bars\n"
         f"- candidate budget: {int(context.budget)}\n"
         f"- proposals this round: up to {int(context.proposals_per_round)}"
     )
@@ -259,9 +264,10 @@ def build_prompts(
 ) -> tuple[str, str]:
     """The system and user messages for one round, at most :data:`PROMPT_MAX_CHARS` together.
 
-    When space runs out the cross-run history goes first, then template examples; research
-    notes shrink only after both are gone, and the system constraints plus the field/operator
-    catalogue are never truncated.
+    When space runs out the research notes are shortened first and the feedback block is dropped
+    next; the remaining room then goes to template examples before the cross-run history, so the
+    history is the first optional block to disappear entirely. The system constraints and the
+    run parameters, field and operator catalogues are never truncated.
     """
     system = _system_prompt(context)
     budget = PROMPT_MAX_CHARS - len(system) - len(_TAIL) - 2
@@ -275,6 +281,9 @@ def build_prompts(
         )
     fixed = _join([params_section, feedback_section])
     notes = str(context.research_notes or "")[:RESEARCH_NOTES_MAX_CHARS]
+    # Escaped before the length bookkeeping below: a note carrying the closing tag must not end
+    # the data block early, and its escaped form is the length the prompt budget actually spends.
+    notes = notes.replace(_NOTES_CLOSE_TAG, _ESCAPED_NOTES_CLOSE)
     notes_section = _notes_section(notes)
 
     required = _join([fixed, notes_section])
@@ -515,15 +524,19 @@ class LLMProposer:
         self._timeout_seconds = timeout_seconds
 
     def __call__(self, system_prompt: str, user_prompt: str) -> ProposalBatch:
-        if not self._service.is_configured():
-            raise ProposalGenerationError()
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
         try:
+            # Both calls are the adapter's trust boundary: a provider that raises while being
+            # asked whether it is configured fails the round like any other transport failure.
+            if not self._service.is_configured():
+                raise ProposalGenerationError()
             text = self._service.call_llm_api(
                 messages, use_json_mode=True, timeout_seconds=self._timeout_seconds)
+        except ProposalGenerationError:
+            raise
         except Exception as exc:
             raise ProposalGenerationError() from exc
         return ProposalBatch(
@@ -572,6 +585,7 @@ class ProposalSource:
         self._last_feedback: dict[str, Any] | None = None
         self._open_rounds: list[tuple[int, list[dict[str, Any]]]] = []
         self._rounds = 0
+        self._evaluated_rounds: set[int] = set()
         self._proposals = 0
         self._l1_rejected = 0
         self._duplicates = 0
@@ -593,14 +607,17 @@ class ProposalSource:
         """What this run's proposal rounds did, for the job result.
 
         Counts are this run's own rows. ``rounds`` is how many rounds actually ran (a round with
-        no valid proposal ends the stream early); model identity is the last answering batch, so
-        a replay -- which calls no model -- reports empty strings. The notes are hashed, never
-        copied into the summary.
+        no valid proposal ends the stream early); a replay reports the recorded rounds that
+        reached at least one evaluation instead, because a recorded round whose rows were all
+        rejected at L1 never ran here. Model identity is the last answering batch, so a replay --
+        which calls no model -- reports empty strings. The notes are hashed, never copied into
+        the summary.
         """
         notes = str(self._context.research_notes or "")
+        replay = bool(self._context.replay or self._context.replay_of)
         return {
             "enabled": True,
-            "rounds": self._rounds,
+            "rounds": len(self._evaluated_rounds) if replay else self._rounds,
             "proposals": self._proposals,
             "l1Rejected": self._l1_rejected,
             "duplicates": self._duplicates,
@@ -836,6 +853,7 @@ class ProposalSource:
             thresholds=self._context.thresholds,
         )
         if evaluated:
+            self._evaluated_rounds.add(int(round_no))
             self._repository.update_proposal_status(
                 self._context.run_id,
                 user_id=self._context.user_id,

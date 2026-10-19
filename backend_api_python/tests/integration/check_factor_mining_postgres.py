@@ -1,9 +1,9 @@
 """Opt-in factor mining integration checks against an isolated PostgreSQL schema.
 
-Requires DATABASE_URL. The migration under test is applied to a uniquely named schema that also
-holds a stub ``qd_users`` table the migration's foreign keys need; the table names keep their
-``qd_`` prefix, because only the schema they land in is the test's. Application tables are never
-touched and the schema is dropped in ``finally``.
+Requires DATABASE_URL. The migrations under test (v1 then the v3 additions) are applied to a
+uniquely named schema that also holds a stub ``qd_users`` table the migrations' foreign keys
+need; the table names keep their ``qd_`` prefix, because only the schema they land in is the
+test's. Application tables are never touched and the schema is dropped in ``finally``.
 
 Run from ``backend_api_python/``:
 
@@ -24,18 +24,29 @@ from psycopg2.extras import RealDictCursor
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
-MIGRATION = BACKEND_ROOT / "migrations" / "20261013_factor_mining.sql"
+MIGRATIONS = (
+    BACKEND_ROOT / "migrations" / "20261013_factor_mining.sql",
+    BACKEND_ROOT / "migrations" / "20261018_factor_mining_v3.sql",
+)
 # The repository modules import as ``app.*``, which only resolves with the backend root on the
 # path. The other release checks assume a caller-provided PYTHONPATH instead.
 sys.path.insert(0, str(BACKEND_ROOT))
 
-TABLES = ("qd_factor_mining_runs", "qd_factor_candidates", "qd_factor_trials")
+TABLES = (
+    "qd_factor_mining_runs",
+    "qd_factor_candidates",
+    "qd_factor_trials",
+    "qd_factor_proposals",
+)
 INDEXES = (
     "idx_factor_mining_runs_user_id",
     "idx_factor_candidates_user_id",
     "idx_factor_candidates_user_hash",
     "idx_factor_candidates_user_status",
     "idx_factor_trials_run_stage",
+    "idx_factor_proposals_user_run",
+    "idx_factor_proposals_user_hash",
+    "idx_factor_mining_runs_user_job",
 )
 
 
@@ -57,7 +68,7 @@ def main():
 
     storage = candidate("app.services.factor_mining.storage")
     cursor_type = candidate("app.utils.db_postgres").PostgresCursor
-    migration = MIGRATION.read_text(encoding="utf-8")
+    migration = "\n".join(path.read_text(encoding="utf-8") for path in MIGRATIONS)
     schema = "qd_factor_mining_test_" + uuid4().hex
     admin = psycopg2.connect(dsn)
     admin.autocommit = True
@@ -99,13 +110,13 @@ def main():
         passed.append(name)
         print("OK  " + name)
 
-    def run(user_id, budget=25):
+    def run(user_id, budget=25, job_id=""):
         """One run row through the repository, and its id."""
         return repository.persist_run(
             user_id=user_id,
             config={"market": "USStock", "timeframe": "1D", "budget": budget},
             source_id=7, source_name="factor mining check", snapshot_id="",
-            manifest={"name": "check"},
+            manifest={"name": "check"}, job_id=job_id,
         )
 
     def trial(stage, verdict, reason):
@@ -132,12 +143,37 @@ def main():
             "SELECT indexname FROM pg_indexes WHERE schemaname = %s", (schema,))}
         missing = [index for index in INDEXES if index not in present]
         assert not missing, f"missing indexes: {missing}"
+        assert scalar(
+            "SELECT COUNT(*) FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = 'qd_factor_mining_runs' "
+            "AND column_name = 'job_id'", (schema,)) == 1, \
+            "qd_factor_mining_runs.job_id is missing"
         print("    indexes in schema: " + ", ".join(sorted(present)))
         ok("schema_tables_and_indexes")
 
         # The ledger is written through the repository's own INSERT ... SELECT, so a trial's owner
         # comes from the run it belongs to rather than from the argument.
-        run_id = run(1)
+        job_id = "check-" + uuid4().hex
+        run_id = run(1, job_id=job_id)
+
+        # The v3 additions are read and written through the repository exactly as the service
+        # does: a proposal row round-trips, and the job id on the run is what maps a job to it.
+        proposal = {
+            "round": 1, "ordinal": 1, "expression": {"op": "close"},
+            "fingerprint": fingerprint, "hypothesis": "check", "model": "m", "provider": "p",
+            "promptHash": "a" * 64, "dslVersion": 1, "source": "llm",
+            "status": "proposed", "reason": "",
+        }
+        assert repository.save_proposals(run_id, user_id=1, proposals=[proposal]) == 1, \
+            "save_proposals did not attempt one row"
+        rows = repository.list_proposals(run_id, user_id=1)
+        assert len(rows) == 1, f"list_proposals read {len(rows)} rows"
+        assert rows[0]["expression"] == {"op": "close"}, "the expression did not round-trip"
+        assert repository.get_run_by_job_id(job_id, user_id=1)["id"] == run_id, \
+            "the job id does not map back to its run"
+        assert repository.get_run_by_job_id(job_id, user_id=2) is None, \
+            "a job id crossed tenants"
+        ok("proposal_rows_and_job_id_round_trip")
         written = repository.save_trials(run_id, user_id=1, trials=[
             trial("L1", "reject", "factorMining.reject.invalid"),
             trial("L5", "pass", ""),
@@ -172,6 +208,8 @@ def main():
         with admin.cursor() as cur:
             cur.execute(migration)
         assert repository.count_trials(run_id, user_id=1) == 2, "re-apply changed the ledger"
+        assert scalar("SELECT COUNT(*) FROM qd_factor_proposals") == 1, \
+            "re-apply changed the proposals"
         assert scalar("SELECT COUNT(*) FROM qd_factor_mining_runs") == 1, "re-apply lost the run"
         ok("migration_reapply_is_idempotent")
 

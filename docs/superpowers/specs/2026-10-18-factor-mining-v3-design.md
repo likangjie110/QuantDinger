@@ -157,10 +157,10 @@ CREATE INDEX IF NOT EXISTS idx_factor_proposals_user_hash
 | `aiRounds` | int | 2 | 1–3；仅 `ai` 模式允许 |
 | `aiProposalsPerRound` | int | 10 | 1–20；仅 `ai` 模式允许 |
 | `researchNotes` | string | `""` | ≤ 8000 字符；仅 `ai` 模式允许 |
-| `replayJobId` | string | `""` | 仅 `ai` 模式允许；原 run 必须是当前用户的 AI run |
+| `replayJobId` | string | `""` | 仅 `ai` 模式允许；原 run 必须是当前用户的 AI run，状态为 `success` 或 `failed`，且记录了至少一条提案 |
 
 - 非 `ai` 模式携带 AI 字段 → `factorMining.invalidParameter`。
-- `replayJobId` 与原 run 的 `dsl_version` 不一致 → `factorMining.aiReplayIncompatible`；原 run 不存在或不属于当前用户 → `factorMining.aiReplayNotFound`。
+- 原 run 不是 AI run、状态是 `cancelled` / `running`、没有记录提案，或与原 run 的 `dsl_version` 不一致 → `factorMining.aiReplayIncompatible`；原 run 不存在或不属于当前用户 → `factorMining.aiReplayNotFound`。`failed` 的 AI run 只要记录了提案就可重放：中途失败会丢弃已评估 trials（台账在搜索返回后才写），提案行仍在，重放会重新评估已记录提案。
 - 重放请求只需要 `searchMode="ai"` 与 `replayJobId`；若同时提供 `market/timeframe/startDate/endDate/budget/thresholds`，必须与原 run 的 `config_json` 一致，否则 `factorMining.aiReplayIncompatible`。评估配置与 `source_id` 一律取原 run。
 
 ### 7.2 `GET /api/factor-mining/jobs/<job_id>` 的 AI 摘要
@@ -268,7 +268,7 @@ CREATE INDEX IF NOT EXISTS idx_factor_proposals_user_hash
 
 ### 9.2 跨 run
 
-- 查询同一 `user_id` + `market` + `timeframe` 下最近 5 次已完成 run（排除当前 run）。
+- 查询同一 `user_id` + `market` + `timeframe` 下最近 5 次 `status='success'` 的 run（排除当前 run）。
 - 聚合 `qd_factor_trials` 的 stage/verdict/reason 计数，以及 `qd_factor_candidates` 中 `status != frozen` 的最近拒绝原因。
 - 最多附 10 条历史失败表达式与原因；不注入完整 trial 表。
 - 总字符数不超过 6000；按确定性顺序截断。
@@ -279,12 +279,14 @@ CREATE INDEX IF NOT EXISTS idx_factor_proposals_user_hash
 
 ## 10. 重放与确定性
 
-- `replayJobId` 解析到原 AI run；读取其 `qd_factor_proposals`（按 `round, ordinal`）。
+- `replayJobId` 解析到原 AI run（状态为 `success` 或 `failed`，且记录了至少一条提案）；读取其 `qd_factor_proposals`（按 `round, ordinal`）。
+- 非 AI run、无记录提案、`cancelled` / `running` → `aiReplayIncompatible`。
 - 新 run 复制提案行：`source="replay"`，保留 `model/provider/prompt_hash/hypothesis/expression`；重新执行 L1 校验，状态与拒绝原因按当前 DSL 重算。
 - 只有 `evaluated` 的提案进入候选流；`l1_rejected`/`duplicate` 不评估。
 - 新 run 使用原 run 的 `config_json`、`source_id`；重新抓取数据。
-- 若新 run 的 `snapshot_id` 与原 run 不同，摘要记 `snapshotChanged=true`；不承诺指标完全相同，但提案与 L1 结果应一致。
+- 若新 run 的 `snapshot_id` 与原 run 不同，摘要记 `snapshotChanged=true`；不承诺指标完全相同，但提案与 L1 结果应一致。原 run 的 `snapshot_id` 为空时不比较，记 `snapshotChanged=false`。
 - `dsl_version` 不同 → 拒绝重放（`aiReplayIncompatible`）。
+- 重放不调用模型、不查询跨 run 历史；AI 摘要的 `rounds` 记实际产生过评估的记录轮次数。
 - 新提案必须开新 run；不带 `replayJobId` 的 AI run 总是重新调用 LLM。
 
 ## 11. 限额、错误与成本
@@ -311,7 +313,7 @@ CREATE INDEX IF NOT EXISTS idx_factor_proposals_user_hash
 
 ## 12. 前端
 
-- 因子挖掘独立前端（`frontend-factor-mining/`）：搜索模式增加 `ai`；表单显示轮次、每轮条数、研究笔记（仅 ai 模式）。
+- 主产品前端（独立仓库 `frontend-vue`，Vue 2.7 + Ant Design Vue）：搜索模式增加 `ai`；表单显示轮次、每轮条数、研究笔记（仅 ai 模式）。
 - 作业详情：展示 AI 摘要（轮次、提案/拒绝/评估计数、模型、重放标记）与提案列表（消费新端点）。
 - i18n：新增键见 §7.4；中英文同步。
 - 不新增页面路由；在现有因子挖掘页面内扩展。
@@ -330,7 +332,7 @@ CREATE INDEX IF NOT EXISTS idx_factor_proposals_user_hash
 - `DSL_VERSION` 不变；既有候选/试验/指纹不受影响。
 - 新表是加法；旧 run 与候选读取路径不变。
 - `searchMode` 新增值：后端、前端、OpenAPI 与任何枚举消费方同步更新；未知模式仍按 `invalidParameter` 拒绝。
-- 作业时长：AI 模式最多 3 次 LLM 调用（每次 ≤60s），加上现有数据抓取/评估；worker 超时沿用现有配置，必要时在文档中提示。
+- 作业时长：AI 模式最多 6 次 LLM 调用（3 轮 × 2 次尝试，每次 ≤60s），加上现有数据抓取/评估；worker 超时沿用现有配置，必要时在文档中提示。
 - 日志：记录 run_id、round、proposal_count、l1_rejected、duplicate、model/provider、prompt_hash；不记录研究笔记原文与完整 prompt。
 - 数据保留：提案随 run 级联删除（`ON DELETE CASCADE`）；job request 的笔记随 job 存储保留。
 

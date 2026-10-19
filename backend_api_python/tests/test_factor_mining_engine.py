@@ -1803,6 +1803,22 @@ def test_the_ai_candidate_source_reads_scoped_history_and_returns_a_proposal_str
     assert hasattr(source, "ai_summary")
 
 
+def test_a_replay_candidate_source_reads_no_history():
+    """A replay has no model to read history, so the cross-run summary must not be queried."""
+    entries = ({"round": 1, "ordinal": 1,
+                "expression": {"op": "ts_pct_change", "args": ["close"], "params": {"n": 5}}},)
+    config = _config(search_mode=SEARCH_MODE_AI, replay_job_id="job-1")
+    repo = _FakeRepo()
+    source, _total = engine_module._candidate_source(
+        config, SEARCH_MODE_AI, lambda expression: None,
+        user_id=4, ai=_ai_options(run_id=9, repository=repo, replay_proposals=entries),
+        outcome=lambda fp: None,
+    )
+    assert list(source), "the recorded proposal was not replayed"
+    assert repo.history_calls == []
+    assert repo.saved and repo.saved[0][2][0]["source"] == "replay"
+
+
 def _payload(**overrides):
     base = {"market": "USStock", "timeframe": "1D", "startDate": "2024-01-01",
             "endDate": "2024-10-31", "sourceId": 1, "budget": 12, "seed": 3}
@@ -1928,11 +1944,13 @@ def test_ai_context_budget_is_the_effective_cap(monkeypatch):
 
     monkeypatch.setattr(engine_module, "ProposalSource", fake_source)
     source, total = engine_module._candidate_source(
-        _config(budget=2, ai_rounds=2, ai_proposals_per_round=5), SEARCH_MODE_AI,
+        _config(budget=2, ai_rounds=2, ai_proposals_per_round=5, holding_period=9),
+        SEARCH_MODE_AI,
         lambda expression: None, user_id=4, ai=_ai_options(),
         outcome=lambda fingerprint: None,
     )
     assert captured["context"].budget == 2
+    assert captured["context"].holding_period == 9
     assert total == 2
     assert list(source) == []
 

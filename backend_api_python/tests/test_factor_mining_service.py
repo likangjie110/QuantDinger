@@ -260,6 +260,9 @@ def _original_config():
     }
 
 
+_REPLAY_PROPOSAL = {"expression": {"op": "close"}, "status": "evaluated"}
+
+
 def _ai_run_result(snapshot_id: str = "b" * 64) -> dict:
     """A run record as the AI engine writes it: ``summary.ai`` present, snapshot settable."""
     return {**_run_result([], []), "summary": {
@@ -1147,6 +1150,7 @@ def test_replay_refuses_a_field_that_disagrees_with_the_record():
     service = _service()
     service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
                                               "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
     service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig", "budget": 20})
     assert service.jobs[-1]["request"]["budget"] == 20
     with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
@@ -1159,6 +1163,7 @@ def test_replay_compares_the_effective_thresholds_not_the_spelling():
     service = _service()
     service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
                                               "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
     original = GateThresholds.from_payload(_original_config()["thresholds"])
     service.submit(user_id=4, payload={
         "searchMode": "ai", "replayJobId": "orig",
@@ -1172,6 +1177,7 @@ def test_replay_refuses_thresholds_that_change_the_effective_bars():
     service = _service()
     service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
                                               "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
     original = GateThresholds.from_payload(_original_config()["thresholds"])
     with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
         service.submit(user_id=4, payload={
@@ -1185,16 +1191,52 @@ def test_replay_takes_uncompared_fields_from_the_record():
     service = _service()
     service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
                                               "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
     service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig",
                                        "seed": 999, "groups": 3})
     assert service.jobs[-1]["request"]["seed"] == 42
     assert service.jobs[-1]["request"]["groups"] == 5
 
 
-def test_replay_refuses_a_run_that_did_not_succeed():
+def test_replay_of_a_failed_ai_run_uses_the_proposals_it_recorded():
+    """A failed run kept its proposals but never wrote trials; replay re-evaluates them."""
     service = _service()
     service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
                                               "status": "failed"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
+    service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+    service.jobs[-1]["runner"](service.jobs[-1]["request"], None)
+    assert service.engine_calls[-1]["ai"].replay_proposals == (
+        service.repository.proposals[9][0],)
+
+
+@pytest.mark.parametrize("status", ["cancelled", "running"])
+def test_replay_refuses_a_run_that_never_finished(status):
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": status}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
+    with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
+        service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+
+
+@pytest.mark.parametrize("status", ["failed", "success"])
+def test_replay_refuses_a_run_that_recorded_no_proposals(status):
+    """Without proposal rows there is nothing to copy, whatever the run reached."""
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": status}
+    with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
+        service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+
+
+def test_replay_refuses_a_run_that_was_not_an_ai_run():
+    """A replay reproduces model proposals; another mode recorded none to reproduce."""
+    service = _service()
+    config = _original_config()
+    config["search_mode"] = "enumeration"
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": config, "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
     with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
         service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
 
@@ -1224,10 +1266,23 @@ def test_a_replay_records_the_run_it_copied_and_the_snapshot_drift(snapshot_id, 
     service = _service(run_result=_ai_run_result(snapshot_id))
     service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
                                               "snapshotId": "b" * 64, "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
     service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
     result = service.jobs[-1]["runner"](service.jobs[-1]["request"], None)
     assert result["summary"]["ai"]["replayOf"] == "orig"
     assert result["summary"]["ai"]["snapshotChanged"] is changed
+
+
+def test_a_replay_of_a_run_without_a_snapshot_reports_no_drift():
+    """A record with no fingerprint cannot say the data moved; comparing to '' would."""
+    service = _service(run_result=_ai_run_result("b" * 64))
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
+    service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+    result = service.jobs[-1]["runner"](service.jobs[-1]["request"], None)
+    assert result["summary"]["ai"]["replayOf"] == "orig"
+    assert result["summary"]["ai"]["snapshotChanged"] is False
 
 
 def test_the_replay_payload_covers_every_field_a_recorded_config_carries():

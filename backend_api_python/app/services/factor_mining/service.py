@@ -265,19 +265,28 @@ class FactorMiningService:
     def _replay_source(self, job_id: str, user_id: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """The run a replay copies and its proposal rows, or the key that refuses the replay.
 
-        The run has to be a finished success: replaying a failed run would copy a record whose
-        proposals were never fully evaluated, and the proposals have to be readable by the
-        current DSL. A row without a version is read as current -- every stored row carries one,
-        and a hand-built record cannot say otherwise.
+        Only an AI run can be replayed: a replay reproduces model proposals, and no other mode
+        recorded any. ``success`` and ``failed`` are both replayable -- a run that failed part-way
+        wrote proposals but no trials, so a replay is how its recorded material is evaluated
+        again -- while ``cancelled`` and ``running`` are not. A run with no proposals has nothing
+        to replay whatever its status. The proposals also have to be readable by the current DSL;
+        a row without a version is read as current -- every stored row carries one, and a
+        hand-built record cannot say otherwise.
         """
         run = self._repository.get_run_by_job_id(str(job_id), user_id=int(user_id))
         if not run:
             raise ValueError("factorMining.aiReplayNotFound")
-        if str(run.get("status") or "") != "success":
+        config = run.get("config")
+        config = config if isinstance(config, Mapping) else {}
+        if str(config.get("search_mode") or "") != SEARCH_MODE_AI:
+            raise ValueError("factorMining.aiReplayIncompatible")
+        if str(run.get("status") or "") not in ("success", "failed"):
             raise ValueError("factorMining.aiReplayIncompatible")
         proposals = self._repository.list_proposals(
             int(run["id"]), user_id=int(user_id), limit=_REPLAY_PROPOSAL_LIMIT, offset=0,
         )
+        if not proposals:
+            raise ValueError("factorMining.aiReplayIncompatible")
         for proposal in proposals:
             if int(proposal.get("dslVersion", DSL_VERSION)) != DSL_VERSION:
                 raise ValueError("factorMining.aiReplayIncompatible")
@@ -606,15 +615,18 @@ def _record_ai_summary(
 
     ``snapshotChanged`` compares the panel this run searched with the original run's recorded
     fingerprint. It is the reading a replay is for: the same proposals evaluated over different
-    data are a different result, and the summary has to say which of the two happened.
+    data are a different result, and the summary has to say which of the two happened. A run
+    recorded before the fingerprint was backfilled cannot answer, so an empty original snapshot
+    reports ``false`` rather than a comparison against nothing.
     """
     summary = search.get("summary")
     ai_summary = summary.get("ai") if isinstance(summary, Mapping) else None
     if not isinstance(ai_summary, dict):
         return
     ai_summary["replayOf"] = config.replay_job_id
+    original_snapshot = str((original or {}).get("snapshotId") or "")
     ai_summary["snapshotChanged"] = bool(
-        original and summary.get("snapshotId") != original.get("snapshotId")
+        original_snapshot and summary.get("snapshotId") != original_snapshot
     )
 
 

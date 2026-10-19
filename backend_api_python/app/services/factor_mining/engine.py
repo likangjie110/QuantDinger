@@ -1690,9 +1690,10 @@ def _candidate_source(
 
     AI is neither: the source is the proposal stream, whose history is this tenant's prior
     failures in the same market and timeframe (this run excluded), and whose length is the
-    smaller of the rounds times the proposals per round and the run's budget. ``outcome`` is
-    how a closed round reads this run's own verdicts -- the trials are written only after the
-    search returns, so the source cannot read them from the store.
+    smaller of the rounds times the proposals per round and the run's budget. A replay copies
+    recorded proposals instead, so it injects no history at all -- there is no model to read it.
+    ``outcome`` is how a closed round reads this run's own verdicts -- the trials are written only
+    after the search returns, so the source cannot read them from the store.
     """
     if search_mode == SEARCH_MODE_AI:
         if ai is None:
@@ -1700,6 +1701,7 @@ def _candidate_source(
         # The run's candidate budget caps what the proposal rounds may evaluate: the rounds and
         # proposals bound the source, the budget bounds the run.
         budget = min(config.ai_rounds * config.ai_proposals_per_round, config.budget)
+        replay = bool(ai.replay_proposals or config.replay_job_id)
         context = ProposalContext(
             user_id=user_id,
             run_id=ai.run_id,
@@ -1710,15 +1712,16 @@ def _candidate_source(
             budget=budget,
             rounds=config.ai_rounds,
             proposals_per_round=config.ai_proposals_per_round,
+            holding_period=config.holding_period,
             research_notes=ai.research_notes,
             fields=fields_for(config.market),
             thresholds=asdict(config.thresholds),
-            history=ai.repository.failure_summary(
+            history=({} if replay else ai.repository.failure_summary(
                 user_id=user_id,
                 market=config.market,
                 timeframe=config.timeframe,
                 exclude_run_id=ai.run_id,
-            ),
+            )),
             replay=ai.replay_proposals,
             replay_of=config.replay_job_id,
         )

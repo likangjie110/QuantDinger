@@ -296,17 +296,19 @@ symbol name is hashed too). It is a **fingerprint, not a replayable copy** -- v1
 and no market snapshot.
 
 **Warmup.** The fetch reaches back before the search start by an amount that depends on the search
-mode, because the two modes know different things about what they will evaluate. **Enumeration**
+mode, because each mode knows something different about what it will evaluate. **Enumeration**
 knows exactly: every candidate comes from a template, so the run measures them before it fetches --
 the same template selection, budget, and seed the search loop expands -- and asks for `max(40,
 min(504, longest lookback + 5))` bars, converted to calendar days. Budgeting the DSL's 504 ceiling
 instead would cost about 3.5x the provider history -- on a daily policy that is the difference
 between a one-year and a four-month searchable window. **Evolution** knows nothing of the kind: a
 crossover grafts an arbitrary subtree, with any window the DSL accepts, onto an arbitrary path, so
-it takes the ceiling (`MAX_LOOKBACK=504` bars ≈ 953 calendar days) instead. Where a market-data
-policy caps the fetched range, that ceiling gets the evolved run **refused outright** -- the shared
-backtest range check raises before a bar is requested, and the job fails with
-`strategyV2.backtestRangeLimit` -- rather than searched over a shorter window.
+it takes the ceiling (`MAX_LOOKBACK=504` bars ≈ 953 calendar days) instead. **AI** is in the same
+position for a different reason: the model writes the expression, so nothing before the call
+bounds its lookback; it takes the same ceiling, for the same reason and at the same cost. Where a
+market-data policy caps the fetched range, that ceiling gets an evolved or AI run **refused
+outright** -- the shared backtest range check raises before a bar is requested, and the job fails
+with `strategyV2.backtestRangeLimit` -- rather than searched over a shorter window.
 
 **Determinism and reproducibility.** The same panel plus the same run config -- every field of the
 request, `searchMode` included -- produces the same trials and the same candidates in the same
@@ -367,7 +369,9 @@ breeding settings and the AI fields included -- and still answers with **exactly
 `{templateCount, candidateBudget}`: two keys, and no echo of the mode, which the caller already
 knows because it is what it submitted. For an AI run `templateCount` is `0` and
 `candidateBudget` is `min(aiRounds * aiProposalsPerRound, budget)`: the AI stream is the whole
-search, and the run budget still caps it.
+search, and the run budget still caps it. `/estimate` does **not** resolve `replayJobId`: a replay
+request carries only the mode and the job id, so there is no run shape in it to price. To price a
+replay, send the recorded run's config without `replayJobId`.
 
 **Job receipt / job object** (one field set for both):
 
@@ -493,7 +497,8 @@ becomes the next round's `Previous round feedback`. It must read the engine, not
 run fetches the summary once before the first round from the caller's 5 most recent **successful**
 runs on the same market and timeframe -- stage/verdict/reason counts plus up to 10 failed
 expressions, capped at 6000 characters -- and every round's prompt carries it, space permitting.
-A replay calls no model and reads no history. Failed and cancelled runs are not used as history.
+A replay calls no model and injects no cross-run history -- the summary query is skipped entirely,
+not merely ignored. Failed and cancelled runs are not used as history.
 
 **What is stored.** `qd_factor_proposals` holds one row per proposal (`run_id`, `round`,
 `ordinal`, expression, hash, hypothesis, model, provider, prompt hash, DSL version, source,
@@ -512,8 +517,10 @@ only their hashes are.
  "replayOf": "", "snapshotChanged": false}
 ```
 
-`rounds` is the number of rounds actually run; `model` / `provider` identify the last answering
-batch (empty on a replay, which calls no model). Non-AI runs do not carry `summary.ai`.
+`rounds` is the number of rounds actually run; on a replay it counts the recorded rounds that
+reached at least one evaluation, because a recorded round whose rows were all rejected at L1 did
+not run here. `model` / `provider` identify the last answering batch (empty on a replay, which
+calls no model). Non-AI runs do not carry `summary.ai`.
 
 **Proposal endpoint.** `GET /api/factor-mining/jobs/<job_id>/proposals?limit=50&offset=0` returns
 `{"items": [...]}` sorted by `(round, ordinal)`; `limit` is clamped to 200. Each item is
@@ -522,20 +529,25 @@ provider, promptHash, dslVersion, source, createdAt}`. A running job returns the
 far (possibly none); an unknown job, another tenant's job, a non-mining job, or a job that has not
 opened its run all read as 404 `factorMining.jobNotFound`.
 
-**Replay.** `replayJobId` names one of the caller's own **successful** AI runs. A replay request
-needs only `searchMode="ai"` and `replayJobId`; the recorded run supplies the market, window,
-budget, source and AI bounds. A client may restate `market`, `timeframe`, `startDate`, `endDate`,
-`budget` or `thresholds`, but only with effective values equal to the record -- a disagreement is
+**Replay.** `replayJobId` names one of the caller's own **AI runs**: another mode recorded no
+proposals, so it cannot be replayed. The recorded run may be `success` or `failed`; `cancelled`
+and `running` are refused. A failed run is worth replaying precisely because its failure discarded
+the evaluated trials -- the ledger is written only after the search returns -- while its proposal
+rows survived; the replay re-evaluates every recorded proposal against the current panel. A run
+that recorded no proposals, whatever its status, has nothing to replay. A replay request needs
+only `searchMode="ai"` and `replayJobId`; the recorded run supplies the market, window, budget,
+source and AI bounds. A client may restate `market`, `timeframe`, `startDate`, `endDate`, `budget`
+or `thresholds`, but only with effective values equal to the record -- a disagreement is
 `factorMining.aiReplayIncompatible`. `researchNotes` may be supplied afresh for the audit record;
 it is not sent to a model. The replay copies the recorded proposals into a new run with
 `source = "replay"`, re-runs L1 against the current DSL (a `dslVersion` mismatch is
 `factorMining.aiReplayIncompatible`), and evaluates only the legal ones. The proposer is never
 called on this path. Because the panel is refetched, `snapshotChanged` says whether its
 fingerprint differs from the original run's: the proposals and their L1 statuses are reproduced,
-but the metrics are a new measurement. An unknown or other-tenant `replayJobId` is
-`factorMining.aiReplayNotFound`. A successful run with no recorded proposals (for example a
-non-AI run) has nothing to replay and fails the new job with
-`factorMining.aiNoValidProposals`.
+but the metrics are a new measurement. A run recorded without a snapshot fingerprint reports
+`snapshotChanged = false` -- it cannot say the data moved. An unknown or other-tenant
+`replayJobId` is `factorMining.aiReplayNotFound`. A non-AI run, a run with no recorded proposals,
+or a `cancelled` / `running` run is `factorMining.aiReplayIncompatible`.
 
 **Limits.**
 
@@ -672,7 +684,7 @@ backend can emit; the backend emits keys only and never renders copy.
 | `factorMining.aiProposalFailed` | The model call failed on transport or JSON after its one retry; proposals already written are kept |
 | `factorMining.aiNoValidProposals` | Every round of an AI run produced zero legal proposals |
 | `factorMining.aiReplayNotFound` | `replayJobId` names no job of the caller's, or one that is not a mining job |
-| `factorMining.aiReplayIncompatible` | The recorded run is not a successful run, its DSL version differs, or a restated run field disagrees with the record |
+| `factorMining.aiReplayIncompatible` | The recorded run is not an AI run, is `cancelled` or `running`, recorded no proposals, its DSL version differs, or a restated run field disagrees with the record |
 | `factorMining.runNotFound` | A write targeted a run that does not exist or is not the caller's |
 
 **Parameterized forms (3, so a consumer must not match on a bare key)**

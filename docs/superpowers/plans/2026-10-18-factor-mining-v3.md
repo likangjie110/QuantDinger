@@ -6,7 +6,7 @@
 
 **架构：** 新增 `app/services/factor_mining/proposals.py`（prompt、LLM 适配、提案源、反馈摘要），新增 `qd_factor_proposals` 表；引擎增加 AI 候选来源与内存 `outcome` 回调；服务层负责 AI 参数、重放与提案端点；前端新增模式选择与提案列表。不新增 job kind/进程角色，LLM 只在 mining worker 内调用。
 
-**技术栈：** Python 3.11、Flask、PostgreSQL（psycopg 风格 `get_db_connection`）、`LLMService`、pandas、pytest、Vue 3 + Element Plus。
+**技术栈：** Python 3.11、Flask、PostgreSQL（psycopg 风格 `get_db_connection`）、`LLMService`、pandas、pytest；主产品前端为独立仓库 `frontend-vue`（Vue 2.7 + Ant Design Vue）。
 
 **规格：** [`docs/superpowers/specs/2026-10-18-factor-mining-v3-design.md`](../specs/2026-10-18-factor-mining-v3-design.md)；上游 [`2026-10-13-factor-mining.md`](../specs/2026-10-13-factor-mining.md) §13 v3 行。
 
@@ -49,7 +49,7 @@
 - 创建 `backend_api_python/tests/test_factor_mining_proposals.py`：prompt/解析/反馈/提案源/重放。
 - 创建 `backend_api_python/tests/test_factor_mining_v3_migration.py`：迁移与 `init.sql` 一致性。
 - 修改 `backend_api_python/tests/test_factor_mining_storage.py`、`tests/test_factor_mining_engine.py`、`tests/test_factor_mining_service.py`、`tests/test_factor_mining_api.py`。
-- 修改 `frontend-factor-mining/src/components/SubmitJob.vue`、`JobDetail.vue`、`src/api/factorMining.js`、`src/i18n/zh-CN.js`。
+- 修改主产品前端（独立仓库 `frontend-vue`，Vue 2.7 + Ant Design Vue）：`src/views/factor-mining/components/SubmitJob.vue`、`JobList.vue`、`src/api/factor-mining.js`、`src/locales/factor-mining-overrides.js`；创建 `src/views/factor-mining/aiPayload.js` 与其单测。独立页 `frontend-factor-mining/` 保持原样。
 - 修改 `docs/product/FACTOR_MINING.md`、`FACTOR_MINING_CN.md`、`docs/superpowers/specs/2026-10-13-factor-mining.md`、`docs/api/openapi.yaml`。
 
 ---
