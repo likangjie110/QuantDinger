@@ -198,7 +198,7 @@
       "FactorMiningRunRequest": {
         "type": "object",
         "additionalProperties": false,
-        "description": "Normal runs require sourceId, market, startDate, and endDate. AI replay requires searchMode=\"ai\" and replayJobId instead.",
+        "description": "Normal runs require sourceId, market, startDate, and endDate.",
         "properties": {
           "sourceId": { "type": "integer", "minimum": 1 },
           "sourceName": { "type": "string" },
@@ -649,6 +649,7 @@
     "/api/agent/v1/factor-mining/jobs": {
       "post": {
         "summary": "Submit a factor mining run",
+        "description": "AI replay requires searchMode=\"ai\" and replayJobId instead of the run-shape fields.",
         "x-scope-class": "B",
         "parameters": [{ "in": "header", "name": "Idempotency-Key", "required": true, "schema": { "type": "string", "maxLength": 120 } }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/FactorMiningRunRequest" } } } },
