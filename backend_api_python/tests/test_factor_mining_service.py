@@ -9,12 +9,15 @@ integration check.
 """
 
 import copy
+from dataclasses import asdict, fields
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from app.services.factor_mining import service as mining_service
+from app.services.factor_mining.dsl import DSL_VERSION
 from app.services.factor_mining.engine import DEFAULT_SEED, MiningConfig, MiningDataProvider
+from app.services.factor_mining.gates import GateThresholds
 from app.services.factor_mining.service import FactorMiningService
 from app.services.factor_mining.templates import DEFAULT_BUDGET, expand_candidates
 from app.tasks import agent_jobs as celery_agent_jobs
@@ -84,6 +87,10 @@ class _Repository:
         self.trials = []
         self.candidates = []
         self.finished = []
+        # The job -> run lookup a replay and the proposals endpoint read, and the recorded
+        # proposals a replay copies. Keyed the way the real repository answers them.
+        self.runs_by_job = {}
+        self.proposals = {}
 
     def persist_run(self, **kwargs):
         self.trace.append("persist_run")
@@ -104,6 +111,13 @@ class _Repository:
         self.trace.append("finish_run")
         self.finished.append({"run_id": run_id, "user_id": user_id, "status": status,
                               "result": result, "error_message": error_message})
+
+    def get_run_by_job_id(self, job_id, *, user_id):
+        return self.runs_by_job.get(str(job_id))
+
+    def list_proposals(self, run_id, *, user_id, limit=50, offset=0):
+        rows = list(self.proposals.get(run_id, []))
+        return rows[offset:offset + limit]
 
 
 class _BacktestService:
@@ -131,11 +145,13 @@ class _Engine:
         self.search_modes = []
         self.survivors = None
         self.configs = []
+        self.calls = []
 
-    def run(self, *, user_id, code, config, search_mode=None):
+    def run(self, *, user_id, code, config, search_mode=None, ai=None):
         self.trace.append("engine.run")
         self.configs.append(config)
         self.search_modes.append(search_mode)
+        self.calls.append({"config": config, "search_mode": search_mode, "ai": ai})
         if self.error is not None:
             raise self.error
         return self.run_result
@@ -171,6 +187,94 @@ def _job_row(**overrides):
            "finished_at": datetime(2026, 1, 1, 0, 5)}
     row.update(overrides)
     return row
+
+
+class _Jobs:
+    """The job store's two submit-side calls, backed by the list the tests read as ``jobs``."""
+
+    def __init__(self):
+        self.jobs = []
+
+    def count_active_jobs(self, **_):
+        return 0
+
+    def submit_job(self, *, job_id=None, request_payload=None, runner=None, **kwargs):
+        self.jobs.append({
+            "job_id": job_id, "kind": kwargs.get("kind"), "status": "queued",
+            "request": dict(request_payload or {}), "runner": runner, "result": None,
+        })
+        return {"job_id": job_id, "status": "queued"}
+
+
+def _service(run_result=None):
+    """A service wired to in-memory collaborators for the AI and replay tests.
+
+    ``_restore_module_hooks`` puts back the two module hooks this patches -- the source lookup
+    and the job store -- so one helper can cover the submit and the runner in the same test.
+    ``proposer_factory`` hands over a proposer that refuses to be called: these tests either
+    inject no model call (replay, notes) or assert the wiring without running the stream.
+    """
+    repository = _Repository()
+    engine = _Engine(repository.trace,
+                     run_result=_run_result([], []) if run_result is None else run_result)
+    build, _ = _factory(repository.trace, engine)
+    jobs = _Jobs()
+    proposer = lambda system_prompt, user_prompt: pytest.fail("the model must not be called")
+    service = FactorMiningService(
+        engine_factory=build,
+        repository=repository,
+        proposer_factory=lambda: proposer,
+    )
+    service.jobs = jobs.jobs
+    service.repository = repository
+    service.engine_calls = engine.calls
+    mining_service.get_script_source_service = lambda: _SourceService(_SOURCE)
+    mining_service.agent_jobs.submit_job = jobs.submit_job
+    mining_service.agent_jobs.count_active_jobs = jobs.count_active_jobs
+    return service
+
+
+@pytest.fixture(autouse=True)
+def _restore_module_hooks():
+    """Undo whatever ``_service`` patched, after every test in this module."""
+    source = mining_service.get_script_source_service
+    submit_job = mining_service.agent_jobs.submit_job
+    count_active_jobs = mining_service.agent_jobs.count_active_jobs
+    yield
+    mining_service.get_script_source_service = source
+    mining_service.agent_jobs.submit_job = submit_job
+    mining_service.agent_jobs.count_active_jobs = count_active_jobs
+
+
+def _original_config():
+    """A stored run's config: the snake_case ``asdict`` shape ``persist_run`` writes."""
+    return {
+        "source_id": 3, "source_name": "US equity portfolio", "market": "USStock",
+        "timeframe": "1D", "start_date": "2024-01-01T00:00:00",
+        "end_date": "2024-10-31T23:59:59", "freeze_ratio": 0.3, "budget": 20, "seed": 42,
+        "template_ids": [], "groups": 5, "holding_period": 5, "commission": 0.0005,
+        "slippage": 0.0005, "neutralize_industry": False,
+        "thresholds": asdict(GateThresholds()), "search_mode": "ai", "population": 32,
+        "generations": 20, "elite_ratio": 0.25, "ai_rounds": 2,
+        "ai_proposals_per_round": 10, "replay_job_id": "",
+    }
+
+
+_REPLAY_PROPOSAL = {"expression": {"op": "close"}, "status": "evaluated"}
+
+
+def _ai_run_result(snapshot_id: str = "b" * 64) -> dict:
+    """A run record as the AI engine writes it: ``summary.ai`` present, snapshot settable."""
+    return {**_run_result([], []), "summary": {
+        **_run_result([], [])["summary"], "snapshotId": snapshot_id,
+        "ai": {"enabled": True, "replayOf": "", "snapshotChanged": False},
+    }}
+
+
+def _camel(name: str) -> str:
+    """``template_ids`` -> ``templateIds``: the spelling a run payload uses."""
+    head, *rest = name.split("_")
+    return head + "".join(part.title() for part in rest)
 
 
 # ─────────────────────────────── the job boundary ───────────────────────────────
@@ -242,7 +346,9 @@ def test_submit_strips_client_supplied_reserved_keys(monkeypatch):
         payload=_payload(**{"__billing": {"credits": 999}, "__userId": 99}),
     )
 
-    assert captured["request_payload"] == {**_payload(), "__userId": 4}
+    assert captured["request_payload"] == {**_payload(), "__userId": 4,
+                                           "__jobId": captured["job_id"]}
+    assert captured["job_id"]
 
 
 def test_get_job_speaks_the_camel_case_envelope(monkeypatch):
@@ -985,3 +1091,212 @@ def test_run_mining_job_shell_delegates_to_the_process_singleton(monkeypatch):
 
     assert mining_service.run_mining_job({"__userId": 17}, None) == {"ok": True}
     assert captured == {"payload": {"__userId": 17}, "on_progress": None}
+
+
+# ──────────────────────────── AI proposals and replay ────────────────────────────
+
+def test_ai_fields_are_refused_outside_ai_mode():
+    service = _service()
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        service.submit(user_id=4, payload=_payload(searchMode="enumeration", aiRounds=2))
+
+
+def test_research_notes_are_capped_and_not_in_the_public_config():
+    service = _service()
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        service.submit(user_id=4, payload=_payload(searchMode="ai", researchNotes="x" * 8001))
+    receipt = service.submit(user_id=4, payload=_payload(
+        searchMode="ai", researchNotes="secret note"))
+    assert "researchNotes" not in receipt["config"]
+    assert service.jobs[-1]["request"]["researchNotes"] == "secret note"
+
+
+def test_ai_run_passes_run_id_and_notes_to_the_engine():
+    service = _service()
+    service.submit(user_id=4, payload=_payload(searchMode="ai", researchNotes="note"))
+    service.jobs[-1]["runner"](service.jobs[-1]["request"], None)
+    assert service.engine_calls[-1]["ai"].run_id == RUN_ID
+    assert service.engine_calls[-1]["ai"].research_notes == "note"
+
+
+def test_replay_uses_the_original_config_and_proposals():
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "sourceId": 3, "snapshotId": "b" * 64,
+                                              "status": "success"}
+    service.repository.proposals[9] = [{"expression": {"op": "close"}, "status": "evaluated"}]
+    service.jobs.append({"job_id": "orig", "kind": "factor_mining", "status": "succeeded",
+                         "result": {"runId": 9}})
+    service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+    result = service.jobs[-1]["runner"](service.jobs[-1]["request"], None)
+    ai = service.engine_calls[-1]["ai"]
+    assert ai.replay_proposals == tuple(service.repository.proposals[9])
+    assert service.engine_calls[-1]["config"].ai_rounds == 2
+    # The replay opens its own run under its own job id: the proposal rows are keyed by
+    # ``(run_id, round, ordinal)``, so reusing the original run id would collide with them.
+    assert service.jobs[-1]["job_id"] != "orig"
+    assert service.repository.runs[0]["job_id"] == service.jobs[-1]["job_id"]
+    assert result["runId"] == RUN_ID
+
+
+def test_replay_of_an_unknown_job_is_refused_by_key():
+    service = _service()
+    with pytest.raises(ValueError, match="factorMining.aiReplayNotFound"):
+        service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "missing"})
+
+
+def test_replay_refuses_a_field_that_disagrees_with_the_record():
+    """A client value equal to the record is accepted; a different one is not silently replaced."""
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
+    service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig", "budget": 20})
+    assert service.jobs[-1]["request"]["budget"] == 20
+    with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
+        service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig",
+                                           "budget": 99})
+
+
+def test_replay_compares_the_effective_thresholds_not_the_spelling():
+    """A partial override equal to the record's bars is the same run, so the replay is legal."""
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
+    original = GateThresholds.from_payload(_original_config()["thresholds"])
+    service.submit(user_id=4, payload={
+        "searchMode": "ai", "replayJobId": "orig",
+        "thresholds": {"min_icir": original.min_icir},
+    })
+    # The record still wins the stored request: the client's spelling does not replace it.
+    assert service.jobs[-1]["request"]["thresholds"] == _original_config()["thresholds"]
+
+
+def test_replay_refuses_thresholds_that_change_the_effective_bars():
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
+    original = GateThresholds.from_payload(_original_config()["thresholds"])
+    with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
+        service.submit(user_id=4, payload={
+            "searchMode": "ai", "replayJobId": "orig",
+            "thresholds": {"min_icir": original.min_icir + 0.1},
+        })
+
+
+def test_replay_takes_uncompared_fields_from_the_record():
+    """Only the six run-shape fields are compared; anything else the record owns silently."""
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
+    service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig",
+                                       "seed": 999, "groups": 3})
+    assert service.jobs[-1]["request"]["seed"] == 42
+    assert service.jobs[-1]["request"]["groups"] == 5
+
+
+def test_replay_of_a_failed_ai_run_uses_the_proposals_it_recorded():
+    """A failed run kept its proposals but never wrote trials; replay re-evaluates them."""
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": "failed"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
+    service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+    service.jobs[-1]["runner"](service.jobs[-1]["request"], None)
+    assert service.engine_calls[-1]["ai"].replay_proposals == (
+        service.repository.proposals[9][0],)
+
+
+@pytest.mark.parametrize("status", ["cancelled", "running"])
+def test_replay_refuses_a_run_that_never_finished(status):
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": status}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
+    with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
+        service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+
+
+@pytest.mark.parametrize("status", ["failed", "success"])
+def test_replay_refuses_a_run_that_recorded_no_proposals(status):
+    """Without proposal rows there is nothing to copy, whatever the run reached."""
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": status}
+    with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
+        service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+
+
+def test_replay_refuses_a_run_that_was_not_an_ai_run():
+    """A replay reproduces model proposals; another mode recorded none to reproduce."""
+    service = _service()
+    config = _original_config()
+    config["search_mode"] = "enumeration"
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": config, "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
+    with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
+        service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+
+
+def test_replay_refuses_proposals_the_current_dsl_cannot_read():
+    service = _service()
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": "success"}
+    service.repository.proposals[9] = [
+        {"expression": {"op": "close"}, "dslVersion": DSL_VERSION + 1},
+    ]
+    with pytest.raises(ValueError, match="factorMining.aiReplayIncompatible"):
+        service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+
+
+def test_an_ai_run_records_that_it_replayed_nothing():
+    service = _service(run_result=_ai_run_result())
+    service.submit(user_id=4, payload=_payload(searchMode="ai"))
+    result = service.jobs[-1]["runner"](service.jobs[-1]["request"], None)
+    assert result["summary"]["ai"]["replayOf"] == ""
+    assert result["summary"]["ai"]["snapshotChanged"] is False
+
+
+@pytest.mark.parametrize("snapshot_id,changed", [("b" * 64, False), ("c" * 64, True)],
+                         ids=["same-data", "moved-data"])
+def test_a_replay_records_the_run_it_copied_and_the_snapshot_drift(snapshot_id, changed):
+    service = _service(run_result=_ai_run_result(snapshot_id))
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "snapshotId": "b" * 64, "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
+    service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+    result = service.jobs[-1]["runner"](service.jobs[-1]["request"], None)
+    assert result["summary"]["ai"]["replayOf"] == "orig"
+    assert result["summary"]["ai"]["snapshotChanged"] is changed
+
+
+def test_a_replay_of_a_run_without_a_snapshot_reports_no_drift():
+    """A record with no fingerprint cannot say the data moved; comparing to '' would."""
+    service = _service(run_result=_ai_run_result("b" * 64))
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": _original_config(),
+                                              "status": "success"}
+    service.repository.proposals[9] = [dict(_REPLAY_PROPOSAL)]
+    service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+    result = service.jobs[-1]["runner"](service.jobs[-1]["request"], None)
+    assert result["summary"]["ai"]["replayOf"] == "orig"
+    assert result["summary"]["ai"]["snapshotChanged"] is False
+
+
+def test_the_replay_payload_covers_every_field_a_recorded_config_carries():
+    """The hand-written replay list must not fall behind ``MiningConfig``.
+
+    ``searchMode`` and ``replayJobId`` are the replay's own; the evolution settings are the one
+    explicit exclusion, because a replay is an AI run and never breeds. Everything else a stored
+    config holds has to travel back into the replayed submission.
+    """
+    evolution_only = {"population", "generations", "eliteRatio"}
+    config_fields = {_camel(field.name) for field in fields(MiningConfig)}
+    assert set(mining_service._REPLAY_FIELDS) == config_fields - evolution_only - {
+        "searchMode", "replayJobId",
+    }
+    assert set(mining_service._REPLAY_CONFLICT_FIELDS) == {
+        "market", "timeframe", "startDate", "endDate", "budget", "thresholds",
+    }

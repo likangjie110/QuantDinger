@@ -86,6 +86,7 @@ def submit_job(
     request_payload: dict,
     runner: Callable[..., Any],
     idempotency_key: Optional[str] = None,
+    job_id: Optional[str] = None,
 ) -> dict:
     """Persist a job row and dispatch its runner on the thread pool.
 
@@ -96,8 +97,12 @@ def submit_job(
     where ``on_progress(dict)`` is called by the runner to publish partial
     results.  Each call is delivered to live SSE subscribers AND persisted on
     the job row so reconnecting clients can replay the latest snapshot.
+
+    ``job_id`` lets a caller name the job itself, so another record (a mining
+    run, for instance) can reference it before dispatch. An absent one is
+    generated here.
     """
-    job_id = _new_job_id()
+    job_id = job_id or _new_job_id()
     created_at = datetime.utcnow()
     request_payload = dict(request_payload)
     with get_db_connection() as db:

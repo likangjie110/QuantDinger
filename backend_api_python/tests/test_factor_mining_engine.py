@@ -30,6 +30,8 @@ from app.services.factor_mining import pool
 from app.services.factor_mining.dsl import MAX_LOOKBACK, fields_for
 from app.services.factor_mining.engine import (
     DEFAULT_BUILTIN_COMPARISON_LIMIT,
+    SEARCH_MODE_AI,
+    AISearchOptions,
     ComparisonSet,
     FactorMiningEngine,
     MiningConfig,
@@ -45,7 +47,7 @@ from app.services.factor_mining.engine import (
 )
 from app.services.factor_mining.evaluator import ExpressionEvaluator
 from app.services.factor_mining.gates import GateThresholds
-from app.services.factor_mining.templates import expand_candidates
+from app.services.factor_mining.templates import CandidateSeed, expand_candidates
 from app.services.strategy_v2.factor_research import FactorResearchEngine
 
 
@@ -1655,3 +1657,348 @@ def test_the_review_refuses_an_unknown_search_mode_too():
         with pytest.raises(ValueError, match="factorMining.invalidParameter"):
             engine.review_frozen(user_id=1, code="PORTFOLIO = {}", config=_config(),
                                  survivors=survivors, trials_count=1, search_mode="genetic")
+
+
+class _FakeRepo:
+    """The proposal store an AI run writes through. Tests that bypass ``_candidate_source``
+    never reach it; the ones that do read ``history_calls`` to see what the run asked for."""
+
+    def __init__(self):
+        self.history_calls: list[dict] = []
+        self.saved: list[tuple] = []
+        self.status_updates: list[dict] = []
+
+    def failure_summary(self, **kwargs):
+        self.history_calls.append(kwargs)
+        return {"runIds": [], "stageCounts": [], "recentFailures": []}
+
+    def save_proposals(self, run_id, *, user_id, proposals):
+        self.saved.append((run_id, user_id, proposals))
+
+    def update_proposal_status(self, run_id, *, user_id, round_no, ordinals, status):
+        self.status_updates.append({
+            "run_id": run_id, "user_id": user_id, "round_no": round_no,
+            "ordinals": tuple(ordinals), "status": status,
+        })
+
+
+@pytest.fixture
+def _engine_fixture():
+    frames, members = _fixture()
+    return FactorMiningEngine(data_provider=_FakeProvider(frames, members)), _config()
+
+
+def _ai_options(**overrides):
+    base = dict(run_id=9, research_notes="", proposer=None, repository=_FakeRepo(),
+                replay_proposals=())
+    base.update(overrides)
+    return AISearchOptions(**base)
+
+
+def test_ai_mode_requires_ai_options(_engine_fixture):
+    engine, config = _engine_fixture
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        engine.run(user_id=4, code="code", config=config, search_mode=SEARCH_MODE_AI)
+
+
+def test_non_ai_mode_refuses_ai_options(_engine_fixture):
+    engine, config = _engine_fixture
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        engine.run(user_id=4, code="code", config=config, ai=_ai_options())
+
+
+def test_ai_mode_uses_max_lookback_for_search_and_review():
+    assert _warmup_bars(_config(search_mode=SEARCH_MODE_AI), SEARCH_MODE_AI) == MAX_LOOKBACK
+
+
+def test_the_ai_review_warmup_travels_to_the_provider():
+    provider = _FakeProvider(*_fixture())
+    survivor = {"expression": _MOMENTUM_5, "fingerprint": "f" * 64, "origin": "ai",
+                "template_id": "", "status": "search", "reason": "",
+                "metrics": {}, "outOfSample": {}}
+    FactorMiningEngine(data_provider=provider).review_frozen(
+        user_id=1, code="PORTFOLIO = {}", config=_config(), survivors=[survivor],
+        trials_count=1, search_mode=SEARCH_MODE_AI,
+    )
+    assert provider.search_modes == [SEARCH_MODE_AI]
+
+
+def test_every_yielded_ai_seed_gets_a_trial(_engine_fixture, monkeypatch):
+    engine, config = _engine_fixture
+    calls = []
+
+    class _Source:
+        def __iter__(self):
+            yield CandidateSeed(
+                expression={"op": "ts_pct_change", "args": ["close"], "params": {"n": 5}},
+                fingerprint="a" * 64, template_id="", origin="ai", params={})
+
+        def finish(self):
+            pass
+
+        def ai_summary(self):
+            return {"enabled": True, "proposals": 1, "evaluated": 1}
+
+    monkeypatch.setattr(engine_module, "_candidate_source",
+                        lambda *a, **k: (_Source(), 1))
+    result = engine.run(
+        user_id=4, code="code", config=config, search_mode=SEARCH_MODE_AI,
+        ai=AISearchOptions(run_id=9, research_notes="", proposer=None,
+                           repository=_FakeRepo(), replay_proposals=()))
+    assert len(result["trials"]) == 1
+    assert result["summary"]["ai"]["enabled"] is True
+
+
+def test_a_seeds_outcome_is_complete_before_the_source_resumes(_engine_fixture, monkeypatch):
+    """The source closes a round when it is resumed, so the outcome must already be there.
+
+    Evaluating while iterating is what the second AI round's feedback is built from; a source
+    drained first would find every outcome missing and prompt the model with an empty round.
+    """
+    engine, config = _engine_fixture
+    seed = CandidateSeed(expression=_MOMENTUM_5, fingerprint="a" * 64, template_id="",
+                         origin="ai", params={})
+    captured: dict = {}
+    resumed: list = []
+
+    class _Source:
+        def __iter__(self):
+            captured["before"] = captured["outcome"](seed.fingerprint)
+            yield seed
+            resumed.append(captured["outcome"](seed.fingerprint))
+
+        def finish(self):
+            pass
+
+        def ai_summary(self):
+            return {"enabled": True}
+
+    def fake_source(*args, **kwargs):
+        captured["outcome"] = kwargs["outcome"]
+        return _Source(), 1
+
+    monkeypatch.setattr(engine_module, "_candidate_source", fake_source)
+    engine.run(user_id=4, code="code", config=config, search_mode=SEARCH_MODE_AI,
+               ai=_ai_options())
+
+    assert captured["before"] is None
+    outcome = resumed[0]
+    assert outcome["stage"] in ("L1", "L2", "L3", "L4")
+    assert outcome["verdict"] in ("pass", "reject")
+    assert isinstance(outcome["metrics"], dict)
+
+
+def test_the_ai_candidate_source_reads_scoped_history_and_returns_a_proposal_stream():
+    """The history is the tenant's own, this run excluded, and the total is the AI budget."""
+    config = _config(search_mode=SEARCH_MODE_AI, ai_rounds=3, ai_proposals_per_round=5,
+                     budget=20)
+    repo = _FakeRepo()
+    source, total = engine_module._candidate_source(
+        config, SEARCH_MODE_AI, lambda expression: None,
+        user_id=4, ai=_ai_options(run_id=9, repository=repo), outcome=lambda fp: None,
+    )
+    assert repo.history_calls == [{"user_id": 4, "market": "USStock", "timeframe": "1d",
+                                   "exclude_run_id": 9}]
+    assert total == 15
+    assert hasattr(source, "ai_summary")
+
+
+def test_a_replay_candidate_source_reads_no_history():
+    """A replay has no model to read history, so the cross-run summary must not be queried."""
+    entries = ({"round": 1, "ordinal": 1,
+                "expression": {"op": "ts_pct_change", "args": ["close"], "params": {"n": 5}}},)
+    config = _config(search_mode=SEARCH_MODE_AI, replay_job_id="job-1")
+    repo = _FakeRepo()
+    source, _total = engine_module._candidate_source(
+        config, SEARCH_MODE_AI, lambda expression: None,
+        user_id=4, ai=_ai_options(run_id=9, repository=repo, replay_proposals=entries),
+        outcome=lambda fp: None,
+    )
+    assert list(source), "the recorded proposal was not replayed"
+    assert repo.history_calls == []
+    assert repo.saved and repo.saved[0][2][0]["source"] == "replay"
+
+
+def _payload(**overrides):
+    base = {"market": "USStock", "timeframe": "1D", "startDate": "2024-01-01",
+            "endDate": "2024-10-31", "sourceId": 1, "budget": 12, "seed": 3}
+    base.update(overrides)
+    return base
+
+
+def _config_from(payload):
+    return MiningConfig.from_payload(payload, default_commission=0.0005,
+                                     default_slippage=0.0005)
+
+
+def test_ai_settings_are_refused_outside_ai_mode():
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        _config_from(_payload(aiRounds=2))
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        _config_from(_payload(aiProposalsPerRound=5))
+
+
+def test_ai_settings_default_and_bounds():
+    defaults = _config_from(_payload(searchMode="ai"))
+    assert (defaults.ai_rounds, defaults.ai_proposals_per_round) == (2, 10)
+    named = _config_from(_payload(searchMode="ai", aiRounds=3, aiProposalsPerRound=20,
+                                  replayJobId="job-1"))
+    assert (named.ai_rounds, named.ai_proposals_per_round, named.replay_job_id) == \
+        (3, 20, "job-1")
+    for bad in ({"aiRounds": 0}, {"aiRounds": 4}, {"aiProposalsPerRound": 0},
+                {"aiProposalsPerRound": 21}):
+        with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+            _config_from(_payload(searchMode="ai", **bad))
+
+
+def test_replay_is_refused_outside_ai_mode():
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        _config_from(_payload(replayJobId="job-1"))
+
+
+def test_ai_outcomes_keep_only_the_feedback_metrics(_engine_fixture, monkeypatch):
+    """The per-round outcome lives for the whole run, so it keeps only what feedback reads."""
+    engine, config = _engine_fixture
+    seed = CandidateSeed(expression=_MOMENTUM_5, fingerprint="a" * 64, template_id="",
+                         origin="ai", params={})
+    captured: dict = {}
+
+    class _Source:
+        def __iter__(self):
+            yield seed
+
+        def finish(self):
+            pass
+
+        def ai_summary(self):
+            return {"enabled": True}
+
+    def fake_source(*args, **kwargs):
+        captured.update(kwargs)
+        return _Source(), 1
+
+    monkeypatch.setattr(engine_module, "_candidate_source", fake_source)
+    result = engine.run(user_id=4, code="code", config=config, search_mode=SEARCH_MODE_AI,
+                        ai=_ai_options())
+
+    outcome = captured["outcome"](seed.fingerprint)
+    assert set(outcome) == {"stage", "verdict", "reason", "metrics"}
+    assert set(outcome["metrics"]) == {"rankIc", "icir"}
+    assert outcome["metrics"]["rankIc"] == result["trials"][0]["metrics"]["rankIc"]
+    assert outcome["metrics"]["icir"] == result["trials"][0]["metrics"]["icir"]
+
+
+def test_non_ai_runs_do_not_retain_outcomes(_engine_fixture, monkeypatch):
+    """Enumeration and evolution must not hold a per-candidate copy of the full metrics."""
+    engine, config = _engine_fixture
+    captured: dict = {}
+
+    def fake_source(*args, **kwargs):
+        captured.update(kwargs)
+        return iter(()), 0
+
+    monkeypatch.setattr(engine_module, "_candidate_source", fake_source)
+    engine.run(user_id=4, code="code", config=config)
+    assert captured["outcome"] is None
+
+
+def test_ai_evaluation_is_capped_by_the_run_budget(monkeypatch):
+    """The rounds bound the source; the run's candidate budget bounds what is evaluated."""
+    entries = tuple(
+        {"round": 1, "ordinal": ordinal,
+         "expression": {"op": "ts_pct_change", "args": ["close"], "params": {"n": window}}}
+        for ordinal, window in enumerate((2, 3, 4, 5, 6), start=1)
+    )
+    seen: list[dict] = []
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()),
+                                on_progress=seen.append)
+    monkeypatch.setattr(engine_module, "PROGRESS_EVERY", 1)
+    result = engine.run(
+        user_id=4, code="code",
+        config=_config(budget=2, ai_rounds=2, ai_proposals_per_round=5),
+        search_mode=SEARCH_MODE_AI,
+        ai=_ai_options(replay_proposals=entries),
+    )
+    assert len(result["trials"]) == 2
+    assert [event["evaluated"] for event in seen] == [1, 2]
+    assert {event["total"] for event in seen} == {2}
+
+
+def test_ai_context_budget_is_the_effective_cap(monkeypatch):
+    """The prompt reports the budget the run will actually evaluate, not the raw product."""
+    captured: dict = {}
+
+    class _Source:
+        def __iter__(self):
+            return iter(())
+
+        def finish(self):
+            pass
+
+        def ai_summary(self):
+            return {"enabled": True}
+
+    def fake_source(**kwargs):
+        captured.update(kwargs)
+        return _Source()
+
+    monkeypatch.setattr(engine_module, "ProposalSource", fake_source)
+    source, total = engine_module._candidate_source(
+        _config(budget=2, ai_rounds=2, ai_proposals_per_round=5, holding_period=9),
+        SEARCH_MODE_AI,
+        lambda expression: None, user_id=4, ai=_ai_options(),
+        outcome=lambda fingerprint: None,
+    )
+    assert captured["context"].budget == 2
+    assert captured["context"].holding_period == 9
+    assert total == 2
+    assert list(source) == []
+
+
+def test_a_capped_ai_run_closes_the_last_round():
+    """A cap stops the stream before its close code; the run must close the round itself."""
+    entries = tuple(
+        {"round": 1, "ordinal": ordinal,
+         "expression": {"op": "ts_pct_change", "args": ["close"], "params": {"n": window}}}
+        for ordinal, window in enumerate((2, 3, 4, 5, 6), start=1)
+    )
+    repo = _FakeRepo()
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    result = engine.run(
+        user_id=4, code="code",
+        config=_config(budget=2, ai_rounds=2, ai_proposals_per_round=5),
+        search_mode=SEARCH_MODE_AI,
+        ai=_ai_options(run_id=9, repository=repo, replay_proposals=entries),
+    )
+
+    assert result["summary"]["ai"]["evaluated"] == len(result["trials"]) == 2
+    assert repo.status_updates == [{
+        "run_id": 9, "user_id": 4, "round_no": 1,
+        "ordinals": (1, 2), "status": "evaluated",
+    }]
+    rows = repo.saved[-1][2]
+    assert [row["status"] for row in rows] == [
+        "evaluated", "evaluated", "proposed", "proposed", "proposed",
+    ]
+
+
+def test_a_full_budget_ai_run_closes_its_last_round():
+    """The default configuration hits the cap exactly, so no further pull ever closes the tail."""
+    entries = tuple(
+        {"round": (ordinal - 1) // 5 + 1, "ordinal": (ordinal - 1) % 5 + 1,
+         "expression": {"op": "ts_pct_change", "args": ["close"], "params": {"n": window}}}
+        for ordinal, window in enumerate(range(2, 12), start=1)
+    )
+    repo = _FakeRepo()
+    engine = FactorMiningEngine(data_provider=_FakeProvider(*_fixture()))
+    result = engine.run(
+        user_id=4, code="code",
+        config=_config(budget=10, ai_rounds=2, ai_proposals_per_round=5),
+        search_mode=SEARCH_MODE_AI,
+        ai=_ai_options(run_id=9, repository=repo, replay_proposals=entries),
+    )
+
+    assert result["summary"]["ai"]["evaluated"] == len(result["trials"]) == 10
+    assert [(call["round_no"], call["ordinals"]) for call in repo.status_updates] == [
+        (1, (1, 2, 3, 4, 5)), (2, (1, 2, 3, 4, 5)),
+    ]

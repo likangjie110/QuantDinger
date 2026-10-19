@@ -9,7 +9,8 @@ instant its value became known, so a bar reads the last of them published at or 
 Second the split: the requested range is cut into a search
 window and a frozen tail, and the tail is never fetched by the search; the out-of-sample review
 asks for it separately, once. Third the loop: every candidate the source produces -- the
-template expansion, or, in evolution, that expansion plus the stream bred from it -- is scored
+template expansion, or, in evolution, that expansion plus the stream bred from it, or, in AI,
+the proposals a model answered with -- is scored
 through ``FactorResearchEngine`` and walked down the graded gate ladder, and every one of them
 -- pass or reject -- leaves a trial behind, carrying only the metrics a gate reads: the
 candidate keeps the whole measurement, but the ledger has one row per evaluation and would
@@ -105,6 +106,7 @@ from app.services.factor_mining.pool import (
     load_pool,
     pool_panels,
 )
+from app.services.factor_mining.proposals import ProposalContext, ProposalSource
 from app.services.factor_mining.templates import (
     DEFAULT_BUDGET,
     MAX_BUDGET,
@@ -147,7 +149,8 @@ POOL_NAME_LENGTH = 8
 
 SEARCH_MODE_ENUMERATION = "enumeration"
 SEARCH_MODE_EVOLUTION = "evolution"
-_SEARCH_MODES = (SEARCH_MODE_ENUMERATION, SEARCH_MODE_EVOLUTION)
+SEARCH_MODE_AI = "ai"
+_SEARCH_MODES = (SEARCH_MODE_ENUMERATION, SEARCH_MODE_EVOLUTION, SEARCH_MODE_AI)
 
 # The evolution search's own defaults. A run that breeds names all three in its payload -- the
 # boundary refuses one that does not -- and these are what a config built in process starts from.
@@ -157,9 +160,32 @@ DEFAULT_EVOLUTION_POPULATION = 32
 DEFAULT_EVOLUTION_GENERATIONS = 20
 DEFAULT_EVOLUTION_ELITE_RATIO = 0.25
 
+# The AI search's own defaults and caps. A round is one model call, so the product of the two
+# numbers is the run's whole candidate budget -- bounded because every proposal is a paid call
+# and every evaluation a measured one.
+DEFAULT_AI_ROUNDS = 2
+MAX_AI_ROUNDS = 3
+DEFAULT_AI_PROPOSALS_PER_ROUND = 10
+MAX_AI_PROPOSALS_PER_ROUND = 20
+
 # What evolution ranks a generation by: a metric every evaluated individual already carries, so
 # the fitness callback never computes anything and the evolution module never reads data.
 FITNESS_METRIC = "icir"
+
+
+@dataclass(frozen=True)
+class AISearchOptions:
+    """What an AI run brings from its caller: a model call, a store, and the run's own id.
+
+    ``replay_proposals`` turns the same stream into a replay: recorded expressions are yielded
+    instead of asking the model, while the run still writes its own rows and evaluates them.
+    """
+
+    run_id: int
+    research_notes: str
+    proposer: Callable[[str, str], Any]
+    repository: Any
+    replay_proposals: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -189,6 +215,9 @@ class MiningConfig:
     population: int = DEFAULT_EVOLUTION_POPULATION
     generations: int = DEFAULT_EVOLUTION_GENERATIONS
     elite_ratio: float = DEFAULT_EVOLUTION_ELITE_RATIO
+    ai_rounds: int = DEFAULT_AI_ROUNDS
+    ai_proposals_per_round: int = DEFAULT_AI_PROPOSALS_PER_ROUND
+    replay_job_id: str = ""
 
     @classmethod
     def from_payload(
@@ -213,6 +242,7 @@ class MiningConfig:
             raise ValueError("factorMining.budgetExceeded")
         search_mode = _search_mode(payload.get("searchMode"))
         population, generations, elite_ratio = _evolution_settings(payload, search_mode)
+        ai_rounds, ai_proposals_per_round = _ai_settings(payload, search_mode)
         return cls(
             market=str(payload.get("market") or ""),
             timeframe=_timeframe(payload.get("timeframe"), "1D"),
@@ -236,6 +266,9 @@ class MiningConfig:
             population=population,
             generations=generations,
             elite_ratio=elite_ratio,
+            ai_rounds=ai_rounds,
+            ai_proposals_per_round=ai_proposals_per_round,
+            replay_job_id=_replay_job_id(payload, search_mode),
         )
 
 
@@ -778,19 +811,22 @@ class FactorMiningEngine:
         code: str,
         config: MiningConfig,
         search_mode: str = SEARCH_MODE_ENUMERATION,
+        ai: AISearchOptions | None = None,
     ) -> dict[str, Any]:
         """Search ``code``'s universe over ``config`` and return the run record.
 
         ``search_mode`` picks the candidate source, and the mode is the caller's because the
-        sources need different things from this method: enumeration expands the templates, while
+        sources need different things from this method: enumeration expands the templates,
         evolution needs a ``fitness`` callback that only the engine can build -- it answers with
         the measurement this run wrote for an individual, and the evolution module must not read
-        data or compute a metric itself. The mode also travels to the provider, because it decides
-        how much history the panel must carry before the search window.
+        data or compute a metric itself -- and AI needs the caller's ``ai`` options, because the
+        model call and the proposal store belong to it. The mode also travels to the provider,
+        because it decides how much history the panel must carry before the search window.
 
         Both sources are an ``Iterable[CandidateSeed]`` and the loop pulls one individual at a
-        time, because evolution consults that callback while it streams: draining the source first
-        would leave every generation ranked on nothing.
+        time, because evolution consults that callback while it streams and the AI source closes
+        a round when it is resumed: draining the source first would leave every generation ranked
+        on nothing and every round's feedback empty.
 
         ``candidates`` are the survivors of the ladder, in production order; ``trials`` are every
         candidate the run evaluated, rejected ones included, because that count is what the
@@ -800,6 +836,10 @@ class FactorMiningEngine:
         the run already holds, spends budget and leaves nothing behind.
         """
         if search_mode not in _SEARCH_MODES:
+            raise ValueError("factorMining.invalidParameter")
+        if (search_mode == SEARCH_MODE_AI) != (ai is not None):
+            # One mode, one set of inputs: a run that named AI without its options cannot call
+            # a model, and options handed to any other mode would be silently ignored.
             raise ValueError("factorMining.invalidParameter")
         panel = self._data_provider.prepare(
             user_id=user_id, code=code, config=config, search_mode=search_mode,
@@ -843,13 +883,33 @@ class FactorMiningEngine:
                 return None
             return measured.get(fingerprint)
 
-        source, total = _candidate_source(config, search_mode, fitness)
+        ai_outcomes: dict[str, dict] = {}
+
+        def ai_outcome(fingerprint: str) -> dict | None:
+            """What this run measured for ``fingerprint``, for a source closing its round."""
+            return ai_outcomes.get(fingerprint)
+
+        source, total = _candidate_source(
+            config, search_mode, fitness, user_id=user_id, ai=ai,
+            outcome=ai_outcome if ai is not None else None,
+        )
         trials: list[dict[str, Any]] = []
         candidates: list[dict[str, Any]] = []
         for evaluated, seed in enumerate(source, start=1):
             verdict, metrics = self._evaluate(
                 seed.expression, evaluator, config, split, panel, members, comparison,
             )
+            if ai is not None:
+                # Written before the loop pulls again: resuming the AI source closes its round
+                # and reads these, and the next round's prompt is built from them. Only the two
+                # metrics the feedback reads are kept -- the full payload is up to 0.78 MB per
+                # candidate and this dict lives for the whole run.
+                ai_outcomes[seed.fingerprint] = {
+                    "stage": verdict.stage,
+                    "verdict": "pass" if verdict.passed else "reject",
+                    "reason": verdict.reason,
+                    "metrics": {"rankIc": metrics.get("rankIc"), "icir": metrics.get("icir")},
+                }
             value = metrics.get(FITNESS_METRIC)
             if isinstance(value, float) and math.isfinite(value):
                 measured[seed.fingerprint] = value
@@ -872,12 +932,18 @@ class FactorMiningEngine:
                     "outOfSample": {},
                 })
             self._progress(evaluated, total)
+        summary = self._summary(config, panel, trials, candidates, comparison)
+        if search_mode == SEARCH_MODE_AI:
+            # A capped stream stops before the source's own close code, so its last round is
+            # still open; close it before the summary counts what was evaluated.
+            source.finish()
+            summary["ai"] = source.ai_summary()
         return {
             "config": self._config_payload(config),
             "split": self._split_payload(split),
             "trials": trials,
             "candidates": candidates,
-            "summary": self._summary(config, panel, trials, candidates, comparison),
+            "summary": summary,
         }
 
     def review_frozen(
@@ -1541,6 +1607,35 @@ def _evolution_settings(
     return population, generations, elite_ratio
 
 
+def _ai_settings(payload: Mapping[str, Any], search_mode: str) -> tuple[int, int]:
+    """The AI search's rounds and proposals per round.
+
+    Both are refused on a non-AI run rather than ignored: a caller who named them asked for a
+    different search than the mode they passed, and running one mode while the payload describes
+    another is the disagreement this layer exists to catch. On an AI run both are bounded,
+    because every proposal is one paid model call and one measured evaluation. A blank value
+    states no more than an absent key, the same reading ``_evolution_settings`` uses.
+    """
+    if search_mode != SEARCH_MODE_AI:
+        if any(payload.get(key) not in (None, "")
+               for key in ("aiRounds", "aiProposalsPerRound")):
+            raise ValueError("factorMining.invalidParameter")
+        return DEFAULT_AI_ROUNDS, DEFAULT_AI_PROPOSALS_PER_ROUND
+    rounds = _payload_int(payload, "aiRounds", DEFAULT_AI_ROUNDS)
+    proposals = _payload_int(payload, "aiProposalsPerRound", DEFAULT_AI_PROPOSALS_PER_ROUND)
+    if not 1 <= rounds <= MAX_AI_ROUNDS or not 1 <= proposals <= MAX_AI_PROPOSALS_PER_ROUND:
+        raise ValueError("factorMining.invalidParameter")
+    return rounds, proposals
+
+
+def _replay_job_id(payload: Mapping[str, Any], search_mode: str) -> str:
+    """The job whose proposals a replay copies. Replay is an AI run without a model call."""
+    job_id = str(payload.get("replayJobId") or "").strip()
+    if job_id and search_mode != SEARCH_MODE_AI:
+        raise ValueError("factorMining.invalidParameter")
+    return job_id
+
+
 def _portfolio_manifest(code: str) -> StrategyManifest:
     """Compile the source, keeping the portfolio-only contract the research entry enforces."""
     manifest = compile_strategy_v2(code).manifest
@@ -1549,10 +1644,37 @@ def _portfolio_manifest(code: str) -> StrategyManifest:
     return manifest
 
 
+class _CappedSource:
+    """An AI proposal stream cut at the run's budget, with its summary still reachable.
+
+    ``itertools.islice`` stops pulling at the cap -- which matters, because resuming the source
+    can spend a model call on the next round -- but it drops the ``ai_summary`` and ``finish``
+    the run record needs afterwards. This keeps both: the slice is the stream, the wrapped source
+    is the rest.
+    """
+
+    def __init__(self, source: Any, limit: int) -> None:
+        self._source = source
+        self._seeds = itertools.islice(source, limit)
+
+    def __iter__(self):
+        return self._seeds
+
+    def finish(self) -> None:
+        self._source.finish()
+
+    def ai_summary(self) -> dict[str, Any]:
+        return self._source.ai_summary()
+
+
 def _candidate_source(
     config: MiningConfig,
     search_mode: str,
     fitness: Callable[[dict], float | None],
+    *,
+    user_id: int,
+    ai: AISearchOptions | None = None,
+    outcome: Callable[[str], Mapping[str, Any] | None] | None = None,
 ) -> tuple[Iterable[CandidateSeed], int]:
     """The candidates this run evaluates, and the count its progress is reported against.
 
@@ -1565,7 +1687,56 @@ def _candidate_source(
     generation plus the budget rather than a length evolution cannot know. What it breeds with --
     the population, its generations, and the elite share -- is the run config's, so the numbers a
     stored run reports are the ones the search actually used.
+
+    AI is neither: the source is the proposal stream, whose history is this tenant's prior
+    failures in the same market and timeframe (this run excluded), and whose length is the
+    smaller of the rounds times the proposals per round and the run's budget. A replay copies
+    recorded proposals instead, so it injects no history at all -- there is no model to read it.
+    ``outcome`` is how a closed round reads this run's own verdicts -- the trials are written only
+    after the search returns, so the source cannot read them from the store.
     """
+    if search_mode == SEARCH_MODE_AI:
+        if ai is None:
+            raise ValueError("factorMining.invalidParameter")
+        # The run's candidate budget caps what the proposal rounds may evaluate: the rounds and
+        # proposals bound the source, the budget bounds the run.
+        budget = min(config.ai_rounds * config.ai_proposals_per_round, config.budget)
+        replay = bool(ai.replay_proposals or config.replay_job_id)
+        context = ProposalContext(
+            user_id=user_id,
+            run_id=ai.run_id,
+            market=config.market,
+            timeframe=config.timeframe,
+            start_date=config.start_date,
+            end_date=config.end_date,
+            budget=budget,
+            rounds=config.ai_rounds,
+            proposals_per_round=config.ai_proposals_per_round,
+            holding_period=config.holding_period,
+            research_notes=ai.research_notes,
+            fields=fields_for(config.market),
+            thresholds=asdict(config.thresholds),
+            history=({} if replay else ai.repository.failure_summary(
+                user_id=user_id,
+                market=config.market,
+                timeframe=config.timeframe,
+                exclude_run_id=ai.run_id,
+            )),
+            replay=ai.replay_proposals,
+            replay_of=config.replay_job_id,
+        )
+        return (
+            _CappedSource(
+                ProposalSource(
+                    context=context,
+                    repository=ai.repository,
+                    proposer=ai.proposer,
+                    outcome=outcome or (lambda fingerprint: None),
+                ),
+                budget,
+            ),
+            budget,
+        )
     seeds = expand_candidates(
         template_ids=config.template_ids or None,
         budget=config.budget,
@@ -1607,9 +1778,11 @@ def _warmup_bars(config: MiningConfig, search_mode: str) -> int:
 
     Evolution can know nothing of the kind: a crossover grafts an arbitrary subtree -- with any
     window the DSL accepts -- onto an arbitrary path, so no number short of the ceiling is
-    correct for a run that breeds. The price is provider history, on every evolved run.
+    correct for a run that breeds. AI is in the same position for a different reason: the model
+    writes the expression, so nothing before the call bounds its lookback. Both pay the ceiling
+    in provider history, on every such run.
     """
-    if search_mode == SEARCH_MODE_EVOLUTION:
+    if search_mode in (SEARCH_MODE_EVOLUTION, SEARCH_MODE_AI):
         return MAX_LOOKBACK
     candidates = expand_candidates(
         template_ids=config.template_ids or None,
