@@ -15,8 +15,8 @@ cannot price. Nothing here clamps, defaults over, or re-derives a value one of t
 rejected -- a run that searched something other than what was asked for is worse than a failed
 one.
 
-Two counts are the orchestration's own. ``trials_count`` handed to the frozen review is the
-*whole* ledger -- rejected candidates included -- because that count is the deflated-Sharpe
+Two counts are the orchestration's own. ``trials_count`` handed to the frozen review accumulates
+the research group's whole ledgers -- rejected candidates included -- because it is the deflated-Sharpe
 denominator, and pricing the search with the survivor count would understate exactly the bias the
 correction exists for. And ``summary.frozen`` is the engine's placeholder 0: the search cannot
 know how many survivors hold up out of sample, so the count is written back here, from the
@@ -32,11 +32,10 @@ so both dispatch paths execute one implementation.
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from app.markets.registry import list_market_keys
@@ -55,6 +54,7 @@ from app.services.factor_mining.engine import (
 )
 from app.services.factor_mining.gates import GateThresholds
 from app.services.factor_mining.proposals import LLMProposer, RESEARCH_NOTES_MAX_CHARS
+from app.services.factor_mining.research import feedback_context, research_context
 from app.services.factor_mining.storage import FactorMiningRepository
 from app.services.factor_mining.templates import (
     DEFAULT_BUDGET,
@@ -65,6 +65,7 @@ from app.services.script_source import get_script_source_service
 from app.services.strategy_v2.contract import compile_strategy_v2
 from app.services.strategy_v2.service import StrategyV2BacktestService
 from app.utils import agent_jobs
+from app.utils import factor_mining_jobs
 
 
 JOB_KIND = "factor_mining"
@@ -91,7 +92,7 @@ _KNOWN_MARKETS = frozenset(list_market_keys())
 # which market or window a listed job ran, and the keys that leave are the ones a caller
 # recognises their own submission by.
 _JOB_CONFIG_KEYS = (
-    "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio",
+    "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio", "holdoutRatio",
     "budget", "seed", "templateIds", "groups", "holdingPeriod", "commission", "slippage",
     "neutralizeIndustry", "thresholds", "searchMode", "population", "generations", "eliteRatio",
     "aiRounds", "aiProposalsPerRound", "replayJobId",
@@ -101,7 +102,7 @@ _JOB_CONFIG_KEYS = (
 # ``searchMode`` and ``replayJobId`` are added by the replay itself; ``researchNotes`` is the
 # caller's own and never part of the recorded config.
 _REPLAY_FIELDS = (
-    "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio",
+    "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio", "holdoutRatio",
     "budget", "seed", "templateIds", "groups", "holdingPeriod", "commission", "slippage",
     "neutralizeIndustry", "thresholds", "aiRounds", "aiProposalsPerRound",
 )
@@ -197,6 +198,7 @@ class FactorMiningService:
         request_payload = self._replay_request(request_payload, int(user_id))
         config = self._config(request_payload)
         self._research_notes(request_payload, config)
+        factor_mining_jobs.recover_jobs(user_id=int(user_id))
         if agent_jobs.count_active_jobs(user_id=int(user_id), kind=JOB_KIND):
             raise ValueError("factorMining.concurrentLimit")
         job_id = uuid.uuid4().hex
@@ -313,6 +315,7 @@ class FactorMiningService:
 
     def get_job(self, job_id: str, *, user_id: int) -> dict[str, Any] | None:
         """One of the caller's mining jobs; another tenant's or another feature's job is not found."""
+        factor_mining_jobs.recover_jobs(user_id=int(user_id))
         row = agent_jobs.get_job(str(job_id), user_id=int(user_id))
         return _public_job(row) if row and row.get("kind") == JOB_KIND else None
 
@@ -320,18 +323,15 @@ class FactorMiningService:
         """The caller's mining jobs, newest first, in the same envelope as :meth:`get_job`.
 
         Each job is re-read for its progress and result: a poller lists jobs to find the one that
-        finished, and the summary query carries neither. Listing is also where a job orphaned by a
-        dead worker is retired -- an unswept ghost is not cosmetic, because the concurrency gate
-        counts active jobs, so it would otherwise block every later submission by that tenant.
+        finished, and the summary query carries neither. Listing redispatches expired leases for
+        the caller through the existing finite-job runner. A job's age alone is never proof that
+        its worker died, and a live lease continues to hold its concurrency slot.
         The result is left out of the listed row (``hasResult`` says whether there is one): it is
         the whole run record, and twenty of them is more than a listing can carry.
         """
+        factor_mining_jobs.recover_jobs(user_id=int(user_id))
         items = []
         for summary in agent_jobs.list_jobs(user_id=int(user_id), kind=JOB_KIND, limit=limit):
-            if _is_stale_running_job(summary):
-                agent_jobs._set_failure(
-                    str(summary.get("job_id") or ""), "factorMining.workerInterrupted",
-                )
             row = agent_jobs.get_job(str(summary.get("job_id") or ""), user_id=int(user_id))
             if row:
                 items.append(_public_job(row, include_result=False))
@@ -388,6 +388,12 @@ class FactorMiningService:
         request_payload = dict(payload or {})
         user_id = int(request_payload.pop("__userId"))
         job_id = str(request_payload.pop("__jobId", ""))
+        execution_token = str(request_payload.pop("__executionToken", ""))
+        repository = self._repository
+        if job_id:
+            repository = repository.for_execution(
+                job_id=job_id, user_id=user_id, token=execution_token,
+            )
         config = self._config(request_payload)
         notes = self._research_notes(request_payload, config)
         source = get_script_source_service().get_source(config.source_id, user_id=user_id)
@@ -396,7 +402,15 @@ class FactorMiningService:
         code = str(source.get("code") or "").strip()
         if not code:
             raise ValueError("factorMining.sourceCodeRequired")
-        run_id = self._repository.persist_run(
+        manifest = compile_strategy_v2(code).manifest.metadata()
+        previous = self._repository.get_recovery_run(job_id, user_id=user_id) if (
+            job_id and config.search_mode == SEARCH_MODE_AI and not config.replay_job_id) else None
+        recovery_proposals = ()
+        if previous and previous.get("status") == "failed" and config.search_mode == SEARCH_MODE_AI:
+            recovery_proposals = tuple(self._repository.list_proposals(
+                int(previous["id"]), user_id=user_id, limit=_REPLAY_PROPOSAL_LIMIT, offset=0,
+            ))
+        run_id = repository.persist_run(
             user_id=user_id,
             config=asdict(config),
             source_id=config.source_id,
@@ -404,7 +418,7 @@ class FactorMiningService:
             # The panel is prepared inside the search, after this row exists; ``finish_run``
             # backfills the fingerprint from the result.
             snapshot_id="",
-            manifest=compile_strategy_v2(code).manifest.metadata(),
+            manifest=manifest,
             # The id the job was submitted under, so a proposal lookup works from either side
             # while the job runs and after it failed.
             job_id=job_id,
@@ -414,7 +428,7 @@ class FactorMiningService:
         try:
             ai = None
             if config.search_mode == SEARCH_MODE_AI:
-                replay_proposals: tuple[Mapping[str, Any], ...] = ()
+                replay_proposals: tuple[Mapping[str, Any], ...] = recovery_proposals
                 if config.replay_job_id:
                     original, rows = self._replay_source(config.replay_job_id, user_id)
                     replay_proposals = tuple(rows)
@@ -422,8 +436,9 @@ class FactorMiningService:
                     run_id=run_id,
                     research_notes=notes,
                     proposer=self._proposer_factory(),
-                    repository=self._repository,
+                    repository=repository,
                     replay_proposals=replay_proposals,
+                    history_context=feedback_context(config, manifest),
                 )
             engine = self._engine_factory(
                 data_provider=MiningDataProvider(backtest_service=self._backtest_service),
@@ -434,45 +449,45 @@ class FactorMiningService:
             # The record names the run it belongs to, so a job result is auditable by itself.
             search["runId"] = run_id
             _record_ai_summary(search, config, original)
-            self._repository.save_trials(run_id, user_id=user_id, trials=search["trials"])
+            trials_count = repository.save_trials(run_id, user_id=user_id, trials=search["trials"])
             # The counts may only be persisted once the ledger holds them: a run row closed before
             # its trials were written would claim evaluations the ledger never received.
             result = search
-            self._repository.upsert_candidates(
-                user_id=user_id, run_id=run_id, candidates=result["candidates"],
+            research = repository.register_experiment_trials(
+                run_id, user_id=user_id, context=research_context(config), trials_count=trials_count,
             )
+            result["summary"]["research"] = research
             reviewed = engine.review_frozen(
                 user_id=user_id,
                 code=code,
                 config=config,
                 survivors=result["candidates"],
-                trials_count=len(result["trials"]),
+                trials_count=research["cumulativeTrials"],
                 # The review carries the search's own mode: it is the warmup rule the frozen
                 # panel is fetched with, and the survivors it judges were bred under that rule.
                 # Left to the engine's default, the tail would be fetched short of an evolved
                 # survivor's lookback and the out-of-sample window silently truncated.
                 search_mode=config.search_mode,
             )
-            self._repository.upsert_candidates(
-                user_id=user_id, run_id=run_id, candidates=reviewed,
-            )
             result["candidates"] = reviewed
+            research.update(engine.freeze_evidence())
             result["summary"]["frozen"] = sum(
                 1 for candidate in reviewed if candidate.get("status") == "frozen"
             )
-            self._repository.finish_run(run_id, user_id=user_id, status="success", result=result)
+            repository.publish_run(run_id, user_id=user_id, result=result)
         except agent_jobs.JobCancelledError:
             # The job store already says cancelled, and the run row has to agree: a library view
             # that reads "failed" cannot tell the user's own cancellation from an engine failure.
-            self._repository.finish_run(
-                run_id, user_id=user_id, status="cancelled", result=result,
-            )
+            # Production cancellation closes the run under the same job lock. The unbound path
+            # is retained for an explicitly injected standalone engine/repository invocation.
+            if not job_id:
+                repository.finish_run(run_id, user_id=user_id, status="cancelled", result=result)
             raise
         except Exception as exc:
             # ``result`` carries whatever the search already produced. A review that fails after
             # the ledger was written must not persist zero counts and an empty fingerprint against
             # a run whose trials are on disk.
-            self._repository.finish_run(
+            repository.finish_run(
                 run_id, user_id=user_id, status="failed", result=result, error_message=str(exc),
             )
             raise
@@ -592,6 +607,7 @@ def _replay_fields(run: Mapping[str, Any], replay_job_id: str) -> dict[str, Any]
         "startDate": str(config.get("start_date") or "")[:10],
         "endDate": str(config.get("end_date") or "")[:10],
         "freezeRatio": config.get("freeze_ratio"),
+        "holdoutRatio": config.get("holdout_ratio", 0.0),
         "budget": config.get("budget"),
         "seed": config.get("seed"),
         "templateIds": list(config.get("template_ids") or ()),
@@ -628,22 +644,6 @@ def _record_ai_summary(
     ai_summary["snapshotChanged"] = bool(
         original_snapshot and summary.get("snapshotId") != original_snapshot
     )
-
-
-def _is_stale_running_job(row: Mapping[str, Any]) -> bool:
-    """A job still marked ``running`` long past the worker's own time limit: its process is gone.
-
-    The threshold is the one the strategy-evolution list applies -- the worker's limit plus a
-    grace window -- because a job inside its limit may simply be slow, and retiring a live job
-    would both mislabel it and hand its concurrency slot to a second run.
-    """
-    if row.get("status") != "running" or not row.get("started_at"):
-        return False
-    started_at = row["started_at"]
-    if started_at.tzinfo is None:
-        started_at = started_at.replace(tzinfo=timezone.utc)
-    limit_seconds = max(120, int(os.getenv("CELERY_TASK_TIME_LIMIT", "3600"))) + 300
-    return (datetime.now(timezone.utc) - started_at).total_seconds() > limit_seconds
 
 
 def _public_job(

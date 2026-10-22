@@ -208,6 +208,16 @@ See [distributed runtime deployment and scaling](DISTRIBUTED_RUNTIME_SCALING.md)
 for the release sequence, ownership model, rollback boundary, and 100,000-
 strategy prerequisites.
 
+Factor mining runs as finite Celery work in the dedicated `mining` queue, consumed
+by `celery-mining-worker`; the general worker retains `jobs,ai,maintenance`.
+Both source and GHCR stacks include it, including local-build and production
+overrides. Configure `CELERY_MINING_REPLICAS`, `CELERY_MINING_CONCURRENCY`,
+`CELERY_MINING_PREFETCH`, `CELERY_MINING_DB_POOL_MIN/MAX`, and
+`CELERY_MINING_MEMORY_LIMIT` / `CELERY_MINING_CPU_LIMIT` separately from the general
+worker. See [mining capacity, local readiness and upgrade/rollback draining](DISTRIBUTED_RUNTIME_SCALING.md#factor-mining-queue-capacity).
+Start the mining consumer before switching producers; a healthy broker alone does
+not prove it can consume the new queue. This does not change trading ownership.
+
 ## 6. Configure Nginx
 
 Install Nginx:

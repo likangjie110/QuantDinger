@@ -196,6 +196,13 @@ docker compose -f docker-compose.ghcr.yml up -d --force-recreate \
 迁移为共享的外部服务，并使用编排系统或等价部署层。发布顺序、所有权模型、回滚边界与十万策略
 前置条件见[分布式运行时部署与扩容](DISTRIBUTED_RUNTIME_SCALING_CN.md)。
 
+因子挖掘仍属于有限 Celery 作业，由 `celery-mining-worker` 专门消费 `mining`；
+通用 Worker 保留 `jobs,ai,maintenance`。源码、GHCR、本地构建与生产覆盖组合均包含该服务。
+使用 `CELERY_MINING_REPLICAS`、`CELERY_MINING_CONCURRENCY`、`CELERY_MINING_PREFETCH`、
+`CELERY_MINING_DB_POOL_MIN/MAX` 和 `CELERY_MINING_MEMORY_LIMIT` / `CELERY_MINING_CPU_LIMIT`
+独立配置其容量。具体见[挖掘容量、自身队列就绪与升级/回滚排空](DISTRIBUTED_RUNTIME_SCALING_CN.md#因子挖掘队列容量)。
+先启动挖掘消费者，再切换生产者；broker 健康不能证明新队列存在可用消费者。交易所有权不变。
+
 ## 6. 配置 Nginx
 
 安装 Nginx：

@@ -4,6 +4,35 @@ import pytest
 from app.services.strategy_v2.factor_research import FactorResearchEngine
 
 
+@pytest.mark.parametrize("stop_after", ["metrics", "stability", "correlation", None])
+def test_p2_research_stages_are_ordered_and_preserve_full_response(stop_after):
+    frames, index = _comparable_frames()
+    arguments = dict(frames=frames, factor_id="momentum_20", start_date=index[0],
+                     end_date=index[-1], groups=3, holding_period=5,
+                     commission=0.001, slippage=0.002, neutralize_industry=True)
+    full = FactorResearchEngine().run(**arguments)
+    stages = []
+
+    def on_stage(stage, metrics):
+        stages.append(stage)
+        assert "icSeries" in metrics
+        assert "groupCurves" not in metrics and "longShortCurve" not in metrics
+        return stage != stop_after
+
+    result = FactorResearchEngine().run(**arguments, on_stage=on_stage)
+    expected = ["metrics", "stability", "correlation"]
+    assert stages == (expected[:expected.index(stop_after) + 1] if stop_after else expected)
+    assert result["rankIc"] == full["rankIc"]
+    assert result["coverage"] == full["coverage"]
+    if stop_after != "metrics":
+        assert result["stability"] == full["stability"]
+        assert result["averageTurnover"] == full["averageTurnover"]
+    if stop_after:
+        assert "longShortCurve" not in result
+    else:
+        assert result == full
+
+
 def _comparable_frames(periods=90, symbols=("A", "B", "C", "D", "E", "F")):
     """Frames whose symbols rank the same way on every date, so correlations are known.
 

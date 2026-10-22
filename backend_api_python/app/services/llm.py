@@ -5,10 +5,13 @@ AtlasCloud, Custom (OpenAI-compatible), MiniMax.
 Kept separate from AnalysisService to avoid circular imports.
 """
 import json
+import math
 import os
 import requests
+from time import monotonic
 from typing import Dict, Any, Optional, List
 from enum import Enum
+from urllib3.util import Timeout as HTTPTimeout
 
 from app.utils.logger import get_logger
 from app.config import APIKeys
@@ -18,6 +21,16 @@ from app.utils.redaction import redact_secrets
 logger = get_logger(__name__)
 
 DEFAULT_MAX_TOKENS = 16_384
+
+
+def _deadline_timeout(deadline: float | None, cap: float) -> float:
+    """Return the remaining request allowance; a deadline never gets a fresh budget."""
+    if deadline is None:
+        return cap
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError("LLM call deadline exceeded")
+    return min(cap, remaining)
 
 RETRYABLE_LLM_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
 RETRYABLE_LLM_ERROR_TYPES = {
@@ -398,7 +411,8 @@ class LLMService:
             value = os.getenv("LLM_USE_SYSTEM_PROXY", "false")
         return self._truthy(value)
 
-    def _llm_post(self, url: str, *, headers: dict, json_payload: dict, timeout: int, stream: bool = False):
+    def _llm_post(self, url: str, *, headers: dict, json_payload: dict, timeout: float,
+                  stream: bool = False, deadline: float | None = None):
         """
         Send LLM HTTP requests without inheriting exchange/data-source proxies.
 
@@ -406,6 +420,7 @@ class LLMService:
         but LLM providers should not be routed through it unless explicitly requested.
         This avoids failures such as host.docker.internal:7890 refusing LLM traffic.
         """
+        _deadline_timeout(deadline, timeout)
         session = requests.Session()
         proxy_url = self._llm_proxy_url()
         use_system_proxy = self._llm_use_system_proxy()
@@ -417,16 +432,34 @@ class LLMService:
             "timeout": timeout,
             "stream": stream,
         }
+        if deadline is not None:
+            # Redirects otherwise reuse the original timeout for every new request.
+            kwargs["allow_redirects"] = False
         if proxy_url:
             kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
 
         try:
-            if not stream and not proxy_url:
+            if not stream and not proxy_url and deadline is None:
                 session.close()
                 post_kwargs = dict(kwargs)
                 post_kwargs.pop("stream", None)
                 return requests.post(url, **post_kwargs)
+            if deadline is not None:
+                kwargs["timeout"] = HTTPTimeout(total=_deadline_timeout(deadline, timeout))
             response = session.post(url, **kwargs)
+            if deadline is not None:
+                try:
+                    _deadline_timeout(deadline, timeout)
+                    if 300 <= response.status_code < 400:
+                        raise LLMAPIError(
+                            "LLM HTTP redirect is disabled for deadline-bound calls",
+                            status_code=response.status_code,
+                            error_type="invalid_request",
+                            retryable=False,
+                        )
+                except Exception:
+                    response.close()
+                    raise
         except requests.exceptions.RequestException as exc:
             session.close()
             hint = ""
@@ -438,6 +471,9 @@ class LLMService:
                     "LLM_USE_SYSTEM_PROXY disabled unless you really want system proxy env vars."
                 )
             raise requests.exceptions.ConnectionError(f"{redact_secrets(msg)}{hint}") from exc
+        except Exception:
+            session.close()
+            raise
 
         if stream:
             response._quantdinger_llm_session = session
@@ -447,7 +483,7 @@ class LLMService:
 
     def _call_openai_compatible(self, messages: list, model: str, temperature: float, 
                                  api_key: str, base_url: str, timeout: int,
-                                 use_json_mode: bool = True) -> str:
+                                 use_json_mode: bool = True, deadline: float | None = None) -> str:
         """Call OpenAI-compatible API (OpenAI, DeepSeek, Grok, AtlasCloud, OpenRouter)."""
         url = f"{base_url}/chat/completions"
         
@@ -474,7 +510,8 @@ class LLMService:
         if use_json_mode and "atlascloud" not in (base_url or "").lower():
             data["response_format"] = {"type": "json_object"}
 
-        response = self._llm_post(url, headers=headers, json_payload=data, timeout=timeout)
+        response = self._llm_post(url, headers=headers, json_payload=data, timeout=timeout,
+                                  **({"deadline": deadline} if deadline is not None else {}))
         
         # Handle non-2xx with provider/model-aware details
         if response.status_code >= 400:
@@ -688,7 +725,8 @@ class LLMService:
         return ": ".join(parts)
 
     def _call_google_gemini(self, messages: list, model: str, temperature: float,
-                           api_key: str, base_url: str, timeout: int) -> str:
+                           api_key: str, base_url: str, timeout: int,
+                           deadline: float | None = None) -> str:
         """Call Google Gemini API."""
         # The key travels in a header instead of the query string: requests embeds the
         # URL in exception messages, which are logged and surfaced to clients. A custom
@@ -744,7 +782,8 @@ class LLMService:
             "x-goog-api-key": str(api_key or "").strip(),
         }
         
-        response = self._llm_post(url, headers=headers, json_payload=data, timeout=timeout)
+        response = self._llm_post(url, headers=headers, json_payload=data, timeout=timeout,
+                                  **({"deadline": deadline} if deadline is not None else {}))
         response.raise_for_status()
         
         result = response.json()
@@ -813,7 +852,7 @@ class LLMService:
 
     def _call_litellm(self, messages: list, model: str, temperature: float,
                       api_key: str, base_url: str, timeout: int,
-                      use_json_mode: bool = True) -> str:
+                      use_json_mode: bool = True, deadline: float | None = None) -> str:
         """Call LLM via LiteLLM SDK (supports 100+ providers)."""
         try:
             import litellm
@@ -828,9 +867,12 @@ class LLMService:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": self.get_max_tokens(),
-            "timeout": timeout,
+            "timeout": _deadline_timeout(deadline, timeout),
             "drop_params": True,
         }
+        if deadline is not None:
+            # All retries belong to the caller's shared round budget.
+            kwargs["num_retries"] = 0
 
         if use_json_mode:
             kwargs["response_format"] = {"type": "json_object"}
@@ -862,6 +904,7 @@ class LLMService:
                 error_type=error_type,
             ) from e
 
+        _deadline_timeout(deadline, timeout)
         if response.choices and len(response.choices) > 0:
             choice = response.choices[0]
             finish_reason = str(getattr(choice, "finish_reason", "") or "").strip().lower()
@@ -1183,7 +1226,7 @@ class LLMService:
     def call_llm_api(self, messages: list, model: str = None, temperature: float = 0.7, 
                      use_fallback: bool = True, provider: LLMProvider = None,
                      use_json_mode: bool = True, try_alternative_providers: bool = True,
-                     timeout_seconds: float | None = None) -> str:
+                     timeout_seconds: float | None = None, deadline: float | None = None) -> str:
         """
         Call LLM API with the specified or default provider.
         
@@ -1205,6 +1248,13 @@ class LLMService:
             2. Otherwise, use the configured LLM_PROVIDER with normalized model name
             3. Fall back to provider's default model if model name is incompatible
         """
+        if timeout_seconds is not None:
+            budget = float(timeout_seconds)
+            if not math.isfinite(budget) or budget <= 0:
+                raise TimeoutError("LLM call deadline exceeded")
+            requested_deadline = monotonic() + budget
+            deadline = requested_deadline if deadline is None else min(deadline, requested_deadline)
+        _deadline_timeout(deadline, float("inf"))
         cfg = load_addon_config()
         explicit_provider_name = str(
             cfg.get('llm', {}).get('provider') or os.getenv('LLM_PROVIDER', '')
@@ -1272,8 +1322,7 @@ class LLMService:
         
         config = load_addon_config()
         timeout = int(config.get(p.value, {}).get('timeout', 120))
-        if timeout_seconds is not None:
-            timeout = max(1, min(timeout, float(timeout_seconds)))
+        timeout_cap = timeout
         
         # Build model candidates
         models_to_try = [model]
@@ -1295,29 +1344,33 @@ class LLMService:
         attempt_errors = []
         
         for current_model in models_to_try:
+            timeout = _deadline_timeout(deadline, timeout_cap)
+            deadline_options = {"deadline": deadline} if deadline is not None else {}
             try:
                 if p == LLMProvider.LITELLM:
                     result = self._call_litellm(
                         messages, current_model, temperature,
                         api_key, base_url, timeout,
-                        use_json_mode=use_json_mode
+                        use_json_mode=use_json_mode, **deadline_options
                     )
                 elif p == LLMProvider.GOOGLE:
                     result = self._call_google_gemini(
                         messages, current_model, temperature,
-                        api_key, base_url, timeout
+                        api_key, base_url, timeout, **deadline_options
                     )
                 else:
                     # OpenAI-compatible providers
                     result = self._call_openai_compatible(
                         messages, current_model, temperature,
                         api_key, base_url, timeout,
-                        use_json_mode=use_json_mode
+                        use_json_mode=use_json_mode, **deadline_options
                     )
+                _deadline_timeout(deadline, timeout_cap)
                 self._record_model_use(current_model, models_to_try[0], p)
                 return result
                     
             except LLMAPIError as e:
+                _deadline_timeout(deadline, timeout_cap)
                 status_code = e.status_code
                 last_status_code = status_code
                 last_error = str(e)
@@ -1345,6 +1398,7 @@ class LLMService:
                         temperature,
                         use_json_mode,
                         excluded_provider=p,
+                        deadline=deadline,
                     )
 
                 if not use_fallback:
@@ -1372,6 +1426,7 @@ class LLMService:
                 continue
 
             except requests.exceptions.HTTPError as e:
+                _deadline_timeout(deadline, timeout_cap)
                 error_detail = e.response.text if e.response else str(e)
                 status_code = e.response.status_code if e.response else None
                 last_status_code = status_code
@@ -1385,7 +1440,7 @@ class LLMService:
                     logger.warning(f"{p.value} returned {status_code} (likely API key issue). Trying alternative providers...")
                     return self._try_alternative_providers(
                         messages, original_model, temperature, 
-                        use_json_mode, excluded_provider=p
+                        use_json_mode, excluded_provider=p, deadline=deadline,
                     )
                 
                 # Check for recoverable errors - try fallback model
@@ -1398,12 +1453,14 @@ class LLMService:
                     raise _scrubbed_request_error(e) from e
                     
             except requests.exceptions.RequestException as e:
+                _deadline_timeout(deadline, timeout_cap)
                 logger.error(f"{p.value} API request error ({current_model}): {redact_secrets(e)}")
                 last_error = str(e)
                 if not use_fallback or current_model == models_to_try[-1]:
                     raise _scrubbed_request_error(e) from e
                     
             except ValueError as e:
+                _deadline_timeout(deadline, timeout_cap)
                 logger.warning(f"Model {current_model} returned invalid data: {redact_secrets(e)}")
                 last_error = str(e)
                 if current_model == models_to_try[-1]:
@@ -1445,7 +1502,8 @@ class LLMService:
         )
     
     def _try_alternative_providers(self, messages: list, model: str, temperature: float,
-                                  use_json_mode: bool, excluded_provider: LLMProvider = None) -> str:
+                                  use_json_mode: bool, excluded_provider: LLMProvider = None,
+                                  deadline: float | None = None) -> str:
         """
         Try alternative providers when current provider fails.
 
@@ -1462,6 +1520,7 @@ class LLMService:
         ]
         
         for alt_provider in priority_order:
+            _deadline_timeout(deadline, float("inf"))
             if alt_provider == excluded_provider:
                 continue
             
@@ -1475,9 +1534,11 @@ class LLMService:
                     messages, model, temperature,
                     use_fallback=True, provider=alt_provider,
                     use_json_mode=use_json_mode,
-                    try_alternative_providers=False  # Prevent infinite recursion
+                    try_alternative_providers=False,  # Prevent infinite recursion
+                    deadline=deadline,
                 )
             except Exception as e:
+                _deadline_timeout(deadline, float("inf"))
                 logger.warning(f"Alternative provider {alt_provider.value} also failed: {redact_secrets(e)}")
                 continue
         

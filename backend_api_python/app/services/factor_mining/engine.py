@@ -6,9 +6,10 @@ for the as-of universe, ``fetch_frames`` for the bars -- so mining never grows a
 layer with its own time semantics, and the market's own non-price fields are assembled onto
 those bars over the same window (``market_fields``): a derivative column is indexed by the
 instant its value became known, so a bar reads the last of them published at or before it.
-Second the split: the requested range is cut into a search
-window and a frozen tail, and the tail is never fetched by the search; the out-of-sample review
-asks for it separately, once. Third the loop: every candidate the source produces -- the
+Second the split: an optional holdout is reserved from the requested tail, then the remaining
+range is cut into search and validation windows. The search never fetches validation bars;
+the out-of-sample review asks for them separately, once, and the holdout is never evaluated.
+Third the loop: every candidate the source produces -- the
 template expansion, or, in evolution, that expansion plus the stream bred from it, or, in AI,
 the proposals a model answered with -- is scored
 through ``FactorResearchEngine`` and walked down the graded gate ladder, and every one of them
@@ -186,6 +187,7 @@ class AISearchOptions:
     proposer: Callable[[str, str], Any]
     repository: Any
     replay_proposals: tuple[Mapping[str, Any], ...] = ()
+    history_context: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -218,6 +220,7 @@ class MiningConfig:
     ai_rounds: int = DEFAULT_AI_ROUNDS
     ai_proposals_per_round: int = DEFAULT_AI_PROPOSALS_PER_ROUND
     replay_job_id: str = ""
+    holdout_ratio: float = 0.0
 
     @classmethod
     def from_payload(
@@ -253,6 +256,7 @@ class MiningConfig:
             source_id=_payload_int(payload, "sourceId", 0),
             source_name=str(payload.get("sourceName") or ""),
             freeze_ratio=_freeze_ratio(payload.get("freezeRatio")),
+            holdout_ratio=_holdout_ratio(payload.get("holdoutRatio")),
             budget=budget,
             seed=_payload_int(payload, "seed", DEFAULT_SEED),
             template_ids=tuple(str(item) for item in payload.get("templateIds") or ()),
@@ -274,12 +278,14 @@ class MiningConfig:
 
 @dataclass(frozen=True)
 class PeriodSplit:
-    """Search window and frozen tail of one requested range. The tail is never searched."""
+    """Search, validation, and an optional reserved tail that no evaluation reads."""
 
     search_start: datetime
     search_end: datetime
     freeze_start: datetime
     freeze_end: datetime
+    holdout_start: datetime | None = None
+    holdout_end: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -340,12 +346,16 @@ class PoolIncrementEvidence:
     :func:`~app.services.factor_mining.incremental.residual_ic` orthogonalizes against), and
     ``skipped`` is what the pool could not rebuild -- members the measurement never sees, so the
     review is the only place that knows the pool was bigger than what was compared.
+
+    ``membership`` covers the fields' full warmup grid. The evaluator needs historical member
+    ranks for temporal subtrees; the residual measurement reads only the search return dates.
     """
 
     fields: Mapping[str, pd.DataFrame]
     returns: pd.DataFrame
     members: Mapping[str, pd.DataFrame]
     skipped: tuple[str, ...] = ()
+    membership: pd.DataFrame | None = None
 
 
 def _pool_name(fingerprint: Any) -> str:
@@ -450,11 +460,14 @@ def _comparison_set(
     )
     factor_ids = _computable_factor_ids(frames)[:max(0, int(factor_limit))]
     panels = _point_in_time_panels(frames, dates, factor_ids)
+    membership = _point_in_time_membership(panel)
+    comparison_membership = _point_in_time_membership(panel, index=pd.Index(dates), columns=pd.Index(frames))
+    panels = {name: values.where(comparison_membership) for name, values in panels.items()}
     members = pool_loader(
         user_id, config.market, config.timeframe, limit=max(0, int(pool_limit)),
     )
     rebuilt, skipped = pool_panels(members, panel.fields,
-                                   allowed_fields=fields_for(config.market))
+                                   allowed_fields=fields_for(config.market), membership=membership)
     pooled: list[str] = []
     for member in members:
         member_panel = rebuilt.get(member.fingerprint)
@@ -516,7 +529,9 @@ def _pool_increment_evidence(
         opening.shift(-(holding_period + 1)) / opening.shift(-1) - 1.0
     ).reindex(index=index)
     members = {
-        name: comparison.panels[name].reindex(index=index)
+        name: comparison.panels[name].set_axis(
+            pd.to_datetime(comparison.panels[name].index, utc=True).tz_localize(None),
+        ).reindex(index=index, columns=opening.columns)
         for name in comparison.pool
         if name in comparison.panels
     }
@@ -527,6 +542,7 @@ def _pool_increment_evidence(
     )
     return PoolIncrementEvidence(
         fields=panel.fields, returns=returns, members=members, skipped=skipped,
+        membership=_point_in_time_membership(panel),
     )
 
 
@@ -594,7 +610,7 @@ def _pool_increment_record(
 
 
 def split_periods(config: MiningConfig) -> PeriodSplit:
-    """Cut ``config``'s range by the market's own sessions: the last ``freeze_ratio`` of them.
+    """Reserve holdout sessions, then cut validation from the remaining market sessions.
 
     Sessions come from the market's calendar (``market_fields.sessions``): a market that trades
     every calendar day has ~40% more sessions than a business-day count finds, so counting it on
@@ -604,16 +620,23 @@ def split_periods(config: MiningConfig) -> PeriodSplit:
     after the last search session, so the two windows cannot share a bar.
     """
     ratio = _freeze_ratio(config.freeze_ratio)
+    holdout_ratio = _holdout_ratio(config.holdout_ratio)
     calendar = market_fields.sessions(config.market, config.start_date, config.end_date)
-    if len(calendar) < 2:
+    holdout_sessions = max(1, int(len(calendar) * holdout_ratio)) if holdout_ratio else 0
+    retained = calendar[:-holdout_sessions] if holdout_sessions else calendar
+    if len(retained) < 2:
         raise ValueError("factorMining.dateRangeTooShort")
-    search_sessions = min(len(calendar) - 1, max(1, int(len(calendar) * (1.0 - ratio))))
-    search_end = calendar[search_sessions - 1].to_pydatetime()
+    search_sessions = min(len(retained) - 1, max(1, int(len(retained) * (1.0 - ratio))))
+    search_end = retained[search_sessions - 1].to_pydatetime()
+    holdout_start = retained[-1].to_pydatetime() + timedelta(days=1) if holdout_sessions else None
+    freeze_end = holdout_start - timedelta(microseconds=1) if holdout_start else config.end_date
     return PeriodSplit(
         search_start=config.start_date,
         search_end=search_end,
         freeze_start=search_end + timedelta(days=1),
-        freeze_end=config.end_date,
+        freeze_end=freeze_end,
+        holdout_start=holdout_start,
+        holdout_end=config.end_date if holdout_sessions else None,
     )
 
 
@@ -724,9 +747,9 @@ class MiningDataProvider:
 
         The window is the only thing that differs between the search panel and the frozen one.
         The manifest, the as-of universe, the mode's warmup, the range check and the
-        data fingerprint are applied identically -- and the universe is resolved over the whole
-        requested range rather than the window, so both panels carry the same members and the
-        same point-in-time membership. A second copy of this method would be a second time
+        data fingerprint are applied identically -- and the universe is resolved over the search
+        and validation range, excluding the holdout, so both panels carry the same members and
+        point-in-time membership. A second copy of this method would be a second time
         semantics, and the frozen tail is the last place that may drift.
         """
         manifest = _portfolio_manifest(code)
@@ -734,7 +757,7 @@ class MiningDataProvider:
             user_id=user_id,
             manifest=manifest,
             start_date=config.start_date,
-            end_date=config.end_date,
+            end_date=split_periods(config).freeze_end,
         )
         if len(candidates) < MINIMUM_SYMBOLS:
             raise ValueError("factorMining.universeTooSmall")
@@ -756,6 +779,14 @@ class MiningDataProvider:
             fetch_start,
             end_date,
         )
+        # A provider can over-return. Drop later bars before enrichment and fingerprinting, so
+        # neither the validation segment nor the reserved tail enters a search measurement.
+        end = FactorResearchEngine._timestamp(end_date)
+        frames = {
+            symbol: clipped for symbol, frame in frames.items()
+            if not (clipped := frame.loc[pd.to_datetime(frame.index, utc=True).tz_localize(None)
+                                         <= end].copy()).empty
+        }
         if not frames:
             raise ValueError("factorMining.noMarketData")
         # Fetching drops members non-deterministically, and a cross-section of one or two
@@ -803,6 +834,29 @@ class FactorMiningEngine:
         self._data_provider = data_provider
         self._on_progress = on_progress
         self._pool_increment: PoolIncrementEvidence | None = None
+        self._freeze_split: PeriodSplit | None = None
+        self._freeze_snapshot_id: str | None = None
+
+    def freeze_evidence(self) -> dict[str, Any]:
+        """Report actual validation data identity, never a claim of a saved market snapshot."""
+        split = self._freeze_split
+        definition = self._split_payload(split) if split is not None else None
+        version = hashlib.sha256(json.dumps(
+            {"split": definition, "snapshotId": self._freeze_snapshot_id},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest() if split is not None else None
+        return {
+            "freezeSnapshotId": self._freeze_snapshot_id,
+            "freezeVersion": version,
+            "holdout": {
+                "reserved": bool(split and split.holdout_start is not None),
+                "startDate": split.holdout_start.isoformat()
+                if split and split.holdout_start is not None else None,
+                "endDate": split.holdout_end.isoformat()
+                if split and split.holdout_end is not None else None,
+                "evaluated": False,
+            },
+        }
 
     def run(
         self,
@@ -845,6 +899,8 @@ class FactorMiningEngine:
             user_id=user_id, code=code, config=config, search_mode=search_mode,
         )
         split = split_periods(config)
+        self._freeze_split = split
+        self._freeze_snapshot_id = None
         # Assembled once for the whole search, not once per candidate: every comparison panel is
         # a point-in-time rebuild, and the pool's members are re-evaluated expressions.
         comparison = self._data_provider.comparison_set(
@@ -861,7 +917,10 @@ class FactorMiningEngine:
         # order, which is what keeps a candidate's dates and symbols aligned with
         # ``fields["close"]``. Recomputing them here would silently paper over a provider that
         # handed out nothing.
-        evaluator = ExpressionEvaluator(panel.fields, allowed_fields=fields_for(config.market))
+        evaluator = ExpressionEvaluator(
+            panel.fields, allowed_fields=fields_for(config.market),
+            membership=_point_in_time_membership(panel),
+        )
         members = _resolved_members(panel.members)
         measured: dict[str, float] = {}
 
@@ -895,9 +954,20 @@ class FactorMiningEngine:
         )
         trials: list[dict[str, Any]] = []
         candidates: list[dict[str, Any]] = []
+        run_panels: dict[str, pd.DataFrame] = {}
         for evaluated, seed in enumerate(source, start=1):
-            verdict, metrics = self._evaluate(
-                seed.expression, evaluator, config, split, panel, members, comparison,
+            active_comparison = comparison
+            if run_panels:
+                active_comparison = ComparisonSet(
+                    factors=comparison.factors or (
+                        FactorResearchEngine._CORRELATION_FACTORS if not comparison.names() else ()
+                    ),
+                    pool=(*comparison.pool, *run_panels),
+                    panels={**comparison.panels, **run_panels},
+                    skipped=comparison.skipped,
+                )
+            verdict, metrics, candidate_panel = self._evaluate(
+                seed.expression, evaluator, config, split, panel, members, active_comparison,
             )
             if ai is not None:
                 # Written before the loop pulls again: resuming the AI source closes its round
@@ -921,6 +991,9 @@ class FactorMiningEngine:
                 "metrics": _trial_metrics(metrics),
             })
             if verdict.passed:
+                # The first survivor represents its numerical family; later proposals compare
+                # against it on the search window alone, without changing L6's historical pool.
+                run_panels[f"{POOL_NAMESPACE}{seed.fingerprint}"] = candidate_panel
                 candidates.append({
                     "expression": seed.expression,
                     "fingerprint": seed.fingerprint,
@@ -985,11 +1058,14 @@ class FactorMiningEngine:
         """
         if search_mode not in _SEARCH_MODES:
             raise ValueError("factorMining.invalidParameter")
+        self._freeze_split = split_periods(config)
+        self._freeze_snapshot_id = None
         if not survivors:
             return []
         panel = self._data_provider.prepare_freeze(
             user_id=user_id, code=code, config=config, search_mode=search_mode,
         )
+        self._freeze_snapshot_id = panel.snapshot_id
         split = split_periods(config)
         # The tail's own comparison set: the same rule as the search's, over the window this
         # panel covers, so a survivor's frozen measurement is priced like its in-sample one.
@@ -1006,7 +1082,10 @@ class FactorMiningEngine:
         )
         # Same contract as the search: the provider owns the field panels, and the review reads
         # them rather than rebuilding anything it was handed.
-        evaluator = ExpressionEvaluator(panel.fields, allowed_fields=fields_for(config.market))
+        evaluator = ExpressionEvaluator(
+            panel.fields, allowed_fields=fields_for(config.market),
+            membership=_point_in_time_membership(panel),
+        )
         members = _resolved_members(panel.members)
         reviewed: list[dict[str, Any]] = []
         for evaluated, survivor in enumerate(survivors, start=1):
@@ -1077,12 +1156,19 @@ class FactorMiningEngine:
         """
         try:
             panel = ExpressionEvaluator(
-                evidence.fields, allowed_fields=fields_for(config.market)).evaluate(expression)
+                evidence.fields, allowed_fields=fields_for(config.market),
+                membership=evidence.membership,
+            ).evaluate(expression)
+            panel = panel.set_axis(pd.to_datetime(panel.index, utc=True).tz_localize(None))
+            membership = evidence.membership
+            if membership is not None:
+                membership = membership.set_axis(pd.to_datetime(membership.index, utc=True).tz_localize(None))
             return residual_ic(
-                panel.reindex(index=evidence.returns.index),
+                panel.reindex(index=evidence.returns.index, columns=evidence.returns.columns),
                 evidence.members,
                 evidence.returns,
                 min_abs_rank_ic=config.thresholds.min_abs_rank_ic,
+                membership=membership,
             )
         except Exception:
             return _UNREADABLE_CANDIDATE
@@ -1096,8 +1182,8 @@ class FactorMiningEngine:
         panel: PreparedPanel,
         members: Sequence[Mapping[str, Any]],
         comparison: ComparisonSet,
-    ) -> tuple[GateVerdict, dict[str, Any]]:
-        """Score one candidate down the L1-L4 ladder: a verdict and the metrics behind it.
+    ) -> tuple[GateVerdict, dict[str, Any], pd.DataFrame | None]:
+        """Score L1-L4, returning the verdict, metrics, and a survivor's search-only panel.
 
         The whole body sits under one guard because ``ExpressionError`` is not the only way a
         candidate dies. The DSL validates shape and ranges, not values: ``div`` of two scalar
@@ -1109,25 +1195,35 @@ class FactorMiningEngine:
         A rejected candidate still returns whatever metrics were readable, so the ledger keeps
         the fold signs L3 reads alongside everything the other gates read.
         """
+        verdict = GateVerdict(passed=True, stage="L1", reason="")
+
+        def on_stage(stage: str, result: Mapping[str, Any]) -> bool:
+            nonlocal verdict
+            if stage == "metrics":
+                verdict = screen_metrics(result, config.thresholds)
+            elif stage == "stability":
+                verdict = screen_stability(_metrics_payload(result, config), config.thresholds)
+            else:
+                verdict = screen_redundancy(self._correlations(result, comparison), config.thresholds)
+            return verdict.passed
+
         try:
             normalize_expression(expression, allowed_fields=fields_for(config.market))
             candidate_panel = evaluator.evaluate(expression)
             metrics = _metrics_payload(
-                self._research(config, split, panel, members, candidate_panel, comparison), config,
+                self._research(config, split, panel, members, candidate_panel, comparison,
+                               on_stage=on_stage), config,
             )
         except Exception:
             # v1 has no per-candidate error budget: an unreadable candidate is rejected, and
             # the count of them is visible because each one still writes a trial.
-            return GateVerdict(passed=False, stage="L1", reason=INVALID_EXPRESSION_REASON), {}
-        for screen, payload in (
-            (screen_metrics, metrics),
-            (screen_stability, metrics),
-            (screen_redundancy, self._correlations(metrics, comparison)),
-        ):
-            verdict = screen(payload, config.thresholds)
-            if not verdict.passed:
-                return verdict, metrics
-        return GateVerdict(passed=True, stage="L4", reason=""), metrics
+            return GateVerdict(passed=False, stage="L1", reason=INVALID_EXPRESSION_REASON), {}, None
+        values = candidate_panel.loc[
+            (candidate_panel.index >= split.search_start) & (candidate_panel.index <= split.search_end)
+        ] if verdict.passed else None
+        if values is not None:
+            values = values.where(FactorResearchEngine._membership_panel(members, values.index, values.columns))
+        return verdict, metrics, values
 
     def _review(
         self,
@@ -1190,11 +1286,13 @@ class FactorMiningEngine:
         members: Sequence[Mapping[str, Any]],
         candidate_panel: pd.DataFrame,
         comparison: ComparisonSet,
+        *,
+        on_stage: Callable[[str, Mapping[str, Any]], bool] | None = None,
     ) -> dict[str, Any]:
         """Score the candidate panel over the search window."""
         return self._research_window(
             config, panel, members, candidate_panel, split.search_start, split.search_end,
-            comparison,
+            comparison, on_stage=on_stage,
         )
 
     def _research_window(
@@ -1206,6 +1304,8 @@ class FactorMiningEngine:
         start_date: datetime,
         end_date: datetime,
         comparison: ComparisonSet,
+        *,
+        on_stage: Callable[[str, Mapping[str, Any]], bool] | None = None,
     ) -> dict[str, Any]:
         """Score the candidate panel over one window of the panel's frames.
 
@@ -1225,12 +1325,9 @@ class FactorMiningEngine:
         quietly relax ``min_icir`` by the same factor -- a bar in one unit and a measurement in
         another is exactly the incomparability reusing this engine is meant to prevent.
 
-        The comparison set travels with the panel as an injected one. An assembled set that came
-        back empty is handed over as ``None`` instead, which is the research engine's "use the
-        built-in proxies": an empty mapping would leave the de-duplication gate with no finite
-        measurement at all, and its fail-closed rule would reject every candidate of the run --
-        a search with nothing pooled and no measurable registry factor would then never find
-        anything.
+        An empty assembled comparison set explicitly names the built-in proxies, preserving the
+        same fallback factors while measuring only the candidate's row. Public research callers
+        still receive the original full symmetric matrix by default.
         """
         return FactorResearchEngine().run(
             frames=panel.frames,
@@ -1247,8 +1344,9 @@ class FactorMiningEngine:
             annualization_periods=periods_per_year(
                 config.timeframe, {str(member.get("market") or "") for member in members},
             ),
-            comparison_factors=comparison.names() or None,
+            comparison_factors=comparison.names() or FactorResearchEngine._CORRELATION_FACTORS,
             comparison_panels=comparison.panels or None,
+            on_stage=on_stage,
         )
 
     def _correlations(self, metrics: Mapping[str, Any],
@@ -1338,12 +1436,16 @@ class FactorMiningEngine:
 
     @staticmethod
     def _split_payload(split: PeriodSplit) -> dict[str, str]:
-        return {
+        result = {
             "searchStart": split.search_start.isoformat(),
             "searchEnd": split.search_end.isoformat(),
             "freezeStart": split.freeze_start.isoformat(),
             "freezeEnd": split.freeze_end.isoformat(),
         }
+        if split.holdout_start is not None and split.holdout_end is not None:
+            result.update(holdoutStart=split.holdout_start.isoformat(),
+                          holdoutEnd=split.holdout_end.isoformat())
+        return result
 
     @staticmethod
     def _summary(
@@ -1397,6 +1499,23 @@ def _resolved_members(
     if any(member.get("key") for member in members):
         return members
     return ()
+
+
+def _point_in_time_membership(
+    panel: PreparedPanel,
+    *,
+    index: pd.Index | None = None,
+    columns: pd.Index | None = None,
+) -> pd.DataFrame:
+    """Use the research engine's membership semantics on the evaluator's full warmup grid."""
+    reference = panel.fields.get("close")
+    if reference is None:
+        reference = next(iter(panel.fields.values()), pd.DataFrame())
+    index = reference.index if index is None else index
+    columns = reference.columns if columns is None else columns
+    return FactorResearchEngine._membership_panel(
+        _resolved_members(panel.members), pd.to_datetime(index, utc=True).tz_localize(None), columns,
+    ).set_axis(index)
 
 
 def _metrics_payload(result: Mapping[str, Any], config: MiningConfig) -> dict[str, Any]:
@@ -1546,6 +1665,21 @@ def _freeze_ratio(value: Any) -> float:
         raise ValueError("factorMining.freezeRatioInvalid") from exc
     if not 0.0 < ratio < 0.5:
         raise ValueError("factorMining.freezeRatioInvalid")
+    return ratio
+
+
+def _holdout_ratio(value: Any) -> float:
+    """Only an absent ratio uses the legacy split; declared values must be finite fractions."""
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        raise ValueError("factorMining.invalidParameter")
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("factorMining.invalidParameter") from exc
+    if not math.isfinite(ratio) or not 0.0 <= ratio <= 0.30:
+        raise ValueError("factorMining.invalidParameter")
     return ratio
 
 
@@ -1708,7 +1842,7 @@ def _candidate_source(
             market=config.market,
             timeframe=config.timeframe,
             start_date=config.start_date,
-            end_date=config.end_date,
+            end_date=split_periods(config).freeze_end,
             budget=budget,
             rounds=config.ai_rounds,
             proposals_per_round=config.ai_proposals_per_round,
@@ -1721,6 +1855,7 @@ def _candidate_source(
                 market=config.market,
                 timeframe=config.timeframe,
                 exclude_run_id=ai.run_id,
+                **({"context": ai.history_context} if ai.history_context else {}),
             )),
             replay=ai.replay_proposals,
             replay_of=config.replay_job_id,

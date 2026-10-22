@@ -41,8 +41,9 @@ def _execute(kind: str, payload: dict, on_progress):
     raise ValueError(f"Unsupported durable agent job kind: {kind}")
 
 
-@celery_app.task(name="quantdinger.tasks.agent_job", acks_late=True)
-def execute_agent_job(job_id: str) -> None:
+@celery_app.task(bind=True, name="quantdinger.tasks.agent_job", acks_late=True,
+                 reject_on_worker_lost=True, max_retries=None)
+def execute_agent_job(self, job_id: str) -> None:
     from app.utils import agent_jobs
 
     row = agent_jobs.get_job_for_worker(job_id)
@@ -54,6 +55,15 @@ def execute_agent_job(job_id: str) -> None:
     kind = str(row.get("kind") or "")
     if not supports_kind(kind):
         raise ValueError(f"Unsupported durable agent job kind: {kind}")
+
+    if kind == "factor_mining":
+        from app.utils.factor_mining_jobs import JobLeaseBusy, run_job
+
+        try:
+            run_job(job_id, lambda payload, progress: _execute(kind, payload, progress))
+        except JobLeaseBusy as exc:
+            raise self.retry(exc=exc, countdown=exc.retry_after, queue="mining", max_retries=None)
+        return
 
     if not agent_jobs._set_status(job_id, "running", started_at=datetime.utcnow()):
         return
@@ -97,5 +107,6 @@ def execute_agent_job(job_id: str) -> None:
 @celery_app.task(name="quantdinger.tasks.expire_agent_jobs")
 def expire_agent_jobs() -> int:
     from app.utils.agent_jobs import expire_billed_jobs
+    from app.utils.factor_mining_jobs import recover_jobs
 
-    return expire_billed_jobs()
+    return expire_billed_jobs() + recover_jobs()

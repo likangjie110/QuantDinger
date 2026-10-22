@@ -29,11 +29,29 @@ factor_mining_blp = Blueprint("factor_mining", __name__)
 # next to the service's own ``__`` strip: that one guards where the mapping enters the service,
 # this one guards where the untrusted body enters the process.
 _RUN_FIELDS = frozenset({
-    "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio",
+    "sourceId", "sourceName", "market", "timeframe", "startDate", "endDate", "freezeRatio", "holdoutRatio",
     "budget", "seed", "templateIds", "groups", "holdingPeriod", "commission", "slippage",
     "neutralizeIndustry", "thresholds", "searchMode", "population", "generations", "eliteRatio",
     "aiRounds", "aiProposalsPerRound", "replayJobId", "researchNotes",
 })
+
+_RUN_REQUEST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        **{key: {} for key in sorted(_RUN_FIELDS)},
+        "holdoutRatio": {
+            "type": "number", "minimum": 0, "maximum": 0.3, "default": 0,
+            "description": "Reserve the tail without evaluating it; new product UI defaults to 0.10.",
+        },
+        "searchMode": {"type": "string", "enum": ["enumeration", "evolution", "ai"],
+                       "default": "enumeration"},
+        "replayJobId": {"type": "string", "description":
+                        "An owned terminal AI run. Submit only searchMode=ai and replayJobId to replay its recorded configuration."},
+    },
+}
+_RUN_REQUEST_BODY = {"required": True, "content": {
+    "application/json": {"schema": _RUN_REQUEST_SCHEMA},
+}}
 
 
 def _run_payload() -> dict:
@@ -98,6 +116,7 @@ def factor_mining_catalog():
 
 
 @factor_mining_blp.route("/estimate", methods=["POST"])
+@factor_mining_blp.doc(requestBody=_RUN_REQUEST_BODY)
 @login_required
 def estimate_factor_mining():
     """Price a search before submitting it: no source read, no panel, no job."""
@@ -114,6 +133,7 @@ def estimate_factor_mining():
 
 
 @factor_mining_blp.route("/run", methods=["POST"])
+@factor_mining_blp.doc(requestBody=_RUN_REQUEST_BODY)
 @login_required
 def run_factor_mining():
     """Queue one mining run. 202: the receipt is the job, not its result."""
@@ -144,7 +164,13 @@ def list_factor_mining_jobs():
 @factor_mining_blp.route("/jobs/<job_id>", methods=["GET"])
 @login_required
 def get_factor_mining_job(job_id: str):
-    """One job of the caller's. Another tenant's and another feature's are both not found."""
+    """One job of the caller's, including cumulative research evidence.
+
+    result.summary.research contains experimentId, contextHash, runTrials, cumulativeTrials,
+    freezeVersion, freezeSnapshotId and holdout (reserved, startDate, endDate, evaluated=false).
+    Holdout is reserved only; the data fingerprint does not imply a persisted market-data snapshot.
+    Another tenant's and another feature's jobs are both not found.
+    """
     job = get_factor_mining_service().get_job(job_id, user_id=int(g.user_id))
     if not job:
         return jsonify({"code": 0, "msg": "factorMining.jobNotFound", "data": None}), 404

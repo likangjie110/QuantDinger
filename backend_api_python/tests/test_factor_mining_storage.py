@@ -15,6 +15,7 @@ from datetime import datetime
 import pytest
 
 from app.services.factor_mining import storage
+from app.services.factor_mining.research import feedback_context
 from app.services.factor_mining.storage import FactorMiningRepository
 
 # What the ownership precheck's ``SELECT 1`` returns when the run belongs to the caller.
@@ -217,7 +218,7 @@ def test_upsert_candidates_converges_on_the_expression_hash(monkeypatch):
     ) == 1
 
     sql, rows = cursor.statements[1]
-    assert "ON CONFLICT (user_id, expression_hash) DO UPDATE" in sql
+    assert "ON CONFLICT (user_id, market, timeframe, expression_hash) DO UPDATE" in sql
     assert sql.count("?") == len(rows[0])  # every placeholder is bound
     assert len(rows) == 1
     assert "frozen" in cursor.statements[3][1][0]
@@ -445,7 +446,7 @@ def test_failure_summary_never_crosses_tenants(monkeypatch):
         user_id=4, market="USStock", timeframe="1d",
         exclude_run_id=9, history_runs=5, max_expressions=10)
     statements = [sql for sql, _params in cur.statements]
-    assert any("qd_factor_trials" in sql for sql in statements)
+    assert all("qd_factor_candidates" not in sql for sql in statements)
     for sql, params in cur.statements:
         if "user_id" in sql:
             assert 4 in params
@@ -456,11 +457,101 @@ def test_failure_summary_never_crosses_tenants(monkeypatch):
     for fragment in ("status = 'success'", "market = ?", "timeframe = ?", "id <> ?", "LIMIT ?"):
         assert fragment in run_sql
     assert run_params == (4, "USStock", "1d", 9, 5)
-    assert "qd_factor_candidates" in cur.statements[2][0]
-    assert cur.statements[2][1][-1] == 10  # max_expressions
+    assert "result_json" in run_sql
 
     assert set(summary) == {"runIds", "stageCounts", "recentFailures"}
     assert summary == {"runIds": [], "stageCounts": [], "recentFailures": []}
+
+
+def test_failure_summary_uses_frozen_run_results_and_bounds_oos_feedback(monkeypatch):
+    candidate = {"expression": {"op": "neg", "args": ["close"]},
+                 "fingerprint": "a" * 64, "status": "rejected",
+                 "reason": "factorMining.reject.poolIncrement",
+                 "metrics": {"rankIc": .04}, "outOfSample": {
+                     "rankIc": .01, "poolIncrement": {"passed": False, "deltaIc": -.02},
+                     "daily": list(range(1000)), "holdout": {"rankIc": .99}}}
+    cur = _record(monkeypatch, rows=[{"id": 8, "result_json": json.dumps({
+        "trials": [{"stage": "L2", "verdict": "reject", "reason": "coverage"}],
+        "candidates": [candidate]})}])
+    summary = FactorMiningRepository().failure_summary(
+        user_id=4, market="USStock", timeframe="1D", exclude_run_id=9,
+        context={"sourceId": 3, "startDate": "2024-01-01", "endDate": "2024-10-31",
+                 "freezeRatio": .3, "holdoutRatio": .1, "holdingPeriod": 5,
+                 "universe": {"kind": "static"}})
+    assert summary["runIds"] == [8]
+    assert any(row["stage"] == "L6" and row["count"] == 1 for row in summary["stageCounts"])
+    assert summary["recentFailures"][0]["outOfSample"]["rankIc"] == .01
+    assert "holdout" not in json.dumps(summary)
+    assert "daily" not in json.dumps(summary)
+    sql, params = cur.statements[0]
+    assert "holding_period" in sql and "source_id" in sql and "universe" in sql
+    assert 4 in params and "2024-01-01" in params and "2024-10-31" in params
+
+
+@pytest.mark.parametrize("config_change, context_key, expected_value", [
+    ({"start_date": "2024-02-01"}, "startDate", "2024-02-01"),
+    ({"end_date": "2024-09-30"}, "endDate", "2024-09-30"),
+    ({"freeze_ratio": .25}, "freezeRatio", .25),
+    ({"holdout_ratio": .2}, "holdoutRatio", .2),
+], ids=["start-date", "end-date", "freeze-ratio", "holdout-ratio"])
+def test_failure_summary_binds_changed_research_window_and_split(
+    monkeypatch, config_change, context_key, expected_value,
+):
+    """Pin the SQL contract; actual row exclusion belongs to the PostgreSQL check."""
+    config = {"source_id": 3, "market": "USStock", "timeframe": "1D",
+              "start_date": "2024-01-01", "end_date": "2024-10-31",
+              "holding_period": 5, "freeze_ratio": .3, "holdout_ratio": .1}
+    universe = {"kind": "static", "instruments": [{"symbol": "AAPL"}]}
+    manifest = {"universe": universe}
+    original_context = {"version": 1, "sourceId": 3, "market": "USStock", "timeframe": "1D",
+                        "startDate": "2024-01-01", "endDate": "2024-10-31",
+                        "holdingPeriod": 5, "freezeRatio": .3, "holdoutRatio": .1,
+                        "universe": universe}
+    assert feedback_context(config, manifest) == original_context
+    expected_context = {**original_context, context_key: expected_value}
+    requested_context = feedback_context({**config, **config_change}, manifest)
+    assert requested_context == expected_context
+    assert requested_context != original_context
+
+    cur = _record(monkeypatch)
+    summary = FactorMiningRepository().failure_summary(
+        user_id=4, market="USStock", timeframe="1D", exclude_run_id=9,
+        context=requested_context)
+
+    assert len(cur.statements) == 1
+    sql, params = cur.statements[0]
+    for clause in (
+        "AND LEFT(start_date, 10) = ?", "AND LEFT(end_date, 10) = ?",
+        "AND COALESCE((config_json::jsonb ->> 'freeze_ratio')::numeric, 0.3) = ?",
+        "AND COALESCE((config_json::jsonb ->> 'holdout_ratio')::numeric, 0) = ?",
+    ):
+        assert clause in sql
+    assert params == (
+        4, "USStock", "1D", 9, 3,
+        expected_context["startDate"], expected_context["endDate"], 5,
+        expected_context["freezeRatio"], expected_context["holdoutRatio"],
+        json.dumps(universe, ensure_ascii=False), 5,
+    )
+    assert summary == {"runIds": [], "stageCounts": [], "recentFailures": []}
+
+
+def test_register_experiment_trials_refuses_foreign_run(monkeypatch):
+    _record(monkeypatch, rows=[None])
+    with pytest.raises(storage.FactorMiningWriteError, match="factorMining.runNotFound"):
+        FactorMiningRepository().register_experiment_trials(
+            9, user_id=4, context={"sourceId": 3}, trials_count=5)
+
+
+def test_register_experiment_trials_keeps_the_original_run_contribution(monkeypatch):
+    cur = _record(monkeypatch, rows=[_OWNED_RUN, None,
+        {"id": 2, "cumulative_trials": 25}, None,
+        {"experiment_id": 2, "trials_count": 5}])
+    result = FactorMiningRepository().register_experiment_trials(
+        9, user_id=4, context={"sourceId": 3}, trials_count=5)
+    assert result["runTrials"] == 5 and result["cumulativeTrials"] == 25
+    assert result["experimentId"] == 2
+    assert not any("UPDATE qd_factor_mining_experiments" in sql for sql, _ in cur.statements)
+    assert any("FOR UPDATE" in sql for sql, _ in cur.statements)
 
 
 def test_get_run_by_job_id_scopes_by_user(monkeypatch):

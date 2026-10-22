@@ -268,3 +268,61 @@ def test_the_incremental_bar_is_the_l2_bar():
     the ladder and another to survive it, with nothing to notice the drift.
     """
     assert incremental.DEFAULT_MIN_ABS_RANK_IC == GateThresholds().min_abs_rank_ic
+
+
+def _p1_rotating_members():
+    dates = pd.date_range("2025-01-01", periods=4)
+    member = pd.DataFrame([[1., 2., 3., 4., 5., -1e12]] * 4,
+                          index=dates, columns=["A", "B", "C", "D", "E", "outsider"])
+    candidate = member * 10
+    returns = member.copy()
+    candidate["outsider"] = 1e12
+    returns["outsider"] = 1e12
+    candidate.loc[dates[:2], "E"] = 1e12
+    member.loc[dates[:2], "E"] = -1e12
+    returns.loc[dates[:2], "E"] = -1e12
+    candidate.loc[dates[2:], "D"] = -1e12
+    member.loc[dates[2:], "D"] = 1e12
+    returns.loc[dates[2:], "D"] = 1e12
+    membership = pd.DataFrame({"A": True, "B": True, "C": True,
+                               "D": [True, True, False, False], "E": [False, False, True, True],
+                               "outsider": False}, index=dates)
+    return candidate, member, returns, membership
+
+
+def test_p1_l6_raw_and_residual_ic_only_use_current_members_with_label_alignment():
+    candidate, member, returns, membership = _p1_rotating_members()
+    # A pool-only column and reversed axes cannot enlarge or reorder the candidate's universe.
+    member["pool_only"] = 1e15
+    returns["pool_only"] = -1e15
+    unfiltered = incremental.residual_ic(candidate, {MEMBER: member}, returns)
+    result = incremental.residual_ic(candidate, {MEMBER: member.iloc[::-1, ::-1]},
+                                     returns.iloc[::-1, ::-1], membership=membership.iloc[::-1, ::-1])
+
+    assert unfiltered.measured and abs(unfiltered.raw_ic - 1.) > 0.1
+    assert result.measured and result.has_incremental_value is False
+    assert np.isclose(result.raw_ic, 1.)
+    assert result.residual_ic == 0.
+    assert result.used_cross_sections == 4 and result.skipped_cross_sections == 0
+    assert result.reason == incremental.REJECT_NO_INCREMENTAL_VALUE
+
+
+def test_p1_l6_does_not_use_outsiders_to_fill_an_insufficient_cross_section():
+    candidate, member, returns, membership = _p1_rotating_members()
+    membership.loc[:, ["C", "D", "E"]] = False
+    result = incremental.residual_ic(candidate, {MEMBER: member}, returns, membership=membership)
+
+    assert result.measured is False and result.has_incremental_value is None
+    assert result.raw_ic is None and result.residual_ic is None
+    assert result.used_cross_sections == 0 and result.skipped_cross_sections == 4
+    assert result.reason == incremental.UNMEASURED_REASON
+
+
+def test_p1_l6_missing_membership_dates_or_symbols_are_inactive():
+    candidate, member, returns, membership = _p1_rotating_members()
+    membership = membership.drop(index=membership.index[0], columns="outsider")
+    result = incremental.residual_ic(candidate, {MEMBER: member}, returns, membership=membership)
+
+    assert result.measured and np.isclose(result.raw_ic, 1.)
+    assert result.residual_ic == 0.
+    assert result.used_cross_sections == 3 and result.skipped_cross_sections == 1

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from statistics import median
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import pandas as pd
 
@@ -85,6 +85,7 @@ class FactorResearchEngine:
         factor_panel: pd.DataFrame | None = None,
         comparison_factors: Sequence[str] | None = None,
         comparison_panels: Mapping[str, pd.DataFrame] | None = None,
+        on_stage: Callable[[str, Mapping[str, Any]], bool] | None = None,
     ) -> dict[str, Any]:
         """Run one factor's cross-sectional research. ``factor_panel`` overrides the built-in
         factor named by ``factor_id``, which factor mining uses to score a DSL expression --
@@ -96,6 +97,10 @@ class FactorResearchEngine:
         itself. ``None`` -- the default, and what every caller predating the parameter gets --
         keeps the six built-in proxies, byte for byte. See ``_factor_correlation`` for how the
         two modes differ and what an injected set costs.
+
+        ``on_stage`` optionally screens metrics, stability, then correlation before details are
+        built. Returning False ends the study with the measurements available so far. Without
+        the callback every stage runs and the public response remains the complete study.
         """
         requested_groups = max(2, min(10, int(groups or 5)))
         holding_period = max(1, int(holding_period or 5))
@@ -160,6 +165,7 @@ class FactorResearchEngine:
         previous_ranks: pd.Series | None = None
         total_observations = 0
         valid_observations = 0
+        cross_sections: list[tuple[pd.Timestamp, pd.DataFrame, pd.Series]] = []
 
         for timestamp in research_dates:
             active = membership.loc[timestamp]
@@ -190,6 +196,45 @@ class FactorResearchEngine:
             if pd.isna(ic):
                 continue
             ic_rows.append({"time": str(pd.Timestamp(timestamp)), "value": float(ic)})
+            cross_sections.append((timestamp, valid, ranks))
+
+        if not ic_rows:
+            raise ValueError("strategyV2.factorResearchInsufficientObservations")
+
+        ic_series = pd.Series([float(item["value"]) for item in ic_rows], dtype="float64")
+        ic_mean = float(ic_series.mean())
+        annualization = max(1.0, float(annualization_periods or 252.0))
+        ic_std = float(ic_series.std(ddof=1)) if len(ic_series) > 1 else 0.0
+        icir = ic_mean / ic_std * math.sqrt(annualization / holding_period) if ic_std > 0 else 0.0
+        coverage = valid_observations / total_observations if total_observations else 0.0
+        rolling = ic_series.rolling(20, min_periods=5).mean()
+        for index, item in enumerate(ic_rows):
+            item["rolling"] = None if pd.isna(rolling.iloc[index]) else float(rolling.iloc[index])
+        execution_assumptions = {
+            "signal": "close_point_in_time",
+            "entry": "next_bar_open",
+            "exit": f"open_after_{holding_period}_bars",
+            "commission": commission,
+            "slippage": slippage,
+            "periodsPerYear": annualization,
+            "initialFormationExcludedFromAverageTurnover": True,
+        }
+        result = {
+            "methodologyVersion": 2,
+            "factorId": factor_name,
+            "rankIc": ic_mean,
+            "icir": icir,
+            "icSeries": ic_rows,
+            "coverage": coverage,
+            "missingRate": 1.0 - coverage,
+            "executionAssumptions": execution_assumptions,
+        }
+        if on_stage is not None and not on_stage("metrics", result):
+            return result
+
+        # Group weights and turnover belong to stability. Returns, costs, curves and serialized
+        # membership details are only needed after the candidate clears all screening stages.
+        for timestamp, valid, ranks in cross_sections:
             if previous_ranks is not None:
                 aligned = pd.concat([previous_ranks, ranks], axis=1).dropna()
                 if len(aligned) >= 3:
@@ -206,7 +251,6 @@ class FactorResearchEngine:
                 q=effective_groups,
                 labels=False,
             ) + 1
-            period_group_returns: list[tuple[int, float]] = []
             for group in range(1, effective_groups + 1):
                 members_in_group = list(valid.index[labels == group])
                 if not members_in_group:
@@ -217,26 +261,57 @@ class FactorResearchEngine:
                 previous = previous_weights[group]
                 turnover = self._weight_turnover(previous, current_weights)
                 is_initial = not previous
-                cost_multiplier = 1.0 if is_initial else 2.0
-                cost = turnover * cost_multiplier * cost_rate
-                gross_return = float(valid.loc[members_in_group, "return"].mean())
-                net_return = gross_return - cost
                 previous_weights[group] = current_weights
                 observation = {
                     "time": str(pd.Timestamp(timestamp)),
                     "group": group,
-                    "grossReturn": gross_return,
-                    "netReturn": net_return,
                     "turnover": turnover,
-                    "cost": cost,
                     "isInitial": is_initial,
-                    "members": sorted(members_in_group),
-                    "memberCount": len(members_in_group),
+                    "members": members_in_group,
                     "crossSectionSize": len(valid),
                 }
                 group_returns[group].append(observation)
                 group_rows.append(observation)
-                period_group_returns.append((group, gross_return))
+
+        rebalance_rows = [item for item in group_rows if not item["isInitial"]]
+        average_turnover = (
+            sum(float(item["turnover"]) for item in rebalance_rows) / len(rebalance_rows)
+            if rebalance_rows else 0.0
+        )
+        first_half = ic_series.iloc[: max(1, len(ic_series) // 2)]
+        second_half = ic_series.iloc[max(1, len(ic_series) // 2):]
+        stability = {
+            "firstHalfIc": float(first_half.mean()) if not first_half.empty else 0.0,
+            "secondHalfIc": float(second_half.mean()) if not second_half.empty else 0.0,
+            "rankAutocorrelation": (
+                sum(rank_autocorrelations) / len(rank_autocorrelations)
+                if rank_autocorrelations else 0.0
+            ),
+        }
+        result.update(icir=icir, averageTurnover=average_turnover, stability=stability)
+        if on_stage is not None and not on_stage("stability", result):
+            return result
+        correlation = self._factor_correlation(
+            prepared, close, membership, research_dates, factor_name,
+            selected_panel=factor_panel, comparison_factors=comparison_factors,
+            comparison_panels=comparison_panels,
+        )
+        result["factorCorrelation"] = correlation
+        if on_stage is not None and not on_stage("correlation", result):
+            return result
+
+        sections_by_time = {str(pd.Timestamp(timestamp)): valid
+                            for timestamp, valid, _ranks in cross_sections}
+        period_returns: dict[str, list[tuple[int, float]]] = {}
+        for item in group_rows:
+            valid = sections_by_time[item["time"]]
+            members_in_group = item["members"]
+            gross_return = float(valid.loc[members_in_group, "return"].mean())
+            cost = item["turnover"] * (1.0 if item["isInitial"] else 2.0) * cost_rate
+            item.update(grossReturn=gross_return, netReturn=gross_return - cost, cost=cost,
+                        members=sorted(members_in_group), memberCount=len(members_in_group))
+            period_returns.setdefault(item["time"], []).append((item["group"], gross_return))
+        for period_group_returns in period_returns.values():
             if len(period_group_returns) >= 3:
                 group_numbers = pd.Series([item[0] for item in period_group_returns], dtype="float64")
                 returns_by_group = pd.Series([item[1] for item in period_group_returns], dtype="float64")
@@ -246,18 +321,6 @@ class FactorResearchEngine:
                 )
                 if not pd.isna(monotonicity):
                     monotonicities.append(float(monotonicity))
-
-        if not ic_rows:
-            raise ValueError("strategyV2.factorResearchInsufficientObservations")
-
-        ic_series = pd.Series([float(item["value"]) for item in ic_rows], dtype="float64")
-        ic_mean = float(ic_series.mean())
-        ic_std = float(ic_series.std(ddof=1)) if len(ic_series) > 1 else 0.0
-        annualization = max(1.0, float(annualization_periods or 252.0))
-        icir = ic_mean / ic_std * math.sqrt(annualization / holding_period) if ic_std > 0 else 0.0
-        rolling = ic_series.rolling(20, min_periods=5).mean()
-        for index, item in enumerate(ic_rows):
-            item["rolling"] = None if pd.isna(rolling.iloc[index]) else float(rolling.iloc[index])
 
         curves = []
         for group, values in group_returns.items():
@@ -279,14 +342,6 @@ class FactorResearchEngine:
             group_returns.get(effective_groups, []),
             group_returns.get(1, []),
         )
-        coverage = valid_observations / total_observations if total_observations else 0.0
-        rebalance_rows = [item for item in group_rows if not item["isInitial"]]
-        average_turnover = (
-            sum(float(item["turnover"]) for item in rebalance_rows) / len(rebalance_rows)
-            if rebalance_rows else 0.0
-        )
-        first_half = ic_series.iloc[: max(1, len(ic_series) // 2)]
-        second_half = ic_series.iloc[max(1, len(ic_series) // 2):]
         sample_diagnostics = self._sample_diagnostics(
             requested_groups=requested_groups,
             effective_groups=effective_groups,
@@ -315,33 +370,9 @@ class FactorResearchEngine:
             "effectiveGroups": effective_groups,
             "sampleDiagnostics": sample_diagnostics,
             "pointInTimeUniverseApplied": self._has_dated_membership(members or ()),
-            "factorCorrelation": self._factor_correlation(
-                prepared,
-                close,
-                membership,
-                research_dates,
-                factor_name,
-                selected_panel=factor_panel,
-                comparison_factors=comparison_factors,
-                comparison_panels=comparison_panels,
-            ),
-            "stability": {
-                "firstHalfIc": float(first_half.mean()) if not first_half.empty else 0.0,
-                "secondHalfIc": float(second_half.mean()) if not second_half.empty else 0.0,
-                "rankAutocorrelation": (
-                    sum(rank_autocorrelations) / len(rank_autocorrelations)
-                    if rank_autocorrelations else 0.0
-                ),
-            },
-            "executionAssumptions": {
-                "signal": "close_point_in_time",
-                "entry": "next_bar_open",
-                "exit": f"open_after_{holding_period}_bars",
-                "commission": commission,
-                "slippage": slippage,
-                "periodsPerYear": annualization,
-                "initialFormationExcludedFromAverageTurnover": True,
-            },
+            "factorCorrelation": correlation,
+            "stability": stability,
+            "executionAssumptions": execution_assumptions,
         }
 
     @classmethod

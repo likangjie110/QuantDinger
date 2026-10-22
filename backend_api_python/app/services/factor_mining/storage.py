@@ -1,14 +1,17 @@
 """Persistence for factor mining runs, candidates, and the trial ledger.
 
-Four lifetimes in four tables. A **run** is one job: its config, the fingerprint of the panel it
-searched, and the counts it ended with. A **candidate** converges -- ``(user_id, expression_hash)``
-is unique, so the same expression evaluated by a later run updates that row instead of adding a
-second one, and ``run_id`` keeps pointing at the run that judged it last. A **trial** does not
+The primary records have distinct lifetimes. A **run** is one job: its config, panel fingerprint
+and final counts. A **candidate** converges by user, market, timeframe and expression fingerprint,
+so re-evaluation in the same context updates its row and latest-run pointer. A **trial** does not
 converge: one row per evaluation, rejected candidates included, because that count is the
 deflated-Sharpe denominator the frozen review prices the search with, and a ledger missing its
 failures would understate exactly the bias the correction exists for. A **proposal** is what an AI
 run asked to evaluate, kept even when the evaluator never saw it, so a run can be audited and
 replayed from the record rather than from a fresh model call.
+
+A research group accumulates tuning attempts over the same source and split. Each run contributes
+once through a transactional registration; group totals price the next frozen review. Historical
+AI feedback reads completed run results, because the candidate library is a mutable current view.
 
 Serialization happens here and nowhere else. The engine's record mixes timestamp styles by design
 -- ``config`` is a ``MiningConfig`` dumped by ``asdict``, so it carries native ``datetime`` objects
@@ -28,18 +31,20 @@ No clock, network, or panel access: every method takes and returns plain mapping
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from typing import Any
 
 from app.utils.db import get_db_connection
+from app.services.factor_mining.research import context_hash
 
 
 RUN_NOT_FOUND = "factorMining.runNotFound"
 FINGERPRINT_INVALID = "factorMining.fingerprintInvalid"
 
-# ``normalize_expression`` always yields a sha256 hex digest; anything else would join the
-# ``UNIQUE (user_id, expression_hash)`` rows of unrelated expressions into one.
+# ``normalize_expression`` always yields a sha256 hex digest; anything else would join rows for
+# different expressions inside the same market and timeframe.
 _FINGERPRINT_LENGTH = 64
 
 
@@ -121,6 +126,36 @@ _PROPOSAL_KEYS = {
 
 
 class FactorMiningRepository:
+    def __init__(self) -> None:
+        self._execution: tuple[str, int, str] | None = None
+
+    def for_execution(self, *, job_id: str, user_id: int, token: str) -> FactorMiningRepository:
+        """Bind a repository copy to one worker claim without mutating the service singleton."""
+        if not job_id or not token:
+            raise FactorMiningWriteError("factorMining.workerInterrupted")
+        repository = type(self)()
+        repository._execution = (str(job_id), int(user_id), str(token))
+        return repository
+
+    def _execution_guard(self, cur: Any) -> None:
+        if self._execution is not None:
+            from app.utils.factor_mining_jobs import assert_execution
+
+            job_id, user_id, token = self._execution
+            assert_execution(cur, job_id=job_id, user_id=user_id, token=token)
+
+    def _run_scope(self) -> tuple[str, tuple[Any, ...]]:
+        if self._execution is None:
+            return "", ()
+        job_id, _user_id, token = self._execution
+        return " AND job_id = ? AND execution_token = ?", (job_id, token)
+
+    def _assert_execution_user(self, user_id: int, job_id: str | None = None) -> None:
+        if self._execution is not None:
+            owner_job, owner_user, _token = self._execution
+            if int(user_id) != owner_user or (job_id is not None and job_id != owner_job):
+                raise FactorMiningWriteError(RUN_NOT_FOUND)
+
     def _assert_run_owner(self, cur: Any, run_id: int, user_id: int) -> None:
         """Refuse a write aimed at a run that is missing or belongs to someone else.
 
@@ -128,9 +163,12 @@ class FactorMiningRepository:
         ownership would store nothing for a foreign run and still hand back a row count, and the
         caller records that count as the trial ledger's size.
         """
+        self._assert_execution_user(user_id)
+        self._execution_guard(cur)
+        scope, values = self._run_scope()
         cur.execute(
-            "SELECT 1 FROM qd_factor_mining_runs WHERE id = ? AND user_id = ?",
-            (int(run_id), int(user_id)),
+            "SELECT 1 FROM qd_factor_mining_runs WHERE id = ? AND user_id = ?" + scope,
+            (int(run_id), int(user_id), *values),
         )
         if cur.fetchone() is None:
             raise FactorMiningWriteError(RUN_NOT_FOUND)
@@ -156,15 +194,19 @@ class FactorMiningRepository:
         ``job_id`` is the agent job that drives this run; it is what lets a proposal lookup work
         while the job is still running or after it failed.
         """
+        self._assert_execution_user(user_id, job_id)
+        if self._execution is not None and status != "running":
+            raise FactorMiningWriteError("factorMining.invalidParameter")
         with get_db_connection() as db:
             cur = db.cursor()
+            self._execution_guard(cur)
             cur.execute(
                 """
                 INSERT INTO qd_factor_mining_runs
                 (user_id, source_id, source_name, market, timeframe, start_date, end_date,
-                 snapshot_id, config_json, manifest_json, result_json, status, job_id,
+                 snapshot_id, config_json, manifest_json, result_json, status, job_id, execution_token,
                  trials_count, candidates_count, frozen_count, error_message, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, 0, 0, 0, '', NOW())
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, 0, 0, 0, '', NOW())
                 """,
                 (
                     int(user_id), int(source_id), str(source_name or ""),
@@ -172,6 +214,7 @@ class FactorMiningRepository:
                     _window_text(config.get("start_date")), _window_text(config.get("end_date")),
                     str(snapshot_id or ""), _dump(dict(config)), _dump(dict(manifest)),
                     str(status or "running"), str(job_id or ""),
+                    self._execution[2] if self._execution else "",
                 ),
             )
             run_id = int(cur.lastrowid or 0)
@@ -197,27 +240,66 @@ class FactorMiningRepository:
         insert stored. The update is scoped to the caller's own run and simply matches nothing
         otherwise -- there is no payload a caller could lose by failing to close a foreign run.
         """
-        summary = result.get("summary") if isinstance(result, Mapping) else None
-        summary = summary if isinstance(summary, Mapping) else {}
+        if self._execution is not None and status not in {"failed", "cancelled"}:
+            raise FactorMiningWriteError("factorMining.invalidParameter")
         with get_db_connection() as db:
             cur = db.cursor()
-            cur.execute(
-                """
-                UPDATE qd_factor_mining_runs
-                SET status = ?, error_message = ?, result_json = ?,
-                    trials_count = ?, candidates_count = ?, frozen_count = ?,
-                    snapshot_id = COALESCE(NULLIF(?, ''), snapshot_id)
-                WHERE id = ? AND user_id = ?
-                """,
-                (
-                    str(status or ""), str(error_message or ""), _dump(dict(result)),
-                    _count(summary.get("trials")), _count(summary.get("candidates")),
-                    _count(summary.get("frozen")), str(summary.get("snapshotId") or ""),
-                    int(run_id), int(user_id),
-                ),
-            )
-            db.commit()
-            cur.close()
+            try:
+                if self._execution is not None:
+                    self._assert_run_owner(cur, run_id, user_id)
+                self._write_run_result(cur, run_id, user_id, status, result, error_message)
+                if self._execution is not None:
+                    self._write_job_result(cur, "cancelled" if status == "cancelled" else "failed",
+                                           result, error_message)
+                db.commit()
+            finally:
+                cur.close()
+
+    def _write_run_result(
+        self, cur: Any, run_id: int, user_id: int, status: str,
+        result: Mapping[str, Any], error_message: str = "",
+    ) -> None:
+        summary = result.get("summary") or {}
+        scope, values = self._run_scope()
+        cur.execute(
+            """UPDATE qd_factor_mining_runs
+               SET status = ?, error_message = ?, result_json = ?,
+                   trials_count = ?, candidates_count = ?, frozen_count = ?,
+                   snapshot_id = COALESCE(NULLIF(?, ''), snapshot_id)
+               WHERE id = ? AND user_id = ?""" + scope,
+            (str(status), str(error_message), _dump(dict(result)),
+             _count(summary.get("trials")), _count(summary.get("candidates")),
+             _count(summary.get("frozen")), str(summary.get("snapshotId") or ""),
+             int(run_id), int(user_id), *values),
+        )
+
+    def _write_job_result(
+        self, cur: Any, status: str, result: Mapping[str, Any], error_message: str = "",
+    ) -> None:
+        job_id, user_id, token = self._execution
+        cur.execute(
+            """UPDATE qd_agent_jobs
+               SET status = ?, result = ?::jsonb, error = ?, progress = ?::jsonb,
+                   finished_at = NOW(), lease_expires_at = NULL
+               WHERE job_id = ? AND user_id = ? AND execution_token = ? AND status = 'running'""",
+            (status, _dump(dict(result)), error_message or None, _dump({"phase": status}),
+             job_id, user_id, token),
+        )
+
+    def publish_run(self, run_id: int, *, user_id: int, result: Mapping[str, Any]) -> None:
+        """Publish final candidates and both successful timelines in one fenced transaction."""
+        with get_db_connection() as db:
+            cur = db.cursor()
+            try:
+                self._assert_run_owner(cur, run_id, user_id)
+                self._write_candidates(cur, user_id=user_id, run_id=run_id,
+                                       candidates=result.get("candidates") or ())
+                self._write_run_result(cur, run_id, user_id, "success", result)
+                if self._execution is not None:
+                    self._write_job_result(cur, "succeeded", result)
+                db.commit()
+            finally:
+                cur.close()
 
     def save_trials(
         self,
@@ -267,6 +349,66 @@ class FactorMiningRepository:
                 cur.close()
         return len(rows)
 
+    def register_experiment_trials(
+        self, run_id: int, *, user_id: int, context: Mapping[str, Any], trials_count: int,
+    ) -> dict[str, Any]:
+        """Count a run once, serializing concurrent registrations in the same research group."""
+        if isinstance(trials_count, bool) or not isinstance(trials_count, int) or trials_count < 0:
+            raise FactorMiningWriteError("factorMining.invalidParameter")
+        self._assert_execution_user(user_id)
+        fingerprint = context_hash(context)
+        with get_db_connection() as db:
+            cur = db.cursor()
+            try:
+                # Lock the run before the group: a repeated run cannot change groups concurrently.
+                self._execution_guard(cur)
+                scope, values = self._run_scope()
+                cur.execute("SELECT id FROM qd_factor_mining_runs WHERE id = ? AND user_id = ?" +
+                            scope + " FOR UPDATE", (int(run_id), int(user_id), *values))
+                if cur.fetchone() is None:
+                    raise FactorMiningWriteError(RUN_NOT_FOUND)
+                cur.execute("""
+                    INSERT INTO qd_factor_mining_experiments (user_id, context_hash, context_json)
+                    VALUES (?, ?, ?) ON CONFLICT (user_id, context_hash) DO NOTHING RETURNING id
+                    """, (int(user_id), fingerprint, _dump(dict(context))))
+                cur.fetchone()
+                cur.execute("""
+                    SELECT id, cumulative_trials FROM qd_factor_mining_experiments
+                    WHERE user_id = ? AND context_hash = ? FOR UPDATE
+                    """, (int(user_id), fingerprint))
+                group = cur.fetchone()
+                if group is None:
+                    raise FactorMiningWriteError("factorMining.invalidParameter")
+                experiment_id = int(group["id"])
+                cumulative = int(group["cumulative_trials"])
+                cur.execute("""
+                    INSERT INTO qd_factor_mining_experiment_runs
+                        (run_id, user_id, experiment_id, trials_count)
+                    VALUES (?, ?, ?, ?) ON CONFLICT (run_id) DO NOTHING
+                    RETURNING experiment_id, trials_count
+                    """, (int(run_id), int(user_id), experiment_id, trials_count))
+                contribution = cur.fetchone()
+                if contribution is not None:
+                    cur.execute("""
+                        UPDATE qd_factor_mining_experiments
+                        SET cumulative_trials = cumulative_trials + ?, updated_at = NOW()
+                        WHERE id = ? AND user_id = ? RETURNING cumulative_trials
+                        """, (trials_count, experiment_id, int(user_id)))
+                    cumulative = int(cur.fetchone()["cumulative_trials"])
+                else:
+                    cur.execute("""
+                        SELECT experiment_id, trials_count FROM qd_factor_mining_experiment_runs
+                        WHERE run_id = ? AND user_id = ?
+                        """, (int(run_id), int(user_id)))
+                    contribution = cur.fetchone()
+                    if contribution is None or int(contribution["experiment_id"]) != experiment_id:
+                        raise FactorMiningWriteError("factorMining.invalidParameter")
+                db.commit()
+                return {"experimentId": experiment_id, "contextHash": fingerprint,
+                        "runTrials": int(contribution["trials_count"]), "cumulativeTrials": cumulative}
+            finally:
+                cur.close()
+
     def upsert_candidates(
         self,
         *,
@@ -276,11 +418,10 @@ class FactorMiningRepository:
     ) -> int:
         """Write the candidate library and return how many rows were written.
 
-        ``(user_id, expression_hash)`` is the identity, so re-evaluating an expression updates its
-        row -- status, reason, metrics, out-of-sample metrics -- and moves ``run_id`` to the run
-        that judged it last, rather than growing the table with a copy per run. A normal run calls
-        this twice over the same expressions: the search writes survivors as ``search``, and the
-        frozen review writes their final status and out-of-sample metrics on top.
+        ``(user_id, market, timeframe, expression_hash)`` is the identity. Re-evaluating an
+        expression in the same context updates its status and metrics and moves ``run_id`` to the
+        run that judged it last. Normal mining publishes only after the frozen review; this helper
+        remains available for explicit repository operations in the same transaction boundary.
 
         The market and timeframe are read from the owning run inside the statement, because a
         candidate record carries neither: it is the run that knows which market was searched. A
@@ -288,30 +429,40 @@ class FactorMiningRepository:
         written, and a candidate with no fingerprint raises rather than being stored under ``''``
         -- the unique key would fold every such candidate into one row and lose the rest.
         """
-        for index, candidate in enumerate(candidates):
-            if len(str(candidate.get("fingerprint") or "")) != _FINGERPRINT_LENGTH:
-                raise FactorMiningWriteError(f"{FINGERPRINT_INVALID}:{index}")
-        rows = [
-            (
-                int(user_id), int(run_id), _dump(candidate.get("expression") or {}),
-                str(candidate.get("fingerprint") or ""), str(candidate.get("origin") or ""),
-                str(candidate.get("template_id") or ""), str(candidate.get("status") or ""),
-                str(candidate.get("reason") or ""), _dump(candidate.get("metrics") or {}),
-                _dump(candidate.get("outOfSample") or {}), int(run_id),
-            )
-            for candidate in candidates
-        ]
-        if not rows:
+        if not candidates:
             return 0
+        self._candidate_rows(user_id, run_id, candidates)
         with get_db_connection() as db:
             cur = db.cursor()
             try:
                 self._assert_run_owner(cur, run_id, user_id)
-                # A duplicate fingerprint inside one batch is the caller's to prevent: the search
-                # dedupes before truncating (templates.py:242-245), and Postgres refuses a batch
-                # that reaches the same conflict target twice ("cannot affect row a second time").
-                cur.executemany(
-                    """
+                self._write_candidates(cur, user_id=user_id, run_id=run_id, candidates=candidates)
+                db.commit()
+            finally:
+                cur.close()
+        return len(candidates)
+
+    @staticmethod
+    def _candidate_rows(user_id: int, run_id: int, candidates: Sequence[Mapping[str, Any]]) -> list:
+        for index, candidate in enumerate(candidates):
+            if len(str(candidate.get("fingerprint") or "")) != _FINGERPRINT_LENGTH:
+                raise FactorMiningWriteError(f"{FINGERPRINT_INVALID}:{index}")
+        return [
+            (int(user_id), int(run_id), _dump(candidate.get("expression") or {}),
+             str(candidate.get("fingerprint") or ""), str(candidate.get("origin") or ""),
+             str(candidate.get("template_id") or ""), str(candidate.get("status") or ""),
+             str(candidate.get("reason") or ""), _dump(candidate.get("metrics") or {}),
+             _dump(candidate.get("outOfSample") or {}), int(run_id))
+            for candidate in candidates
+        ]
+
+    def _write_candidates(
+        self, cur: Any, *, user_id: int, run_id: int, candidates: Sequence[Mapping[str, Any]],
+    ) -> None:
+        rows = self._candidate_rows(user_id, run_id, candidates)
+        if rows:
+            cur.executemany(
+                """
                     INSERT INTO qd_factor_candidates
                     (user_id, run_id, expression_json, expression_hash, origin, template_id,
                      market, timeframe, status, reject_reason, metrics_json, out_of_sample_json,
@@ -319,7 +470,7 @@ class FactorMiningRepository:
                     SELECT ?, ?, ?, ?, ?, ?, run.market, run.timeframe, ?, ?, ?, ?, NOW(), NOW()
                     FROM qd_factor_mining_runs AS run
                     WHERE run.id = ?
-                    ON CONFLICT (user_id, expression_hash) DO UPDATE
+                    ON CONFLICT (user_id, market, timeframe, expression_hash) DO UPDATE
                     SET run_id = EXCLUDED.run_id,
                         expression_json = EXCLUDED.expression_json,
                         origin = EXCLUDED.origin,
@@ -331,13 +482,8 @@ class FactorMiningRepository:
                         metrics_json = EXCLUDED.metrics_json,
                         out_of_sample_json = EXCLUDED.out_of_sample_json,
                         updated_at = NOW()
-                    """,
-                    rows,
-                )
-                db.commit()
-            finally:
-                cur.close()
-        return len(rows)
+                """, rows,
+            )
 
     def save_proposals(
         self,
@@ -510,6 +656,25 @@ class FactorMiningRepository:
             cur.close()
         return self._hydrate_run(row) if row else None
 
+    def get_recovery_run(self, job_id: str, *, user_id: int) -> dict[str, Any] | None:
+        """Find recorded material even if a newer attempt died before copying proposals."""
+        with get_db_connection() as db:
+            cur = db.cursor()
+            try:
+                cur.execute(
+                    f"""SELECT {_RUN_COLUMNS} FROM qd_factor_mining_runs
+                        WHERE job_id = ? AND user_id = ? AND status = 'failed'
+                          AND EXISTS (SELECT 1 FROM qd_factor_proposals AS proposal
+                                      WHERE proposal.run_id = qd_factor_mining_runs.id
+                                        AND proposal.user_id = qd_factor_mining_runs.user_id)
+                        ORDER BY id DESC LIMIT 1""",
+                    (str(job_id), int(user_id)),
+                )
+                row = cur.fetchone()
+            finally:
+                cur.close()
+        return self._hydrate_run(row) if row else None
+
     def list_candidates(
         self,
         *,
@@ -610,70 +775,76 @@ class FactorMiningRepository:
         exclude_run_id: int,
         history_runs: int = 5,
         max_expressions: int = 10,
+        context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """What the same tenant's recent successful runs in this market failed on.
+        """Bounded failures from the same tenant's compatible completed run records.
 
         Cross-run evidence only -- a run's own results arrive through the engine's outcome callback,
         not from these tables, because trials are written after the search returns. Every query is
-        scoped by ``user_id``, and the run scope also pins ``market``/``timeframe`` and skips the
-        run being planned, so a summary cannot summarise another tenant's search.
+        scoped by ``user_id`` and market/timeframe; a supplied context additionally pins the
+        source/universe, holding period, requested window and split. L5/L6 failures are read from
+        result_json rather than mutable candidate rows. Holdout measurements are never included.
         """
-        recent_runs = """
-            SELECT id
+        context_sql = ""
+        context_params: list[Any] = []
+        if context:
+            context_sql = """
+              AND source_id = ? AND LEFT(start_date, 10) = ? AND LEFT(end_date, 10) = ?
+              AND COALESCE((config_json::jsonb ->> 'holding_period')::int, 5) = ?
+              AND COALESCE((config_json::jsonb ->> 'freeze_ratio')::numeric, 0.3) = ?
+              AND COALESCE((config_json::jsonb ->> 'holdout_ratio')::numeric, 0) = ?
+              AND manifest_json::jsonb -> 'universe' = ?::jsonb
+            """
+            context_params = [int(context["sourceId"]), str(context["startDate"]),
+                              str(context["endDate"]), int(context["holdingPeriod"]),
+                              float(context["freezeRatio"]), float(context["holdoutRatio"]),
+                              _dump(context.get("universe") or {})]
+        recent_runs = f"""
+            SELECT id, result_json
             FROM qd_factor_mining_runs
             WHERE user_id = ? AND market = ? AND timeframe = ?
               AND status = 'success' AND id <> ?
+              {context_sql}
             ORDER BY id DESC
             LIMIT ?
         """
         scope = (
             int(user_id), str(market or ""), str(timeframe or ""), int(exclude_run_id),
-            max(0, int(history_runs)),
+            *context_params, max(0, min(20, int(history_runs))),
         )
         with get_db_connection() as db:
             cur = db.cursor()
-            cur.execute(f"SELECT id FROM ({recent_runs}) AS recent", scope)
-            run_ids = [_count(row.get("id")) for row in cur.fetchall() or []]
-            cur.execute(
-                f"""
-                SELECT stage, verdict, reject_reason AS reason, COUNT(*) AS count
-                FROM qd_factor_trials
-                WHERE user_id = ? AND run_id IN ({recent_runs})
-                GROUP BY stage, verdict, reject_reason
-                ORDER BY stage, verdict, reject_reason
-                """,
-                (int(user_id), *scope),
-            )
-            stage_counts = [
-                {
-                    "stage": str(row.get("stage") or ""),
-                    "verdict": str(row.get("verdict") or ""),
-                    "reason": str(row.get("reason") or ""),
-                    "count": _count(row.get("count")),
-                }
-                for row in cur.fetchall() or []
-            ]
-            cur.execute(
-                f"""
-                SELECT expression_json, expression_hash, status, reject_reason, metrics_json
-                FROM qd_factor_candidates
-                WHERE user_id = ? AND run_id IN ({recent_runs}) AND status <> 'frozen'
-                ORDER BY updated_at DESC, id DESC
-                LIMIT ?
-                """,
-                (int(user_id), *scope, max(0, int(max_expressions))),
-            )
-            recent_failures = [
-                {
-                    "expression": _expression_node(row.get("expression_json")),
-                    "expressionHash": str(row.get("expression_hash") or ""),
-                    "status": str(row.get("status") or ""),
-                    "reason": str(row.get("reject_reason") or ""),
-                    "metrics": _json_mapping(row.get("metrics_json")),
-                }
-                for row in cur.fetchall() or []
-            ]
-            cur.close()
+            try:
+                cur.execute(recent_runs, scope)
+                rows = cur.fetchall() or []
+            finally:
+                cur.close()
+        run_ids = [_count(row.get("id")) for row in rows]
+        counts: Counter[tuple[str, str, str]] = Counter()
+        recent_failures: list[dict[str, Any]] = []
+        limit = max(0, min(20, int(max_expressions)))
+        for row in rows:
+            record = _json_mapping(row.get("result_json"))
+            for trial in record.get("trials") or []:
+                counts[(str(trial.get("stage") or ""), str(trial.get("verdict") or ""),
+                        str(trial.get("reason") or "")[:160])] += 1
+            for candidate in record.get("candidates") or []:
+                if candidate.get("status") != "rejected":
+                    continue
+                oos = candidate.get("outOfSample") or {}
+                stage = "L6" if "poolIncrement" in oos else "L5"
+                reason = str(candidate.get("reason") or "")[:160]
+                counts[(stage, "reject", reason)] += 1
+                if len(recent_failures) < limit:
+                    recent_failures.append({
+                        "expression": candidate.get("expression"),
+                        "expressionHash": str(candidate.get("fingerprint") or ""),
+                        "status": "rejected", "stage": stage, "reason": reason,
+                        "metrics": _feedback_metrics(candidate.get("metrics") or {}),
+                        "outOfSample": _feedback_metrics(oos),
+                    })
+        stage_counts = [{"stage": stage, "verdict": verdict, "reason": reason, "count": count}
+                        for (stage, verdict, reason), count in sorted(counts.items())]
         return {
             "runIds": run_ids,
             "stageCounts": stage_counts,
@@ -717,6 +888,21 @@ class FactorMiningRepository:
         return item
 
 
+def _feedback_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Only bounded scalar research evidence enters a prompt, never curves or holdout data."""
+    keys = ("coverage", "rankIc", "icir", "averageTurnover", "stability", "sharpe",
+            "deflatedSharpe", "maxDrawdown", "sampleCount", "turnover", "longShortSharpe")
+    result = {key: metrics[key] for key in keys
+              if key in metrics and isinstance(metrics[key], (int, float, bool, str, type(None)))}
+    increment = metrics.get("poolIncrement")
+    if isinstance(increment, Mapping):
+        result["poolIncrement"] = {
+            key: increment[key] for key in ("hasIncrementalValue", "residualIc", "deltaIc", "passed", "reason")
+            if key in increment and isinstance(increment[key], (int, float, bool, str, type(None)))
+        }
+    return result
+
+
 def _dump(payload: Any) -> str:
     """One serializer for every ``*_json`` column: any payload in, valid JSON text out."""
     return json.dumps(payload, ensure_ascii=False, default=_json_default)
@@ -739,7 +925,7 @@ def _decode(raw: Any) -> Any:
 
 def _json_mapping(raw: Any) -> dict[str, Any]:
     """A stored JSON object; an unreadable or non-object payload reads as empty."""
-    value = _decode(raw)
+    value = raw if isinstance(raw, Mapping) else _decode(raw)
     return dict(value) if isinstance(value, Mapping) else {}
 
 

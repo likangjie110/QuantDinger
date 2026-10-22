@@ -41,9 +41,82 @@ Actor 邮箱、租约、fencing token、幂等键或订单对账。
 | 马丁、DCA、tick 驱动和交易时段驱动策略 | `trading-worker` | 带策略租约和 fencing 的本地实时调度器 |
 | 实盘待执行订单 | `trading-worker` | PostgreSQL 认领、运行时 fencing 校验、稳定客户端订单 ID |
 | AI、回测、报告与维护任务 | `celery-worker` | 持久 Redis 任务队列与任务重试策略 |
+| 有限因子挖掘任务 | `celery-mining-worker` | 同一持久任务 Redis 上的独立 `mining` 队列；沿用 agent-job 任务与 PostgreSQL 作业记录 |
 
 行情身份必须包含交易所/数据提供方、市场、市场类型、instrument ID 和周期。
 `BTC/USDT` 这样的符号字符串不是全局唯一行情源，绝不能作为唯一的路由键。
+
+## 因子挖掘队列容量
+
+因子挖掘沿用 `celery` 进程角色及 `quantdinger.tasks.agent_job(job_id)` 入口。
+新的 `factor_mining` 作业显式投递到 `mining`，通用 Worker 继续仅消费
+`jobs,ai,maintenance`。隔离的是 Worker 槽位与容器资源预算，交易所有权、作业 ID、
+取消和结果持久化保持原有契约。独立开发环境设置 `CELERY_TASKS_ENABLED=false` 时，
+仍使用既有本地执行器，不提供队列容量隔离。
+
+源码与 GHCR Compose 都启动 `celery-mining-worker`；本地前端构建覆盖文件继承该服务。
+生产覆盖文件为其应用与其他 Celery Worker 一致的非 root、只读文件系统与丢弃 capabilities
+配置。在项目根目录 `.env` 设置：
+
+```dotenv
+CELERY_MINING_REPLICAS=1
+CELERY_MINING_CONCURRENCY=1
+CELERY_MINING_PREFETCH=1
+CELERY_MINING_DB_POOL_MIN=1
+CELERY_MINING_DB_POOL_MAX=4
+CELERY_MINING_MEMORY_LIMIT=2g
+CELERY_MINING_CPU_LIMIT=1.0
+FACTOR_MINING_JOB_LEASE_SEC=120
+FACTOR_MINING_JOB_MAX_ATTEMPTS=3
+```
+
+CPU、内存限额按容器计算，DB pool 按子进程计算；挖掘连接池上限可按
+副本数 × 并发数 × pool max 估算。通用 Worker 保留 `CELERY_CONCURRENCY`。
+两类 Worker 仍共享 PostgreSQL、任务 Redis、存储和宿主机，队列隔离不代表容量已经验证，
+也不会消除共享瓶颈。提高并发或副本数前，测量内存、队列等待时间、作业耗时与数据库连接数。
+
+挖掘执行所有权保存在 PostgreSQL 作业行。每个有限 attempt 持有 execution token 与可续租
+lease，接管更换 token，旧 worker 写入被拒绝。上述默认值使同一作业最多执行3个 attempt。
+既有 maintenance 重投 lease 过期的 running 作业及排队超过60秒的 queued 作业；当前用户的
+提交、详情和列表请求也可触发同一有界恢复。本地执行器共用此所有权路径，broker 路径仍走
+`mining` 队列。恢复保留旧 run 审计，在同一 jobId 下创建新 run，并尽可能复用已记录的 AI 提案。
+
+启动这版后端/worker 前，既有一次性 migration 角色会应用已追加 P1 幂等 DDL 的
+`migrations/init.sql`；对应的 `20261019_factor_mining_p1.sql` 片段供隔离 schema 验证。
+候选身份新增市场/周期，最终候选、run成功与job成功在同一事务发布。旧版应用使用两列候选
+冲突目标，与此schema不兼容；迁移后回滚旧应用需要明确的兼容迁移，不能直接切回。候选内容
+和id不做重写。
+
+两类 Celery 容器的健康检查现在都定向检查自身节点 `celery@<容器 hostname>`，
+要求其活跃消费队列与预期集合完全一致：
+
+```bash
+docker compose exec -T celery-worker python -m app.commands.worker_health celery --queues jobs,ai,maintenance
+docker compose exec -T --index 1 celery-mining-worker python -m app.commands.worker_health celery --queues mining
+```
+
+逐个副本 index 执行挖掘检查。无响应、broker 错误、队列错误，或同时消费挖掘与通用队列时，
+检查失败。旧 `worker_health celery` 命令仍保留心跳检查。`/api/health/ready` 检查
+PostgreSQL 与 broker，`/api/health/workers` 汇总已登记心跳；这两个 HTTP 接口都不能证明
+挖掘消费者已就绪。
+
+升级时先启动并验证新的挖掘消费者，再启用新生产者。旧版本已写入 `jobs` 的挖掘消息由
+通用 Worker 排空；不要清空队列、改写消息或改写作业记录。回滚生产者前，保留兼容的挖掘
+Worker，先排空 `mining` 以及已执行、已预取的工作；仅消费 `jobs,ai,maintenance` 的
+旧 Worker 无法处理 `mining`。沿用既有平滑排空流程，并遵守上方 P1 schema 兼容边界。
+
+启动服务前先校验配置。以下检查不启动 Worker，也不代表吞吐量压测：
+
+```bash
+docker compose --env-file .env.example -f docker-compose.yml config --quiet
+docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.build.yml config --quiet
+docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.production.yml config --quiet
+docker compose --env-file .env.example -f docker-compose.ghcr.yml -f docker-compose.production.yml config --quiet
+```
+
+配置参考：[Celery 5.6 路由](https://docs.celeryq.dev/en/v5.6.3/userguide/routing.html)、
+[Worker 队列检查](https://docs.celeryq.dev/en/v5.6.3/userguide/workers.html#queues-list-of-active-queues)、
+[Compose 服务资源配置](https://docs.docker.com/reference/compose-file/services/)。
 
 ## 安全发布步骤
 

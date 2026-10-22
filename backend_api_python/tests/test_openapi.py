@@ -51,6 +51,29 @@ def test_openapi_shared_schemas(openapi_spec):
         assert name in schemas, f"missing shared schema {name}"
 
 
+def test_factor_mining_documents_holdout_and_research_evidence():
+    # Mount the blueprint alone: create_app performs database startup maintenance.
+    from flask import Flask
+    from flask_smorest import Api
+    from app.routes.factor_mining import factor_mining_blp
+
+    application = Flask(__name__)
+    application.config.update(API_TITLE="Factor mining test", API_VERSION="1",
+                              OPENAPI_VERSION="3.0.3")
+    api = Api(application)
+    api.register_blueprint(factor_mining_blp, url_prefix="/api/factor-mining")
+    paths = api.spec.to_dict()["paths"]
+    for endpoint in ("estimate", "run"):
+        operation = paths[f"/api/factor-mining/{endpoint}"]["post"]
+        schema = operation["requestBody"]["content"]["application/json"]["schema"]
+        assert schema["properties"]["holdoutRatio"] == {
+            "type": "number", "minimum": 0, "maximum": .3, "default": 0,
+            "description": "Reserve the tail without evaluating it; new product UI defaults to 0.10.",
+        }
+    detail = paths["/api/factor-mining/jobs/{job_id}"]["get"]
+    assert "cumulativeTrials" in detail["description"]
+
+
 def test_export_script_writes_yaml(tmp_path):
     """Regression: export_openapi.py produces parseable YAML."""
     import subprocess

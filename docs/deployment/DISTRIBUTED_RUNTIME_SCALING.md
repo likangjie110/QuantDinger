@@ -43,10 +43,98 @@ fencing tokens, idempotency keys, or order reconciliation.
 | Martingale, DCA, tick-driven, and session-driven runtime | `trading-worker` | Realtime local scheduler protected by strategy lease and fencing |
 | Pending live order submission | `trading-worker` | PostgreSQL claim, runtime fencing validation, stable client order ID |
 | AI, backtest, report, and maintenance job | `celery-worker` | Durable Redis jobs queue and task retry policy |
+| Finite factor-mining job | `celery-mining-worker` | Dedicated `mining` queue on the same durable jobs Redis; existing agent-job task and PostgreSQL job record |
 
 Market identity must include venue/provider, market, market type, instrument ID,
 and timeframe. A symbol string such as `BTC/USDT` is not a globally unique price
 stream and must never be used as the only routing key.
+
+## Factor-mining queue capacity
+
+Factor mining keeps the `celery` process role and the existing
+`quantdinger.tasks.agent_job(job_id)` entrypoint. New `factor_mining` jobs are
+published explicitly to `mining`; the general worker continues consuming only
+`jobs,ai,maintenance`. This isolates worker slots and container resource budgets
+without changing trading ownership, job IDs, cancellation, or result storage.
+With `CELERY_TASKS_ENABLED=false`, standalone development still uses the existing
+local executor and does not provide this queue isolation.
+
+The source and GHCR Compose files both start `celery-mining-worker`. The local
+frontend build override inherits it. The production override applies the same
+non-root, read-only filesystem and dropped capabilities as other Celery workers.
+Set the following in the project-root `.env`:
+
+```dotenv
+CELERY_MINING_REPLICAS=1
+CELERY_MINING_CONCURRENCY=1
+CELERY_MINING_PREFETCH=1
+CELERY_MINING_DB_POOL_MIN=1
+CELERY_MINING_DB_POOL_MAX=4
+CELERY_MINING_MEMORY_LIMIT=2g
+CELERY_MINING_CPU_LIMIT=1.0
+FACTOR_MINING_JOB_LEASE_SEC=120
+FACTOR_MINING_JOB_MAX_ATTEMPTS=3
+```
+
+CPU and memory limits apply per container; DB pools apply per child process.
+Estimate the mining DB connection ceiling as replicas × concurrency × pool max.
+The general worker keeps `CELERY_CONCURRENCY`. Both workers still share PostgreSQL,
+jobs Redis, storage, and the host, so queue separation does not prove capacity or
+eliminate shared bottlenecks. Measure memory, queue wait time, job duration and
+database connections before raising mining concurrency or replicas.
+
+Mining ownership is persisted on the PostgreSQL job row. Each finite attempt claims
+an execution token and renewable lease; a replacement receives a new token and stale
+writes are rejected. The defaults above cap a job at three attempts. Existing
+maintenance dispatches expired running jobs and queued rows older than 60 seconds;
+tenant-scoped submit/detail/list requests can trigger the same bounded recovery.
+The local executor also uses this ownership path, while the broker path remains
+the dedicated `mining` queue. Recovery preserves earlier run audit rows, starts a
+new run under the same job ID and reuses recorded AI proposals where available.
+
+The existing one-shot migration role applies the idempotent P1 DDL appended to
+`migrations/init.sql` before starting this backend/worker revision. The matching
+`20261019_factor_mining_p1.sql` fragment is used for isolated schema checks.
+Candidate identity now includes market and timeframe; candidate publication and successful run/job states commit together.
+The previous application revision's two-column candidate conflict target is not
+compatible with this schema: do not roll it back after migration without an
+explicit compatibility migration. No candidate content or IDs are rewritten.
+
+Both Celery container health checks now inspect the local node
+`celery@<container hostname>` and require exactly its expected active queues:
+
+```bash
+docker compose exec -T celery-worker python -m app.commands.worker_health celery --queues jobs,ai,maintenance
+docker compose exec -T --index 1 celery-mining-worker python -m app.commands.worker_health celery --queues mining
+```
+
+Repeat the mining check for every replica index. A missing reply, broker error,
+wrong queue, or mixed mining/general subscriptions fails the check. The legacy
+`worker_health celery` command retains its heartbeat check. `/api/health/ready`
+checks PostgreSQL and the broker, while `/api/health/workers` summarizes recorded
+heartbeats; neither HTTP endpoint proves that a mining consumer is available.
+
+During an upgrade, start and verify the new mining consumers before enabling new
+producers. Let pre-upgrade mining messages already in `jobs` finish on the general
+worker; do not purge queues, rewrite messages, or rewrite job records. Before
+rolling back producers, drain the `mining` queue and its active/reserved work while
+keeping its compatible worker running. Old workers consuming only
+`jobs,ai,maintenance` cannot drain `mining`. Follow the existing graceful drain
+procedure and the P1 schema compatibility boundary above.
+
+Validate configuration before starting services; these checks do not start a
+worker or benchmark throughput:
+
+```bash
+docker compose --env-file .env.example -f docker-compose.yml config --quiet
+docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.build.yml config --quiet
+docker compose --env-file .env.example -f docker-compose.yml -f docker-compose.production.yml config --quiet
+docker compose --env-file .env.example -f docker-compose.ghcr.yml -f docker-compose.production.yml config --quiet
+```
+
+Configuration references: [Celery 5.6 routing](https://docs.celeryq.dev/en/v5.6.3/userguide/routing.html),
+[worker queue inspection](https://docs.celeryq.dev/en/v5.6.3/userguide/workers.html#queues-list-of-active-queues),
+and [Compose service resource settings](https://docs.docker.com/reference/compose-file/services/).
 
 ## Safe release procedure
 

@@ -132,6 +132,7 @@ def residual_ic(
     returns: pd.DataFrame,
     *,
     min_abs_rank_ic: float = DEFAULT_MIN_ABS_RANK_IC,
+    membership: pd.DataFrame | None = None,
 ) -> PoolGain:
     """Judge what ``candidate_panel`` adds to the pool, one session at a time.
 
@@ -140,6 +141,10 @@ def residual_ic(
     member contributed which part of it is not what this answers). ``returns`` is the forward
     returns of the same window, aligned to the same symbols. All three are panels of the search
     window: dates on the index, symbols on the columns.
+
+    ``membership`` restricts every input to the same active symbols before sample counts, ranks,
+    raw IC or regression. Missing mask dates and symbols are inactive; None retains the original
+    unrestricted behavior. A pool member cannot enlarge the candidate's symbol domain.
 
     Sessions where the pool cannot be measured -- a member with no values on that session, a
     session too small for the fit, a flat candidate or a flat return column -- are skipped and
@@ -161,7 +166,7 @@ def residual_ic(
     readings: list[tuple[float, float]] = []
     skipped = 0
     for timestamp in candidate_panel.index:
-        section = _section(candidate_panel, members, returns, timestamp)
+        section = _section(candidate_panel, members, returns, timestamp, membership)
         if section is None or len(section) < max(MIN_CROSS_SECTION_SIZE, len(members) + 2):
             skipped += 1
             continue
@@ -213,6 +218,7 @@ def _section(
     members: list[pd.DataFrame],
     returns: pd.DataFrame,
     timestamp: pd.Timestamp,
+    membership: pd.DataFrame | None = None,
 ) -> pd.DataFrame | None:
     """One session as a frame: candidate, returns, then one column per pool member.
 
@@ -221,11 +227,17 @@ def _section(
     session the returns or any member does not cover at all, and a value that is infinite (a
     division by nothing, which no rank can order against the rest), are missing on the same terms.
     """
+    columns = candidate_panel.columns
+    if membership is not None:
+        if timestamp not in membership.index:
+            return None
+        active = membership.loc[timestamp].reindex(columns).fillna(False).astype(bool)
+        columns = columns[active.to_numpy()]
     rows = []
     for panel in (candidate_panel, returns, *members):
         if timestamp not in panel.index:
             return None
-        rows.append(panel.loc[timestamp].astype(float))
+        rows.append(panel.loc[timestamp].reindex(columns).astype(float))
     frame = pd.concat(rows, axis=1)
     return frame.where(np.isfinite(frame)).dropna()
 

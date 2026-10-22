@@ -3075,6 +3075,53 @@ paths:
         job.'
       tags:
       - FactorMining
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                aiProposalsPerRound: {}
+                aiRounds: {}
+                budget: {}
+                commission: {}
+                eliteRatio: {}
+                endDate: {}
+                freezeRatio: {}
+                generations: {}
+                groups: {}
+                holdingPeriod: {}
+                holdoutRatio:
+                  type: number
+                  minimum: 0
+                  maximum: 0.3
+                  default: 0
+                  description: Reserve the tail without evaluating it; new product
+                    UI defaults to 0.10.
+                market: {}
+                neutralizeIndustry: {}
+                population: {}
+                replayJobId:
+                  type: string
+                  description: An owned terminal AI run. Submit only searchMode=ai
+                    and replayJobId to replay its recorded configuration.
+                researchNotes: {}
+                searchMode:
+                  type: string
+                  enum:
+                  - enumeration
+                  - evolution
+                  - ai
+                  default: enumeration
+                seed: {}
+                slippage: {}
+                sourceId: {}
+                sourceName: {}
+                startDate: {}
+                templateIds: {}
+                thresholds: {}
+                timeframe: {}
       operationId: postApiFactorMiningEstimate
       x-visibility: internal
   /api/factor-mining/run:
@@ -3095,6 +3142,53 @@ paths:
       summary: 'Queue one mining run. 202: the receipt is the job, not its result.'
       tags:
       - FactorMining
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                aiProposalsPerRound: {}
+                aiRounds: {}
+                budget: {}
+                commission: {}
+                eliteRatio: {}
+                endDate: {}
+                freezeRatio: {}
+                generations: {}
+                groups: {}
+                holdingPeriod: {}
+                holdoutRatio:
+                  type: number
+                  minimum: 0
+                  maximum: 0.3
+                  default: 0
+                  description: Reserve the tail without evaluating it; new product
+                    UI defaults to 0.10.
+                market: {}
+                neutralizeIndustry: {}
+                population: {}
+                replayJobId:
+                  type: string
+                  description: An owned terminal AI run. Submit only searchMode=ai
+                    and replayJobId to replay its recorded configuration.
+                researchNotes: {}
+                searchMode:
+                  type: string
+                  enum:
+                  - enumeration
+                  - evolution
+                  - ai
+                  default: enumeration
+                seed: {}
+                slippage: {}
+                sourceId: {}
+                sourceName: {}
+                startDate: {}
+                templateIds: {}
+                thresholds: {}
+                timeframe: {}
       operationId: postApiFactorMiningRun
       x-visibility: internal
   /api/factor-mining/jobs:
@@ -3134,12 +3228,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HumanSuccessEnvelope'
-      summary: Get Api Factor Mining Jobs Job Id
+      summary: One job of the caller's, including cumulative research evidence.
+      description: 'result.summary.research contains experimentId, contextHash, runTrials,
+        cumulativeTrials,
+
+        freezeVersion, freezeSnapshotId and holdout (reserved, startDate, endDate,
+        evaluated=false).
+
+        Holdout is reserved only; the data fingerprint does not imply a persisted
+        market-data snapshot.
+
+        Another tenant''s and another feature''s jobs are both not found.'
       tags:
       - FactorMining
       operationId: getApiFactorMiningJobsJobId
-      description: One job of the caller's. Another tenant's and another feature's
-        are both not found.
       parameters:
       - name: job_id
         in: path

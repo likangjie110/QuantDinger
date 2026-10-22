@@ -109,6 +109,7 @@ def pool_panels(
     field_panels: Mapping[str, pd.DataFrame],
     *,
     allowed_fields: Collection[str] = PRICE_VOLUME_FIELDS,
+    membership: pd.DataFrame | None = None,
 ) -> tuple[dict[str, pd.DataFrame], list[dict[str, str]]]:
     """``(fingerprint -> rebuilt panel, the members no panel could be built for)``.
 
@@ -118,6 +119,9 @@ def pool_panels(
     validated against; a member is read under it too, or a member that names a field the market
     offers would be reported as unbuildable and count against the candidate.
 
+    ``membership`` filters cross-sectional operands with the same mask as the candidate. The
+    final panel is masked only after evaluation, preserving raw temporal history for warmup.
+
     A member whose stored expression no longer evaluates (an operator set that moved on, a row
     whose JSON did not parse) is handed back in ``skipped`` with its fingerprint, rather than
     dropped without a word: a caller that cannot tell "this member is unrelated to the candidate"
@@ -126,12 +130,17 @@ def pool_panels(
     answer with its own fail-closed rule, exactly as it would for a candidate nothing could be
     measured on.
     """
-    evaluator = ExpressionEvaluator(field_panels, allowed_fields=allowed_fields)
+    evaluator = ExpressionEvaluator(field_panels, allowed_fields=allowed_fields, membership=membership)
     panels: dict[str, pd.DataFrame] = {}
     skipped: list[dict[str, str]] = []
     for member in entries:
         try:
-            panels[member.fingerprint] = evaluator.evaluate(member.expression)
+            panel = evaluator.evaluate(member.expression)
+            if membership is not None:
+                panel = panel.where(
+                    membership.reindex(index=panel.index, columns=panel.columns).fillna(False).astype(bool)
+                )
+            panels[member.fingerprint] = panel
         except Exception:
             # Same contract as the search's own guard: an unreadable candidate is not fatal.
             skipped.append({

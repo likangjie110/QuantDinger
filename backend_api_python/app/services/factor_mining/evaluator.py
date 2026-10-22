@@ -6,6 +6,10 @@ has one, otherwise its first panel -- so dates and symbols line up across candid
 data stays missing: a field the mapping does not carry, or a symbol a field never covered,
 becomes NaN rather than an error, and the coverage gate decides what a gap means.
 
+An optional membership panel filters cross-sectional operands before their ranks, means or
+dispersion are computed. Raw fields and temporal subtrees retain pre-entry history for warmup;
+the research layer applies membership again when it reads the resulting factor cross-section.
+
 Subtrees are memoized on their canonical spelling (:func:`~app.services.factor_mining.dsl.
 normalize_expression`), so a subexpression shared by several branches is computed once. ``inf``
 is deliberately not filtered here: the cross-sectional layer in
@@ -25,12 +29,15 @@ import pandas as pd
 from app.services.factor_mining.dsl import PRICE_VOLUME_FIELDS, normalize_expression
 from app.services.factor_mining.operators import apply_operator
 
+_CROSS_SECTIONAL_OPERATORS = frozenset({"cs_rank", "cs_zscore", "cs_demean"})
+
 
 class ExpressionEvaluator:
     """Evaluate DSL expressions against a fixed set of price-volume panels."""
 
     def __init__(self, fields: Mapping[str, pd.DataFrame], *,
-                 allowed_fields: Collection[str] = PRICE_VOLUME_FIELDS) -> None:
+                 allowed_fields: Collection[str] = PRICE_VOLUME_FIELDS,
+                 membership: pd.DataFrame | None = None) -> None:
         self._fields = fields
         # The set the run validated against, not what the mapping happens to carry: a name the
         # mapping lacks is a missing column, which is the mapping's business and not a rejection.
@@ -39,6 +46,9 @@ class ExpressionEvaluator:
         if reference is None:
             reference = next(iter(fields.values()), pd.DataFrame())
         self._reference = reference
+        self._membership = None if membership is None else (
+            membership.reindex(index=reference.index, columns=reference.columns).fillna(False).astype(bool)
+        )
         self._cache: dict[str, Any] = {}
         self._hits = 0
 
@@ -64,9 +74,15 @@ class ExpressionEvaluator:
         if isinstance(node, str):
             value: Any = self._field(node)
         else:
+            arguments = [self._eval(argument) for argument in node.get("args") or []]
+            if self._membership is not None and node["op"] in _CROSS_SECTIONAL_OPERATORS:
+                arguments = [
+                    argument.where(self._membership) if isinstance(argument, pd.DataFrame) else argument
+                    for argument in arguments
+                ]
             value = apply_operator(
                 node["op"],
-                [self._eval(argument) for argument in node.get("args") or []],
+                arguments,
                 node.get("params") or {},
             )
         self._cache[key] = value

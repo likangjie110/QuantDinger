@@ -18,8 +18,9 @@ the HTTP surface, the job and budget limits, and every i18n key.
 - Screens candidates down a graded ladder (L1-L6), from "legal" to "still has out-of-sample
   evidence on the frozen window" and finally "still carries something the caller's own library
   does not".
-- Files results in the candidate library `qd_factor_candidates`: one row per distinct expression,
-  deduplicated across runs, with `run_id` pointing at the run that judged it last.
+- Files results in `qd_factor_candidates`: one current row per
+  `(user_id, market, timeframe, expression_hash)`. Re-evaluation in the same market/timeframe
+  updates that row and its `run_id`; another market or timeframe never overwrites it.
 - Keeps everything tenant-scoped, cancelable per job, and auditable afterwards -- config, data
   fingerprint, counts, and a per-candidate reject reason all land in the database.
 
@@ -64,6 +65,28 @@ curl -s "http://127.0.0.1:5000/api/factor-mining/candidates?status=frozen&limit=
 Once the job reaches `succeeded`, `GET /jobs/<jobId>` carries in `result` the data fingerprint
 `summary.snapshotId`, the three counts `summary.trials` / `summary.candidates` / `summary.frozen`,
 and the `split` block naming the search and frozen windows.
+
+Research governance: `holdoutRatio` accepts 0–0.30 and defaults to 0 for existing API clients;
+new product UI requests default to 0.10. The requested tail is reserved first, and `freezeRatio`
+splits the remaining range into search and validation. The reserved tail is not evaluated or
+provided to AI feedback. There is no final holdout evaluation endpoint in this release.
+
+`summary.research` reports the automatic experiment identity, this run's trial contribution,
+`cumulativeTrials`, `freezeVersion`, `freezeSnapshotId`, and reserved holdout boundaries
+(`evaluated: false`). Groups share user, source, market, timeframe, requested dates and split;
+changing seed, search mode, thresholds, holding period or costs does not reset the trial count.
+Registration counts each run once, and L5 uses the cumulative count. Existing runs are not rewritten.
+Freeze versions identify the split and actual validation-data fingerprint, not a saved market panel.
+
+Screening computes L2, L3 and L4 in sequence and builds full details only for survivors. L4 compares
+against both the historical frozen pool and earlier survivors in the same run, using search data.
+AI feedback matches source/universe semantics, holding period and research window, reads immutable
+run results, and includes bounded L5/L6 failures. One monotonic proposal-round deadline covers retries
+and model/provider fallbacks. Mining jobs use a dedicated `mining` Celery queue and worker capacity.
+
+The product UI offers enumeration, evolution and AI modes, explicit replay of eligible AI jobs,
+and job-to-candidate navigation that restores its run filter after refresh. Replay submits only
+`searchMode=ai` and `replayJobId`; the server copies the original configuration.
 
 ## 3. The expression DSL
 
@@ -203,7 +226,7 @@ further is checked.
 | **L1 legality** | DSL shape, fields, operators, parameter ranges -- and the evaluation itself (division by zero, overflow, a scalar handed to a panel operator) | -- | `factorMining.reject.invalid` |
 | **L2 quick screen** | Coverage, then IC observation count, then signal strength (`\|rankIC\|`) | coverage >= 0.60; observations >= 30; `\|rankIC\|` >= 0.02 | `factorMining.reject.lowCoverage` / `factorMining.reject.insufficientObservations` / `factorMining.reject.weakIc` |
 | **L3 stability** | ICIR, fold sign agreement, first/second half agreement, average turnover | ICIR >= 0.30; fold agreement >= 0.60; halves agree in sign; turnover <= 0.70 | `factorMining.reject.weakIcir` / `factorMining.reject.unstableFolds` / `factorMining.reject.unstableHalves` / `factorMining.reject.highTurnover` |
-| **L4 redundancy** | Absolute correlation against every comparison factor that was scored: the registry's factors against the built-in bar, the caller's own frozen pool (names carrying the `pool:` namespace) against the pool bar | built-ins < 0.85; pool < 0.85 | `factorMining.reject.duplicateBuiltin` / `factorMining.reject.duplicateInPool` / `factorMining.reject.unverifiableRedundancy` |
+| **L4 redundancy** | Absolute correlation on search data: registry factors against the built-in bar; the caller's historical frozen pool and earlier search survivors in this run (the `pool:` namespace) against the pool bar | built-ins < 0.85; pool < 0.85 | `factorMining.reject.duplicateBuiltin` / `factorMining.reject.duplicateInPool` / `factorMining.reject.unverifiableRedundancy` |
 | **L5 frozen out-of-sample** | In-sample and out-of-sample `rankIC` agree and clear the strength bar; deflated-Sharpe probability | `\|OOS rankIC\|` >= 0.01 and same sign as IS; DSR probability >= 0.95 | `factorMining.reject.weakOutOfSample` / `factorMining.reject.selectionBias` |
 | **L6 pool increment** | With the caller's whole frozen pool regressed out of the candidate on each session, is the residual still correlated with the forward returns, and on the same side as the raw IC | `\|residual IC\|` >= `min_abs_rank_ic` (0.02) **and** the residual IC carries the raw IC's sign | `factorMining.reject.noIncrementalValue` |
 
@@ -223,6 +246,11 @@ further is checked.
   to 0.85, but a run may weigh its own library differently from the registry's factors, so the two
   are read apart and the reject keys stay apart -- duplicating a built-in and duplicating what the
   caller already mined send a reader to different places.
+- **L4 also removes numerical duplicates within a run.** Earlier candidates that passed the
+  search gates join the `pool:` comparisons under `max_pool_correlation`. The first representative
+  is kept; a later expression with a different fingerprint but excessive absolute correlation is
+  rejected as `factorMining.reject.duplicateInPool` and still has a trial row. Only search data
+  selects the representative.
 - **L6 only retires on a measurement.** The increment has three states, and only one of them is a
   rejection: `true` (carries information), `false` (measured, carries nothing the pool does not --
   the only state a candidate may be retired on) and "no answer". A pool that is empty, or one
@@ -238,9 +266,10 @@ further is checked.
   series split into at most 4 equal folds, each fold contributing the sign of its mean). A missing
   series -- or one that yielded fewer than two folds -- means "not evaluated", so that check is
   skipped.
-- **L5's `trials` is the whole ledger.** The deflated-Sharpe denominator is **every candidate the
-  run evaluated, rejections included**, not the survivor count. Using survivors would underprice
-  the search itself and understate exactly the selection bias the correction exists for.
+- **L5's `trials` is cumulative within the research group.** Every evaluated candidate in this
+  run, rejections included, contributes once to the group's `cumulativeTrials`, which L5 uses for
+  the deflated-Sharpe correction. Counting only survivors or only the current run would understate
+  selection bias. Existing run results are not rewritten.
 - **Thresholds are overridable.** A `POST /run` payload may carry a `thresholds` object whose keys
   are the `GateThresholds` field names (snake_case): `min_coverage`, `min_ic_observations`,
   `min_abs_rank_ic`, `min_icir`, `min_fold_consistency`, `max_turnover`,
@@ -255,20 +284,35 @@ further is checked.
 
 ## 6. Time semantics and bias controls
 
-**Point-in-time universe.** The universe is resolved by `resolve_candidates` over the **whole
-requested range** (not the search window), so the search panel and the frozen panel carry the same
+**Point-in-time universe.** The universe is resolved by `resolve_candidates` over the **search
+and validation range, excluding holdout**, so the search panel and the frozen panel carry the same
 members and the same point-in-time membership.
+
+**One membership boundary for the DSL, L4 and L6.** `cs_rank`, `cs_zscore` and `cs_demean` mask
+non-members before computing cross-sectional ranks, means or dispersion. L4 applies that same
+point-in-time mask to built-ins, rebuilt historical pool members and same-run comparisons. L6
+restricts the candidate, pool members and forward returns to the same active symbols before
+sample counts, ranks, raw IC and regression; missing mask dates or symbols are inactive. Raw
+fields and time-series subtrees retain pre-entry history for warmup: membership is applied at
+cross-sectional operations and when reading the resulting factor panel, not by erasing that history.
 
 **Signal and execution timing.** A signal is computed from bar *t*'s close. Entry is the **next
 bar's open** and exit is the open `holdingPeriod` bars after that, giving a forward return of
 `exit / entry - 1`. `holdingPeriod` defaults to 5.
 
-**Search and frozen windows are strictly isolated.** The requested range is cut by **trading
-sessions**: the trailing `freezeRatio` (default 0.3, which must fall inside `(0, 0.5)`) of the
-sessions form the frozen window, which starts the **day after** the last search session, so the two
-windows share no bar. The search's data-source calls stop at the search end; the **frozen window is
-read exactly once**, inside `review_frozen`, and only when something survived. No candidate can
-ever touch the bars that are going to judge it.
+**Search, validation and reserved holdout are isolated.** The requested range is cut by the
+market's **trading sessions**: reserve the trailing `holdoutRatio` first, then apply `freezeRatio`
+(default 0.3, strictly inside `(0, 0.5)`) to the remaining sessions to split search from frozen
+validation. `holdoutRatio=0` retains the original two-window behavior. Validation starts the
+**day after** the last search session; the windows share no bar. The search's data-source calls
+stop at the search end; **validation is read once**, inside `review_frozen`, only if candidates
+survived. Holdout is never read by search, L5/L6, the LLM or feedback; this release only reports
+its reserved boundaries with `evaluated: false`.
+
+`summary.research.freezeSnapshotId` comes from the actual validation panel prepared by
+`prepare_freeze`; `freezeVersion` identifies the split and that fingerprint. With no survivors,
+the holdout boundaries are still reported and `freezeSnapshotId` is `null`, because validation
+was not fetched. Neither field represents a stored market-data copy.
 
 **The pool increment is read on the search window.** L6 measures what a survivor adds to the
 caller's frozen pool over the search window's own cross-sections, never over the tail: an increment
@@ -279,8 +323,10 @@ reads the search window's prepared frames, so bars a source returns past the win
 reach it.
 
 **Every trial is on the ledger, failures included.** Each evaluated candidate writes one row into
-`qd_factor_trials`, passes and rejections alike. That ledger's size is the deflated-Sharpe
-denominator used at L5.
+`qd_factor_trials`, passes and rejections alike. After saving the trials, the service registers
+this run's count once in its research group and passes the resulting `cumulativeTrials` to L5.
+Groups are tenant-scoped and keyed by source, market, timeframe, requested dates, `freezeRatio`
+and `holdoutRatio`; seed, search mode, thresholds, holding period and costs do not reset the count.
 
 **A ledger row keeps only what the gates read.** The trial's `metrics` carries `coverage`,
 `rankIc`, `icir`, `foldIcSigns`, `averageTurnover`, `stability`, the `executionAssumptions` block,
@@ -310,9 +356,11 @@ market-data policy caps the fetched range, that ceiling gets an evolved or AI ru
 outright** -- the shared backtest range check raises before a bar is requested, and the job fails
 with `strategyV2.backtestRangeLimit` -- rather than searched over a shorter window.
 
-**Determinism and reproducibility.** The same panel plus the same run config -- every field of the
-request, `searchMode` included -- produces the same trials and the same candidates in the same
-order. `(templateIds, budget, seed)` is only part of it: the mode decides which sources contribute
+**Determinism and reproducibility.** The same candidate stream, panel, comparison pool and run
+config -- every field of the request, `searchMode` included -- produce the same search trials in
+the same order. L5 also depends on the research group's cumulative trial count; repeating a run
+adds a new contribution. AI proposal replay fixes the recorded proposal stream, not the market
+data or research state. `(templateIds, budget, seed)` is only part of it: the mode decides which sources contribute
 candidates and how much history is fetched, and in evolution `population`, `generations` and
 `eliteRatio` decide what it breeds from. Template expansion is seeded, the evolution stream draws
 from `random.Random(seed)` alone, the gate ladder is pure, and nothing iterates a set.
@@ -331,7 +379,7 @@ section 11, and `data` is `null`.
 | `POST` | `/run` | Submit a mining run; **HTTP 202**, returns the job receipt |
 | `GET` | `/jobs` | The caller's mining jobs, newest first, **without** `result` |
 | `GET` | `/jobs/<job_id>` | One job, with `progress` and the full `result` |
-| `POST` | `/jobs/<job_id>/cancel` | Cancel; the runner stops at its next progress report |
+| `POST` | `/jobs/<job_id>/cancel` | Request cancellation and return the persisted job state (section 9) |
 | `GET` | `/jobs/<job_id>/proposals` | An AI job's proposals in generation order (section 8); a running job returns the rows written so far |
 | `GET` | `/candidates` | The candidate library, filtered and paged |
 | `GET` | `/candidates/<candidate_id>` | One candidate, with `metrics` and `outOfSample` |
@@ -342,10 +390,15 @@ key never lands in the job store's request:
 `sourceId`, `sourceName`, `market`, `timeframe`, `startDate`, `endDate`, `freezeRatio`, `budget`,
 `seed`, `templateIds`, `groups`, `holdingPeriod`, `commission`, `slippage`, `neutralizeIndustry`,
 `thresholds`, `searchMode`, `population`, `generations`, `eliteRatio`, `aiRounds`,
-`aiProposalsPerRound`, `researchNotes`, `replayJobId`
+`aiProposalsPerRound`, `researchNotes`, `replayJobId`, `holdoutRatio`
 
 Required: `sourceId` (positive integer), `market` (a known market key), and `startDate` / `endDate`
 (`YYYY-MM-DD`). `budget` defaults to 400 and `timeframe` to `1D`.
+
+`holdoutRatio` defaults to 0 when omitted or `null`, accepts finite numeric values in `[0, 0.30]`,
+and reserves sessions before `freezeRatio` is applied. Booleans, blank or unreadable values,
+non-finite values and out-of-range values return 400 with `factorMining.invalidParameter`.
+The product UI defaults new jobs to 0.10; there is no separate holdout error key.
 
 **Search modes.** `searchMode` is `enumeration` (the default, the template expansion),
 `evolution` (that same expansion plus the stream bred from it), or `ai` (pure model proposals,
@@ -416,10 +469,11 @@ the same envelope, and a queued job has no result yet, so `hasResult` is `false`
 400 with `factorMining.invalidQuery`.
 
 **`?runId=` is not a stable view of "this run's candidates".** The library deduplicates by
-`(user_id, expression_hash)`, and `runId` points at the run that judged an expression **last**, so
-re-running an expression moves its row out of the older run's view and into the newer one. The
-filter answers "which run last judged these rows", which is what the library is for; it does not
-answer "what did run 7 evaluate".
+`(user_id, market, timeframe, expression_hash)`, and `runId` points at the run that judged that
+context's expression **last**. Publishing a re-evaluation in the same context moves its current
+row into the newer run's view; another market or timeframe keeps a separate row. The filter
+answers "which run last judged these rows", not "what did run 7 evaluate"; use run results and
+the trial ledger for historical evidence.
 
 **List view versus detail view.** `/candidates` **omits** `metrics` and `outOfSample` -- a
 candidate's metrics carry its whole IC series and curves, which a page of fifty does not need. Read
@@ -429,10 +483,11 @@ candidate's metrics carry its whole IC series and curves, which a page of fifty 
 `templateId`, `market`, `timeframe`, `status`, `reason`, `createdAt`, `updatedAt`; the detail view
 adds `metrics` and `outOfSample`.
 
-**`status` values:** `search` (cleared L1-L4, awaiting the frozen review), `frozen` (cleared L5 as
-well, and not retired at L6), `rejected` (stopped at some stage; the key is in `reason` -- an L6
-retirement carries `factorMining.reject.noIncrementalValue`, and an increment that could not be
-measured retires nobody).
+**`status` values:** `search` remains a compatibility value for older rows that cleared L1-L4
+and awaited review; new jobs keep search survivors in memory and publish no `search` candidates.
+After review, `publish_run` publishes `frozen` (cleared L5 and not retired at L6) or `rejected`
+candidates. The reject key is in `reason`; L6 retirement carries
+`factorMining.reject.noIncrementalValue`, and an unmeasured increment retires nobody.
 
 **`GET /catalog`:** `fields` is the market's own set, resolved through the same `fields_for` the
 validator uses, so what the editor offers and what L1 accepts cannot drift apart. The optional
@@ -442,9 +497,10 @@ windowed flag -- section 3.2 above is the authoritative table. Each entry of `te
 `{templateId, hypothesisI18nKey, category, parameterGrid}`.
 
 **The label inside the correlation study.** When a mined candidate enters L4's correlation study,
-it is displayed under the factor name **`"expression"`** (the built-ins follow it). So
+it is displayed under the factor name **`"expression"`** (the comparison factors follow it). So
 `metrics.factorCorrelation.factors[0]` is always `"expression"` and `matrix[0][1:]` holds its
-correlation against each built-in.
+correlations against the remaining names: built-ins, historical frozen pool members and earlier
+search survivors in this run.
 
 ## 8. AI proposals and the failure-feedback loop
 
@@ -465,13 +521,14 @@ the server's model configuration. The run's candidate budget is
 budget still caps it. `/estimate` returns that product as `candidateBudget` and `0` as
 `templateCount`.
 
-**One round, at most two model calls.** Each round's prompt carries the market, timeframe and data window,
+**One round, at most two proposal attempts.** Each round's prompt carries the market, timeframe and data window,
 the field catalogue listed in group order, the operator catalogue (arity and window), the candidate budget,
 the cross-run failure summary, the previous round's feedback, the optional research notes, and up
 to ten template examples as priors. Research notes and all historical material are delimited as
 **data**: instructions inside them are not executed. The model must answer with strict JSON:
-`{"proposals": [{"hypothesis": "...", "expression": {...}}]}`. The call has a 60-second timeout
-and is retried once (two attempts per round) on transport or JSON failure; a round that still
+`{"proposals": [{"hypothesis": "...", "expression": {...}}]}`. One 60-second monotonic deadline
+covers the round, including parsing retries and model/provider fallbacks. Transport or JSON failure
+can retry once while budget remains; each request receives only the remaining allowance. A round that still
 fails fails the job with `factorMining.aiProposalFailed`, keeping the proposals already written.
 
 **Validation, deduplication, and the ladder.** A proposal is not a candidate until it passes L1:
@@ -495,15 +552,18 @@ ordered by their relative distance to the threshold; the block is capped at 6000
 becomes the next round's `Previous round feedback`. It must read the engine, not
 `qd_factor_trials`: the service writes trials only after `engine.run` returns. Across runs, a live
 run fetches the summary once before the first round from the caller's 5 most recent **successful**
-runs on the same market and timeframe -- stage/verdict/reason counts plus up to 10 failed
-expressions, capped at 6000 characters -- and every round's prompt carries it, space permitting.
+runs with the same market, timeframe, source/universe semantics, holding period, date window and split.
+The immutable run results supply search and L5/L6 stage/verdict/reason counts plus up to 10
+L5/L6 failed expressions with bounded search and out-of-sample metrics, capped at 6000 characters
+-- and every round's prompt carries it, space permitting. Mutable candidate rows and holdout
+measurements are not read for this history.
 A replay calls no model and injects no cross-run history -- the summary query is skipped entirely,
 not merely ignored. Failed and cancelled runs are not used as history.
 
 **What is stored.** `qd_factor_proposals` holds one row per proposal (`run_id`, `round`,
 `ordinal`, expression, hash, hypothesis, model, provider, prompt hash, DSL version, source,
-status, reject reason). `qd_factor_mining_runs.job_id` (an added column) maps a job to its run, so
-proposals are readable while the job runs and after it fails. Research notes are not copied into
+status, reject reason). `qd_factor_mining_runs.job_id` maps a job to its attempt records; proposal
+lookups select the latest run, including while it runs or after it fails. Research notes are not copied into
 `config_json` or the proposal rows: they travel with the job request (`qd_agent_jobs.request`,
 tenant-scoped), and the summary stores only their SHA-256 and length. Prompts are not stored;
 only their hashes are.
@@ -531,9 +591,9 @@ opened its run all read as 404 `factorMining.jobNotFound`.
 
 **Replay.** `replayJobId` names one of the caller's own **AI runs**: another mode recorded no
 proposals, so it cannot be replayed. The recorded run may be `success` or `failed`; `cancelled`
-and `running` are refused. A failed run is worth replaying precisely because its failure discarded
-the evaluated trials -- the ledger is written only after the search returns -- while its proposal
-rows survived; the replay re-evaluates every recorded proposal against the current panel. A run
+and `running` are refused. A failed run with recorded proposals can be replayed even if it failed
+before the search returned and wrote trials; already committed proposals and audit rows survive.
+The replay re-evaluates recorded proposals against the current panel. A run
 that recorded no proposals, whatever its status, has nothing to replay. A replay request needs
 only `searchMode="ai"` and `replayJobId`; the recorded run supplies the market, window, budget,
 source and AI bounds. A client may restate `market`, `timeframe`, `startDate`, `endDate`, `budget`
@@ -573,18 +633,18 @@ free of charge; each round is at most two model calls and the run is bounded as 
 
 **Durable execution.** A mining job travels through the shared `qd_agent_jobs` table with
 `kind = "factor_mining"`, carried by the Celery durable path (`app/tasks/agent_jobs.py` registers
-the kind). The in-process pool and Celery both end up calling one implementation,
-`run_mining_job`; there are not two code paths.
+the kind). Celery and the local in-process fallback share the fenced `factor_mining_jobs.run_job`
+runner and the same `run_mining_job` implementation.
 
 **Two records, written at different moments.** The job row (`qd_agent_jobs`) is the timeline the API
 polls. The run row (`qd_factor_mining_runs`) is the audit record, and it is opened **before the
 search starts**, so a crash mid-run still leaves a row saying which config was being searched.
 
 **Concurrency cap.** One tenant may have **1 active mining job** at a time. Hitting it returns 400
-with `factorMining.concurrentLimit`. The gate counts that tenant's `queued` / `running` rows **of
-`kind = "factor_mining"`** -- the Agent Gateway's tenant-wide cap still counts every kind, but this
-feature's own limit is its own: a running backtest is not a mining slot, and an unswept ghost from
-another feature (which this feature's sweep does not retire) cannot block mining forever.
+with `factorMining.concurrentLimit`. Submission takes a PostgreSQL transaction advisory lock for
+that tenant and job kind, counts its `queued` / `running` mining jobs, and inserts the new job in
+the same transaction. The service's earlier count is only a fast check. The Agent Gateway's
+tenant-wide cap still counts every kind; this mining cap does not count running backtests.
 
 **Budget caps.**
 
@@ -599,25 +659,41 @@ candidates, the run evaluates exactly what expanded (102 for the default templat
 run's stream is capped at `min(aiRounds * aiProposalsPerRound, budget)` for the same reason, and
 the model may produce fewer legal proposals than either bound; the run evaluates what passed L1.
 
-**Cancellation.** `POST /jobs/<id>/cancel` marks the job cancelled and the runner stops by raising
-`JobCancelledError` at its **next progress report**. The run row is then closed as `cancelled`
-rather than `failed`, because showing a user's own cancellation as an engine failure would be
-wrong.
+**Publication and cancellation.** Search survivors are not written to the candidate library.
+Only after frozen review does `publish_run` write candidates, run `success` and job `succeeded`
+in one transaction, validating execution ownership under the job row lock. Cancellation takes
+the same lock: if it commits first, the job and its running run become `cancelled`, and publication
+adds or updates no candidates. If publication commits first, cancellation returns the existing
+`succeeded` result. Execution stops cooperatively at progress or ownership checks; cancellation
+does not hard-kill blocked I/O.
 
-**Ghost-job collection.** A job whose worker process died stays frozen in `running`. `GET /jobs`
-sweeps while listing: any job still `running` whose `startedAt` is older than
-`max(120, CELERY_TASK_TIME_LIMIT or 3600) + 300` seconds is failed with
-`factorMining.workerInterrupted`. This is not cosmetic -- the concurrency gate counts active jobs,
-so an unswept ghost would permanently block that tenant's submissions.
+**Renewable ownership.** Each claim has an `execution_token`, `lease_expires_at`, `heartbeat_at`
+and attempt count. The lease defaults to 120 seconds (`FACTOR_MINING_JOB_LEASE_SEC`) and renews
+periodically, independently of candidate progress or model calls. Takeover replaces the token;
+every durable write, including progress, audit and failure cleanup, rejects the old owner.
 
-**Open item:** a ghost stuck in `queued` is **out of the sweep's scope** (deferred).
+**Recovery.** Existing maintenance redispatches `queued` jobs older than 60 seconds and `running`
+jobs whose lease expired or is missing. Submit, job detail and job list trigger the same bounded
+recovery scoped to the caller's tenant. Celery uses the `mining` queue; with Celery disabled,
+the local fallback redispatches through the same fenced runner. A live lease is not expired
+merely because the job is old.
+
+**Attempts and audit.** The default limit is 3 total attempts (`FACTOR_MINING_JOB_MAX_ATTEMPTS`).
+Takeover marks an interrupted `running` run `failed` with `factorMining.workerInterrupted`,
+preserving its audit rows, then opens a new run for the new attempt under the same `jobId`.
+Job-based proposal lookups select the latest run. AI recovery reuses proposals already recorded
+by the failed attempt; when such rows exist it does not generate fresh proposals. Exhausting
+the attempt limit fails the job rather than leaving it active.
 
 ## 10. Data tables
 
 | Table | Granularity | Key constraints |
 | --- | --- | --- |
-| `qd_factor_mining_runs` | One row per run | Config, data fingerprint, three counts, status, and `job_id` (the job that drives the run); `user_id` is a foreign key to `qd_users` |
-| `qd_factor_candidates` | One row per distinct expression | `UNIQUE (user_id, expression_hash)`, so it deduplicates across runs; `run_id` is `ON DELETE SET NULL` -- a candidate is an asset that outlives runs, so only its pointer may go with one |
+| `qd_agent_jobs` | One row per job | Mining ownership: `execution_token`, `lease_expires_at`, `heartbeat_at`, `attempts`; `jobId` survives attempt recovery |
+| `qd_factor_mining_runs` | One row per execution attempt | Config, data fingerprint, three counts, status, `job_id` and `execution_token`; interrupted rows remain for audit, and job lookups select the latest run; `user_id` is a foreign key to `qd_users` |
+| `qd_factor_mining_experiments` | One row per tenant and research context | `UNIQUE (user_id, context_hash)`; stores `context_json` and non-negative `cumulative_trials`; context groups source, market, timeframe, requested dates and split ratios |
+| `qd_factor_mining_experiment_runs` | One trial-count contribution per run | `run_id` is the primary key and references runs with `ON DELETE CASCADE`; the `(experiment_id, user_id)` foreign key preserves tenant scope; `trials_count` is registered once so retries do not increase the cumulative count |
+| `qd_factor_candidates` | One current row per expression and context | Unique key `(user_id, market, timeframe, expression_hash)`; same-context re-evaluation updates the row, other contexts stay separate; `run_id` is `ON DELETE SET NULL` -- only its pointer may disappear with a run |
 | `qd_factor_trials` | One row per evaluation | `run_id` is `ON DELETE CASCADE` -- a ledger detached from the run that priced it means nothing |
 | `qd_factor_proposals` | One row per AI proposal | `UNIQUE (run_id, round, ordinal)`, ordered by `(round, ordinal)`; `run_id` is `ON DELETE CASCADE`; `user_id` scopes every read, and `status` / `reject_reason` carry the proposal's own audit state (section 8) |
 
@@ -663,18 +739,18 @@ backend can emit; the backend emits keys only and never renders copy.
 | `factorMining.jobNotFound` | The job does not exist, is not the caller's, or is not a mining job |
 | `factorMining.candidateNotFound` | The candidate does not exist or is not the caller's; also when the id is not an integer |
 | `factorMining.invalidQuery` | A query parameter is not a readable integer |
-| `factorMining.invalidParameter` | A run field cannot be read as the type it is priced with: an integer field (`seed` / `groups` / `holdingPeriod` / `population` / `generations` / `aiRounds` / `aiProposalsPerRound`) that is not an integer, an `eliteRatio` that is not a number, a `commission` / `slippage` too large to convert, a `searchMode` this build does not know, a `timeframe` outside the supported shape (`<digits><m\|h\|d\|w>`), a `population` / `generations` below 1, an `eliteRatio` outside `[0, 1)`, an `aiRounds` outside `1-3`, an `aiProposalsPerRound` outside `1-20`, a `researchNotes` that is not a string or exceeds 8000 characters, any AI field on a non-AI run (`aiRounds` / `aiProposalsPerRound` / `researchNotes` / `replayJobId`), or one of `population` / `generations` / `eliteRatio` missing or blank in an evolution run |
+| `factorMining.invalidParameter` | A run field cannot be read as the type it is priced with: an integer field (`seed` / `groups` / `holdingPeriod` / `population` / `generations` / `aiRounds` / `aiProposalsPerRound`) that is not an integer, an `eliteRatio` that is not a number, a `commission` / `slippage` too large to convert, a `searchMode` this build does not know, a `timeframe` outside the supported shape (`<digits><m\|h\|d\|w>`), a `population` / `generations` below 1, an `eliteRatio` outside `[0, 1)`, an `aiRounds` outside `1-3`, an `aiProposalsPerRound` outside `1-20`, a `researchNotes` that is not a string or exceeds 8000 characters, any AI field on a non-AI run (`aiRounds` / `aiProposalsPerRound` / `researchNotes` / `replayJobId`), one of `population` / `generations` / `eliteRatio` missing or blank in an evolution run, or a `holdoutRatio` that is boolean, blank, unreadable, non-finite or outside `[0, 0.30]` |
 | `factorMining.thresholdsInvalid` | `thresholds` is not an object, or a threshold cannot be read as its own field's type (a fractional `min_ic_observations`, a boolean, a non-finite value) |
 | `factorMining.sourceRequired` | `sourceId` is missing or not a positive integer |
 | `factorMining.sourceNotFound` | The `sourceId` script source does not exist or is not the caller's |
 | `factorMining.sourceCodeRequired` | The script source exists but its code is empty |
 | `factorMining.dateRangeRequired` | `startDate` / `endDate` missing or unparseable |
-| `factorMining.dateRangeTooShort` | Fewer than 2 trading sessions in the range, so no split is possible |
+| `factorMining.dateRangeTooShort` | Fewer than 2 trading sessions remain after reserving holdout, so no search/validation split is possible |
 | `factorMining.invalidMarket` | `market` is not a known market key |
 | `factorMining.budgetInvalid` | `budget` is unreadable or below 1 |
 | `factorMining.budgetExceeded` | `budget` is above 2000 |
 | `factorMining.concurrentLimit` | The caller already has an active job |
-| `factorMining.workerInterrupted` | Failure reason written when a stale job is swept |
+| `factorMining.workerInterrupted` | Failure reason recorded on an interrupted run during lease takeover, and on the job if its attempt limit is exhausted |
 | `factorMining.freezeRatioInvalid` | `freezeRatio` is unreadable or outside `(0, 0.5)` |
 | `factorMining.searchFreezeOverlap` | The split left the frozen window overlapping the search window (a structural guard that should not fire) |
 | `factorMining.universeTooSmall` | The universe resolved to fewer than 3 members |
@@ -709,7 +785,7 @@ backend can emit; the backend emits keys only and never renders copy.
 | `factorMining.reject.unstableHalves` | L3 |
 | `factorMining.reject.highTurnover` | L3 |
 | `factorMining.reject.duplicateBuiltin` | L4 |
-| `factorMining.reject.duplicateInPool` | L4 |
+| `factorMining.reject.duplicateInPool` | L4: historical frozen pool or an earlier search survivor in this run |
 | `factorMining.reject.unverifiableRedundancy` | L4 |
 | `factorMining.reject.weakOutOfSample` | L5 |
 | `factorMining.reject.selectionBias` | L5 |
@@ -744,8 +820,9 @@ never has to hardcode the template list.
 
 - **No billing.** The feature debits nothing and writes no ledger; resources are bounded only by
   the concurrency and budget caps.
-- **`queued` ghosts are not swept.** Only `running` stale jobs are collected; jobs stuck `queued`
-  are out of scope (deferred).
+- **Recovery is bounded retry.** It does not promise an instruction-level checkpoint, hard
+  termination of blocked I/O, or exactly-once provider calls. Recorded proposals can be reused;
+  an unrecorded external call may be repeated after interruption.
 - **`/catalog`'s `operators` carries names only** -- no arity and no windowed flag. The table in
   section 3.2 is the authoritative source.
 - **No strategy-runtime integration.** Mining output cannot be referenced by a strategy, and there

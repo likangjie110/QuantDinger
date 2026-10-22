@@ -288,3 +288,25 @@ def test_the_pool_and_the_engine_report_a_member_the_same_way():
     either side would file the same failure under two different reasons with no test to notice.
     """
     assert pool.INVALID_EXPRESSION_REASON == engine.INVALID_EXPRESSION_REASON
+
+
+def test_p1_pool_rebuild_masks_the_same_cross_section_without_erasing_warmup():
+    dates = pd.date_range("2025-01-01", periods=5)
+    fields = {"close": pd.DataFrame({"A": 1., "B": 3., "C": [3., 6., 9., 12., 15.],
+                                     "outsider": 1e12}, index=dates)}
+    membership = pd.DataFrame({"A": True, "B": True, "C": [False, False, True, False, True],
+                               "outsider": False}, index=dates)
+    mean = {"op": "ts_mean", "args": ["close"], "params": {"n": 3}}
+    entries = [pool.PoolMember(1, "mean", mean),
+               pool.PoolMember(2, "rank", {"op": "cs_rank", "args": [mean]})]
+
+    panels, skipped = pool.pool_panels(entries, fields, membership=membership.iloc[::-1, ::-1])
+
+    assert skipped == []
+    assert panels["mean"].loc[dates[2], "C"] == 6.
+    assert panels["mean"].loc[dates[4], "C"] == 12.
+    assert panels["rank"].loc[dates[2], "A"] == 1 / 3
+    assert panels["rank"].loc[dates[3], "A"] == 0.5
+    assert panels["rank"].loc[dates[2], "C"] == 1.
+    assert pd.isna(panels["mean"].loc[dates[3], "C"])
+    assert all(panel["outsider"].isna().all() for panel in panels.values())

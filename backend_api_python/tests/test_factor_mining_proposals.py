@@ -290,6 +290,42 @@ def test_proposer_raises_the_closed_key_on_transport_failure():
     assert str(exc.value) == "factorMining.aiProposalFailed"
 
 
+def test_p2_round_retry_receives_only_the_remaining_budget(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(proposals, "monotonic", lambda: clock[0], raising=False)
+    fake = _FakeLLM()
+
+    def call(messages, **kwargs):
+        fake.calls.append((messages, kwargs))
+        clock[0] += 40
+        return "bad json" if len(fake.calls) == 1 else _valid_text()
+
+    fake.call_llm_api = call
+    source = proposals.ProposalSource(context=_context(rounds=1), repository=_Repo(),
+                                     proposer=proposals.LLMProposer(service=fake), outcome=lambda _: None)
+    with pytest.raises(proposals.ProposalGenerationError, match="factorMining.aiProposalFailed"):
+        list(source)
+    assert [kwargs["timeout_seconds"] for _, kwargs in fake.calls] == [60.0, 20.0]
+
+
+def test_p2_expired_round_does_not_retry_a_failed_parse(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(proposals, "monotonic", lambda: clock[0], raising=False)
+    fake = _FakeLLM()
+
+    def call(messages, **kwargs):
+        fake.calls.append((messages, kwargs))
+        clock[0] = 61
+        return "bad json"
+
+    fake.call_llm_api = call
+    source = proposals.ProposalSource(context=_context(rounds=1), repository=_Repo(),
+                                     proposer=proposals.LLMProposer(service=fake), outcome=lambda _: None)
+    with pytest.raises(proposals.ProposalGenerationError, match="factorMining.aiProposalFailed"):
+        list(source)
+    assert len(fake.calls) == 1
+
+
 class _Repo:
     def __init__(self):
         self.saved = []
@@ -456,6 +492,18 @@ def test_no_valid_proposals_raises_the_closed_key():
     with pytest.raises(proposals.ProposalGenerationError) as exc:
         list(source)
     assert str(exc.value) == "factorMining.aiNoValidProposals"
+
+
+def test_replayed_rejected_proposals_cannot_turn_a_recovered_run_into_success():
+    rows = ({"round": 1, "ordinal": 1, "hypothesis": "invalid",
+             "expression": {"op": "unknown_op", "args": [], "params": {}},
+             "status": "l1_rejected", "dslVersion": 1},)
+    repository = _Repo()
+    source = proposals.ProposalSource(
+        context=_context(rounds=1, replay=rows), repository=repository,
+        proposer=lambda *args: pytest.fail("recovery cannot call a model"), outcome=lambda fp: None)
+    with pytest.raises(proposals.ProposalGenerationError, match="factorMining.aiNoValidProposals"):
+        list(source)
 
 
 def test_a_format_error_retries_the_round_once_with_the_same_prompt():

@@ -22,6 +22,7 @@ import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from time import monotonic
 from typing import Any
 
 from app.services.factor_mining.dsl import (
@@ -523,7 +524,11 @@ class LLMProposer:
         self._service = service
         self._timeout_seconds = timeout_seconds
 
-    def __call__(self, system_prompt: str, user_prompt: str) -> ProposalBatch:
+    @property
+    def timeout_seconds(self) -> float:
+        return self._timeout_seconds
+
+    def __call__(self, system_prompt: str, user_prompt: str, *, deadline: float | None = None) -> ProposalBatch:
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -533,8 +538,15 @@ class LLMProposer:
             # asked whether it is configured fails the round like any other transport failure.
             if not self._service.is_configured():
                 raise ProposalGenerationError()
+            timeout = self._timeout_seconds if deadline is None else min(
+                self._timeout_seconds, deadline - monotonic())
+            if timeout <= 0:
+                raise ProposalGenerationError()
             text = self._service.call_llm_api(
-                messages, use_json_mode=True, timeout_seconds=self._timeout_seconds)
+                messages, use_json_mode=True, timeout_seconds=timeout,
+                **({"deadline": deadline} if deadline is not None else {}))
+            if deadline is not None and monotonic() >= deadline:
+                raise ProposalGenerationError()
         except ProposalGenerationError:
             raise
         except Exception as exc:
@@ -723,7 +735,7 @@ class ProposalSource:
         for round_no in rounds:
             self._close_round(round_no, [row for row in rows if row["round"] == round_no])
         self._open_rounds = []
-        if not seeds and not self._context.replay:
+        if not seeds:
             raise ProposalGenerationError("factorMining.aiNoValidProposals")
 
     def _generate_round(
@@ -734,11 +746,20 @@ class ProposalSource:
             self._context, round_no=round_no, last_feedback=self._last_feedback)
         prompt_hash = proposal_prompt_hash(system, user)
         failure: Exception | None = None
+        budget = self._proposer.timeout_seconds if isinstance(self._proposer, LLMProposer) else 60.0
+        deadline = monotonic() + budget
         for _ in range(_ROUND_ATTEMPTS):
+            if monotonic() >= deadline:
+                break
             try:
-                batch = self._proposer(system, user)
+                # Test proposers retain the two-argument contract; the real adapter propagates
+                # this same deadline through every model and provider fallback.
+                batch = self._proposer(system, user, deadline=deadline) if isinstance(
+                    self._proposer, LLMProposer) else self._proposer(system, user)
                 parsed = parse_proposals(
                     batch.text, limit=self._context.proposals_per_round)
+                if monotonic() >= deadline:
+                    raise ProposalGenerationError()
             except (ProposalGenerationError, ProposalFormatError) as exc:
                 failure = exc
                 continue

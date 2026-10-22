@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 from celery import Celery, Task
+from kombu import Queue
 from app.config.redis_urls import celery_broker_url, celery_result_backend_url
 
 
@@ -47,6 +48,10 @@ celery_app.conf.update(
         "app.tasks.fast_analysis",
         "app.tasks.maintenance",
         "app.tasks.fundamental_sync",
+    ),
+    task_queues=tuple(
+        Queue(name, exchange=name, routing_key=name)
+        for name in ("jobs", "ai", "maintenance", "mining")
     ),
     task_routes={
         "quantdinger.tasks.fast_analysis": {"queue": "ai"},

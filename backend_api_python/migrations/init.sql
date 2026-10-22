@@ -3357,3 +3357,48 @@ ALTER TABLE qd_factor_mining_runs
   ADD COLUMN IF NOT EXISTS job_id VARCHAR(40) NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_factor_mining_runs_user_job
   ON qd_factor_mining_runs(user_id, job_id);
+
+-- Appended verbatim from migrations/20261019_factor_mining_research.sql.
+-- Cumulative research identity and idempotent per-run trial contributions.
+CREATE TABLE IF NOT EXISTS qd_factor_mining_experiments (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    context_hash VARCHAR(64) NOT NULL,
+    context_json TEXT NOT NULL DEFAULT '{}',
+    cumulative_trials BIGINT NOT NULL DEFAULT 0 CHECK (cumulative_trials >= 0),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, context_hash),
+    UNIQUE (id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS qd_factor_mining_experiment_runs (
+    run_id INTEGER PRIMARY KEY REFERENCES qd_factor_mining_runs(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    experiment_id INTEGER NOT NULL,
+    trials_count INTEGER NOT NULL CHECK (trials_count >= 0),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (experiment_id, user_id)
+        REFERENCES qd_factor_mining_experiments(id, user_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_factor_mining_experiment_runs_group
+    ON qd_factor_mining_experiment_runs(user_id, experiment_id, run_id);
+
+-- Preserve candidate ids/content while matching the library's market/timeframe scope.
+ALTER TABLE qd_factor_candidates
+    DROP CONSTRAINT IF EXISTS qd_factor_candidates_user_id_expression_hash_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_factor_candidates_context_hash
+    ON qd_factor_candidates(user_id, market, timeframe, expression_hash);
+
+-- Durable execution ownership is only used by finite factor-mining jobs.
+ALTER TABLE qd_agent_jobs
+    ADD COLUMN IF NOT EXISTS execution_token VARCHAR(64) NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_agent_jobs_mining_recovery
+    ON qd_agent_jobs(status, lease_expires_at, created_at)
+    WHERE kind = 'factor_mining' AND status IN ('queued', 'running');
+
+ALTER TABLE qd_factor_mining_runs
+    ADD COLUMN IF NOT EXISTS execution_token VARCHAR(64) NOT NULL DEFAULT '';

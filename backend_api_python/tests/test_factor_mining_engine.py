@@ -534,7 +534,7 @@ def test_redundancy_gate_rejects_the_candidate_that_duplicates_a_builtin(monkeyp
                                 thresholds=GateThresholds(
                                     min_ic_observations=5, min_abs_rank_ic=0.0, min_icir=0.0,
                                     min_fold_consistency=0.0, max_turnover=1.0, min_coverage=0.0,
-                                    max_builtin_correlation=1.1))
+                                    max_builtin_correlation=1.1, max_pool_correlation=1.1))
     assert [item["verdict"] for item in result["trials"]] == ["pass", "pass"]
 
     rejected, _ = _run_with_seeds(monkeypatch, [_candidate(_MOMENTUM_5)],
@@ -2002,3 +2002,386 @@ def test_a_full_budget_ai_run_closes_its_last_round():
     assert [(call["round_no"], call["ordinals"]) for call in repo.status_updates] == [
         (1, (1, 2, 3, 4, 5)), (2, (1, 2, 3, 4, 5)),
     ]
+
+
+def test_p2_same_run_numeric_twins_keep_first_and_record_both_trials(monkeypatch):
+    thresholds = GateThresholds(**{**_NO_DEDUPLICATION.__dict__, "max_pool_correlation": 0.85})
+    seeds = _seeds(2)
+    assert seeds[0].fingerprint != seeds[1].fingerprint
+    result, _ = _run_with_seeds(monkeypatch, seeds, thresholds=thresholds)
+    assert [item["fingerprint"] for item in result["candidates"]] == [seeds[0].fingerprint]
+    assert [(item["stage"], item["verdict"], item["reason"]) for item in result["trials"]] == [
+        ("L4", "pass", ""), ("L4", "reject", "factorMining.reject.duplicateInPool"),
+    ]
+
+
+@pytest.mark.parametrize("stage", ["L2", "L3"])
+def test_p2_early_rejection_skips_later_calculations(monkeypatch, stage):
+    calls = {"correlation": 0, "details": 0, "turnover": 0}
+    for name, method in (("correlation", "_factor_correlation"),
+                         ("details", "_long_short_curve"), ("turnover", "_weight_turnover")):
+        original = getattr(FactorResearchEngine, method)
+
+        def recording(*args, _name=name, _original=original, **kwargs):
+            calls[_name] += 1
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(FactorResearchEngine, method,
+                            recording if name == "correlation" else staticmethod(recording))
+    overrides = {"min_coverage": 1.1} if stage == "L2" else {"min_icir": 1e100}
+    thresholds = GateThresholds(**{**_NO_DEDUPLICATION.__dict__, **overrides})
+    result, _ = _run_with_seeds(monkeypatch, _seeds(1), thresholds=thresholds)
+    assert result["trials"][0]["stage"] == stage
+    assert calls["correlation"] == calls["details"] == 0
+    assert (calls["turnover"] == 0) == (stage == "L2")
+
+
+def test_p2_l4_rejected_twin_does_not_build_details(monkeypatch):
+    calls = []
+    original = FactorResearchEngine._long_short_curve
+
+    def recording(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(FactorResearchEngine, "_long_short_curve", staticmethod(recording))
+    thresholds = GateThresholds(**{**_NO_DEDUPLICATION.__dict__, "max_pool_correlation": 0.85})
+    result, _ = _run_with_seeds(monkeypatch, _seeds(2), thresholds=thresholds)
+    assert len(result["trials"]) == 2
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("ratio", [0, 0.1, 0.3])
+def test_p2_holdout_payload_and_market_session_split(ratio):
+    config = _config_from(_payload(holdoutRatio=ratio, freezeRatio=0.25))
+    assert config.holdout_ratio == ratio
+    split = split_periods(config)
+    calendar = engine_module.market_fields.sessions(config.market, config.start_date, config.end_date)
+    holdout_count = max(1, int(len(calendar) * ratio)) if ratio else 0
+    retained = calendar[:-holdout_count] if holdout_count else calendar
+    search_count = max(1, int(len(retained) * 0.75))
+    assert split.search_end == retained[search_count - 1]
+    assert split.search_end < split.freeze_start <= split.freeze_end
+    if ratio:
+        assert split.freeze_end < split.holdout_start <= split.holdout_end == config.end_date
+        assert split.holdout_start <= calendar[-holdout_count]
+    else:
+        assert split.holdout_start is split.holdout_end is None
+        assert split.freeze_end == config.end_date
+
+
+@pytest.mark.parametrize("ratio", [-0.01, 0.31, True, "", "bad", float("nan"), float("inf"), []])
+def test_p2_invalid_holdout_is_a_parameter_error(ratio):
+    with pytest.raises(ValueError, match="factorMining.invalidParameter"):
+        _config_from(_payload(holdoutRatio=ratio))
+
+
+def test_p2_holdout_defaults_to_legacy_two_windows():
+    assert _config_from(_payload()).holdout_ratio == 0.0
+    assert _config().holdout_ratio == 0.0
+
+
+def test_p2_holdout_is_not_fetched_resolved_or_fingerprinted():
+    from tests.test_factor_mining_data import _FakeBacktestService, _SOURCE
+
+    config = _config(holdout_ratio=0.1)
+    split = split_periods(config)
+
+    class OverReturning(_FakeBacktestService):
+        def fetch_frames(self, candidates, frequency, start_date, end_date):
+            frames, skipped = super().fetch_frames(candidates, frequency, start_date, config.end_date)
+            self.fetch_calls[-1] = (frequency, start_date, end_date)
+            return frames, skipped
+
+    service = OverReturning()
+    provider = MiningDataProvider(backtest_service=service)
+    for prepare, end in ((provider.prepare, split.search_end),
+                         (provider.prepare_freeze, split.freeze_end)):
+        panel = prepare(user_id=1, code=_SOURCE, config=config)
+        assert service.fetch_calls[-1][2] == end
+        assert service.resolve_calls[-1][2] == split.freeze_end
+        assert all(frame.index.max() <= end for frame in panel.frames.values())
+        assert all(frame.index.max() <= end for frame in panel.fields.values())
+        assert panel.snapshot_id == engine_module._data_digest(panel.frames)
+
+
+def test_p2_freeze_evidence_uses_actual_review_snapshot_and_split(monkeypatch):
+    config = _config(holdout_ratio=0.1, thresholds=_NO_DEDUPLICATION)
+    provider = _FakeProvider(*_fixture())
+    engine = FactorMiningEngine(data_provider=provider)
+    with _patched_expansion(monkeypatch, _seeds(1)):
+        result = engine.run(user_id=1, code="code", config=config)
+    pending = engine.freeze_evidence()
+    assert pending["freezeSnapshotId"] is None
+    assert pending["holdout"] == {
+        "reserved": True, "startDate": split_periods(config).holdout_start.isoformat(),
+        "endDate": config.end_date.isoformat(), "evaluated": False,
+    }
+
+    def review(snapshot_id, run_config=config):
+        provider.panel = PreparedPanel(**{**provider.panel.__dict__, "snapshot_id": snapshot_id})
+        engine.review_frozen(user_id=1, code="code", config=run_config,
+                             survivors=result["candidates"], trials_count=1)
+        return engine.freeze_evidence()
+
+    first = review("c" * 64)
+    assert first["freezeSnapshotId"] == "c" * 64
+    assert first == review("c" * 64)
+    revised = review("d" * 64)
+    assert first["freezeVersion"] != revised["freezeVersion"]
+    changed_split = review("c" * 64, _config(holdout_ratio=0.2))
+    assert first["freezeVersion"] != changed_split["freezeVersion"]
+
+
+def test_p2_ai_history_receives_context_and_no_holdout_dates(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(engine_module, "ProposalSource", lambda **kwargs: captured.update(kwargs) or ())
+    repo = _FakeRepo()
+    config = _config(holdout_ratio=0.1)
+    history_context = {"sourceId": 1, "holdingPeriod": 5}
+    engine_module._candidate_source(
+        config, SEARCH_MODE_AI, lambda expression: None, user_id=4,
+        ai=_ai_options(repository=repo, history_context=history_context),
+    )
+    assert repo.history_calls[0]["context"] == history_context
+    assert captured["context"].end_date == split_periods(config).freeze_end
+
+
+def test_p2_holdout_preserves_the_last_validation_sessions_intraday_bars():
+    from datetime import timedelta
+
+    config = _config(holdout_ratio=0.1, timeframe="1h")
+    split = split_periods(config)
+    calendar = engine_module.market_fields.sessions(config.market, config.start_date, config.end_date)
+    last_validation_session = calendar[-max(1, int(len(calendar) * 0.1)) - 1]
+    assert split.freeze_end >= last_validation_session + timedelta(hours=23)
+    assert split.freeze_end + timedelta(microseconds=1) == split.holdout_start
+
+
+def test_p2_rejected_candidates_do_not_become_same_run_representatives(monkeypatch):
+    real_screen = engine_module.screen_metrics
+    calls = []
+
+    def screening(metrics, thresholds):
+        calls.append(True)
+        if len(calls) == 1:
+            return engine_module.GateVerdict(False, "L2", "factorMining.reject.lowCoverage")
+        return real_screen(metrics, thresholds)
+
+    monkeypatch.setattr(engine_module, "screen_metrics", screening)
+    thresholds = GateThresholds(**{**_NO_DEDUPLICATION.__dict__, "max_pool_correlation": 0.85})
+    seeds = _seeds(2)
+    result, _ = _run_with_seeds(monkeypatch, seeds, thresholds=thresholds)
+    assert [item["fingerprint"] for item in result["candidates"]] == [seeds[1].fingerprint]
+    assert [item["verdict"] for item in result["trials"]] == ["reject", "pass"]
+
+
+def test_p2_l2_short_circuit_preserves_evolution_fitness(monkeypatch):
+    seeds = _seeds(1)
+    measured = []
+
+    def stream(source, *, fitness, **kwargs):
+        measured.append(fitness(seeds[0].expression))
+        yield from ()
+
+    monkeypatch.setattr(engine_module, "evolve", stream)
+    thresholds = GateThresholds(**{**_NO_DEDUPLICATION.__dict__, "min_coverage": 1.1})
+    with _patched_expansion(monkeypatch, seeds):
+        result, _ = _run(*_fixture(), search_mode="evolution", thresholds=thresholds)
+    assert result["trials"][0]["stage"] == "L2"
+    assert measured[0] is not None
+    assert measured[0] == result["trials"][0]["metrics"]["icir"]
+
+
+def test_p2_mining_proxy_fallback_only_measures_the_candidate_row(monkeypatch):
+    result, _ = _run_with_seeds(monkeypatch, _seeds(1), thresholds=_NO_DEDUPLICATION)
+    block = result["candidates"][0]["metrics"]["factorCorrelation"]
+    assert block["factors"][0] == "expression"
+    assert any(block["observations"][0][1:])
+    assert all(count == 0 for row in block["observations"][1:] for count in row)
+
+
+@pytest.mark.parametrize("mode", ["enumeration", "evolution", "ai"])
+def test_p2_empty_review_keeps_holdout_boundaries_without_reading_data(mode):
+    class UnreadableProvider:
+        def prepare_freeze(self, **kwargs):
+            pytest.fail("an empty review must not read validation or holdout data")
+
+    config = _config(holdout_ratio=0.1)
+    engine = FactorMiningEngine(data_provider=UnreadableProvider())
+    assert engine.review_frozen(user_id=1, code="code", config=config, survivors=[],
+                                trials_count=3, search_mode=mode) == []
+    evidence = engine.freeze_evidence()
+    assert evidence["freezeSnapshotId"] is None
+    assert evidence["holdout"] == {
+        "reserved": True, "startDate": split_periods(config).holdout_start.isoformat(),
+        "endDate": config.end_date.isoformat(), "evaluated": False,
+    }
+
+
+def test_p2_same_run_comparison_never_reads_freeze_or_holdout(monkeypatch):
+    observed = []
+    real_correlation = FactorResearchEngine._factor_correlation
+    config = _config(holdout_ratio=0.1, thresholds=_NO_DEDUPLICATION)
+    split = split_periods(config)
+
+    def recording(self, *args, comparison_panels=None, **kwargs):
+        for name, values in (comparison_panels or {}).items():
+            if name.startswith("pool:"):
+                observed.append((values.index.min(), values.index.max()))
+        return real_correlation(self, *args, comparison_panels=comparison_panels, **kwargs)
+
+    monkeypatch.setattr(FactorResearchEngine, "_factor_correlation", recording)
+    thresholds = GateThresholds(**{**_NO_DEDUPLICATION.__dict__, "max_pool_correlation": 0.85})
+    seeds = _seeds(2)
+    frames, members = _fixture()
+    changed = {key: frame.copy() for key, frame in frames.items()}
+    for offset, frame in enumerate(changed.values()):
+        frame.loc[frame.index > split.search_end] *= (offset + 2) ** 3
+    with _patched_expansion(monkeypatch, seeds):
+        first, _ = _run(frames, members, holdout_ratio=0.1, thresholds=thresholds)
+        second, _ = _run(changed, members, holdout_ratio=0.1, thresholds=thresholds)
+    assert first["trials"] == second["trials"]
+    assert [item["fingerprint"] for item in first["candidates"]] == [seeds[0].fingerprint]
+    assert observed and all(start >= split.search_start and end <= split.search_end
+                            for start, end in observed)
+
+
+def _p1_membership_fixture():
+    frames, members = _frames_and_members()
+    members[-1]["membership_periods"] = [
+        {"valid_from": "2024-05-01", "valid_to": "2024-06-03"},
+        {"valid_from": "2024-09-09", "valid_to": None},
+    ]
+    index = frames["USStock:F"].index
+    outside = (index < "2024-05-01") | ((index >= "2024-06-03") & (index < "2024-09-09"))
+    frames["USStock:F"].loc[outside, "close"] = 1e12
+    frames["USStock:F"].loc[outside, "volume"] = -1e12
+    return frames, members
+
+
+def test_p1_search_and_freeze_apply_membership_inside_the_dsl_and_keep_entry_warmup(monkeypatch):
+    frames, members = _p1_membership_fixture()
+    expression = {"op": "cs_rank", "args": [
+        {"op": "ts_mean", "args": ["volume"], "params": {"n": 3}},
+    ]}
+    observed = []
+    real_run = FactorResearchEngine.run
+
+    def recording(self, **kwargs):
+        observed.append(kwargs["factor_panel"].copy())
+        return real_run(self, **kwargs)
+
+    monkeypatch.setattr(FactorResearchEngine, "run", recording)
+    config = _config(start_date=datetime(2024, 2, 1), thresholds=_NO_DEDUPLICATION)
+    engine = FactorMiningEngine(data_provider=_FakeProvider(frames, members))
+    with _patched_expansion(monkeypatch, [_seed_for(expression)]):
+        result = engine.run(user_id=1, code="PORTFOLIO = {}", config=config)
+    assert result["candidates"], "a survivor must reach the frozen evaluator"
+    engine.review_frozen(user_id=1, code="PORTFOLIO = {}", config=config,
+                         survivors=result["candidates"], trials_count=1)
+
+    assert len(observed) == 2
+    for values in observed:
+        assert values.loc["2024-02-01", "USStock:A"] == 1 / 5
+        assert pd.isna(values.loc["2024-02-01", "USStock:F"])
+        assert pd.notna(values.loc["2024-05-01", "USStock:F"]), "entry must keep its prior three bars"
+        assert pd.isna(values.loc["2024-06-03", "USStock:F"]), "valid_to is exclusive"
+        assert pd.notna(values.loc["2024-09-09", "USStock:F"]), "a second membership period must rejoin"
+
+
+def test_p1_builtin_and_historical_pool_panels_share_the_membership_boundary(monkeypatch):
+    frames, members = _p1_membership_fixture()
+    provider = _FakeProvider(frames, members)
+    config = _config(start_date=datetime(2024, 2, 1), holding_period=1)
+    expression = {"op": "ts_mean", "args": ["volume"], "params": {"n": 3}}
+    monkeypatch.setattr(engine_module, "_computable_factor_ids", lambda _frames: ["momentum"])
+    comparison = _comparison_set(
+        panel=provider.panel, config=config, user_id=1,
+        start_date=config.start_date, end_date=config.end_date,
+        pool_loader=lambda *_args, **_kwargs: [pool.PoolMember(1, "deadbeef" * 8, expression)],
+    )
+
+    for name in ("momentum", "pool:deadbeef"):
+        values = comparison.panels[name]
+        assert pd.isna(values.loc["2024-02-01", "USStock:F"])
+        assert pd.notna(values.loc["2024-05-01", "USStock:F"])
+        assert pd.isna(values.loc["2024-06-03", "USStock:F"])
+        assert pd.notna(values.loc["2024-09-09", "USStock:F"])
+    assert comparison.panels["pool:deadbeef"].loc["2024-05-01", "USStock:F"] < -1e11
+    assert provider.panel.fields["volume"].loc["2024-04-30", "USStock:F"] == -1e12
+
+
+@pytest.mark.parametrize("expression", ["close", {"op": "cs_rank", "args": ["close"]}])
+@pytest.mark.parametrize("timezone", [None, "UTC"])
+def test_p1_l6_engine_aligns_current_members_for_both_raw_fields_and_dsl_factors(expression, timezone):
+    frames, members = _p1_membership_fixture()
+    if timezone:
+        frames = {name: frame.set_axis(frame.index.tz_localize(timezone)) for name, frame in frames.items()}
+    provider = _FakeProvider(frames, members)
+    config = _config(start_date=datetime(2024, 2, 1), holding_period=1)
+    comparison = ComparisonSet(
+        pool=("pool:deadbeef",),
+        panels={"pool:deadbeef": provider.panel.fields["volume"].iloc[::-1, ::-1]},
+    )
+    evidence = engine_module._pool_increment_evidence(
+        panel=provider.panel, config=config, split=split_periods(config), comparison=comparison,
+    )
+    result = FactorMiningEngine(data_provider=provider)._pool_gain(expression, evidence, config)
+
+    assert result.measured and result.used_cross_sections > 20
+    assert result.raw_ic == pytest.approx(1.)
+    assert result.residual_ic == 0.
+    assert result.has_incremental_value is False
+    assert evidence.returns.index.equals(evidence.members["pool:deadbeef"].index)
+
+
+def test_p1_l4_and_search_metrics_do_not_move_when_only_outsider_values_change(monkeypatch):
+    frames, members = _frames_and_members()
+    members[-1]["membership_periods"] = [{"valid_from": "2025-01-01", "valid_to": None}]
+    for offset, frame in enumerate(frames.values()):
+        frame["volume"] = -0.2 * offset
+    changed = {name: frame.copy() for name, frame in frames.items()}
+    changed["USStock:F"]["close"] = 1e12
+    expression = {"op": "add", "args": [{"op": "cs_zscore", "args": ["close"]}, "volume"]}
+    monkeypatch.setattr(engine_module, "_computable_factor_ids", lambda _frames: ["momentum"])
+
+    class Provider(_FakeProvider):
+        def comparison_set(self, **kwargs):
+            return _comparison_set(**kwargs, pool_loader=lambda *_args, **_kwargs: [pool.PoolMember(
+                1, "deadbeef" * 8, {"op": "cs_rank", "args": ["close"]})])
+
+    config = _config(start_date=datetime(2024, 4, 1), holding_period=1, thresholds=_NO_DEDUPLICATION)
+    with _patched_expansion(monkeypatch, [_seed_for(expression)]):
+        first = FactorMiningEngine(data_provider=Provider(frames, members)).run(
+            user_id=1, code="PORTFOLIO = {}", config=config)
+        second = FactorMiningEngine(data_provider=Provider(changed, members)).run(
+            user_id=1, code="PORTFOLIO = {}", config=config)
+
+    assert first["candidates"] and second["candidates"]
+    assert first["trials"] == second["trials"]
+    assert first["candidates"] == second["candidates"]
+    correlation = second["candidates"][0]["metrics"]["factorCorrelation"]
+    assert correlation["factors"] == ["expression", "momentum", "pool:deadbeef"]
+    assert correlation["matrix"][0] == pytest.approx([1., 1., 1.])
+
+
+def test_p1_l6_temporal_subtrees_keep_member_ranks_from_before_the_search_window():
+    frames, members = _p1_membership_fixture()
+    provider = _FakeProvider(frames, members)
+    config = _config(start_date=datetime(2024, 2, 1), holding_period=1)
+    expression = {"op": "ts_mean", "args": [{"op": "cs_rank", "args": ["volume"]}], "params": {"n": 3}}
+    comparison = _comparison_set(
+        panel=provider.panel, config=config, user_id=1,
+        start_date=config.start_date, end_date=split_periods(config).search_end,
+        pool_loader=lambda *_args, **_kwargs: [pool.PoolMember(1, "deadbeef" * 8, expression)], factor_limit=0,
+    )
+    evidence = engine_module._pool_increment_evidence(
+        panel=provider.panel, config=config, split=split_periods(config), comparison=comparison,
+    )
+    result = FactorMiningEngine._pool_gain(expression, evidence, config)
+
+    assert result.measured and result.has_incremental_value is False
+    assert result.residual_ic == 0.
+    assert result.used_cross_sections == len(evidence.returns) - 2
+    assert result.skipped_cross_sections == 2

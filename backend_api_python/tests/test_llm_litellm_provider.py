@@ -854,3 +854,134 @@ def test_model_fallback_flag_is_false_when_primary_model_answers(monkeypatch):
     assert out == "generated code"
     assert service.last_model_used == "deepseek/deepseek-v4.1-flash"
     assert service.model_fallback_used is False
+
+
+def test_p2_model_fallback_shares_the_call_deadline(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr("app.services.llm.monotonic", lambda: clock[0], raising=False)
+    service = _openrouter_service_with(monkeypatch)
+    timeouts = []
+
+    def call(messages, model, temperature, api_key, base_url, timeout, **kwargs):
+        timeouts.append(timeout)
+        clock[0] += 40
+        raise LLMAPIError("missing", status_code=404)
+
+    monkeypatch.setattr(service, "_call_openai_compatible", call)
+    with pytest.raises(TimeoutError):
+        service.call_llm_api([], model="missing-model", timeout_seconds=60,
+                             try_alternative_providers=False)
+    assert timeouts == [60, 20]
+
+
+def test_p2_provider_fallback_preserves_the_absolute_deadline(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr("app.services.llm.monotonic", lambda: clock[0], raising=False)
+    monkeypatch.setattr("app.services.llm.load_addon_config", lambda: {})
+    service = _openrouter_service_with(monkeypatch, default_model="m")
+    monkeypatch.setattr(service, "_normalize_model_for_provider", lambda model, provider: "m")
+    timeouts = []
+
+    def call(messages, model, temperature, api_key, base_url, timeout, **kwargs):
+        timeouts.append(timeout)
+        clock[0] += 35
+        raise LLMAPIError("forbidden", status_code=403)
+
+    monkeypatch.setattr(service, "_call_openai_compatible", call)
+    monkeypatch.setattr(service, "_call_google_gemini", call)
+    monkeypatch.setattr(service, "_call_litellm", call)
+    with pytest.raises(TimeoutError):
+        service.call_llm_api([], model="m", timeout_seconds=60)
+    assert timeouts == [60, 25]
+
+
+@pytest.mark.parametrize("proxy_url", ["", "http://proxy.example:8080"])
+def test_p2_deadline_transport_does_not_follow_redirects(monkeypatch, proxy_url):
+    import requests
+
+    clock = [0.0]
+    sent = []
+
+    class RedirectAdapter(requests.adapters.BaseAdapter):
+        def send(self, request, **kwargs):
+            sent.append((clock[0], kwargs["timeout"]))
+            clock[0] += 40
+            if clock[0] >= 120:
+                raise requests.exceptions.Timeout("transport exceeded its budget")
+            response = requests.Response()
+            response.status_code = 307
+            response.headers["Location"] = "https://llm.example/redirected"
+            response._content = b""
+            response.url = request.url
+            response.request = request
+            return response
+
+        def close(self):
+            pass
+
+    session = requests.Session()
+    session.mount("https://", RedirectAdapter())
+    monkeypatch.setattr("app.services.llm.monotonic", lambda: clock[0])
+    monkeypatch.setattr("app.services.llm.requests.Session", lambda: session)
+    monkeypatch.setattr("app.services.llm.requests.post", session.post)
+    service = _openrouter_service_with(monkeypatch, default_model="m")
+    monkeypatch.setattr(service, "_llm_proxy_url", lambda: proxy_url)
+    with pytest.raises(LLMAPIError, match="redirect"):
+        service.call_llm_api([], model="m", timeout_seconds=60, use_fallback=False,
+                             try_alternative_providers=False)
+
+    assert len(sent) == 1
+    assert sent[0][0] == 0
+    assert sent[0][1].total == 60
+
+
+def test_p2_expired_transport_deadline_never_opens_a_session(monkeypatch):
+    monkeypatch.setattr("app.services.llm.monotonic", lambda: 60)
+
+    def forbidden_session():
+        pytest.fail("an expired request must not open a transport session")
+
+    monkeypatch.setattr("app.services.llm.requests.Session", forbidden_session)
+    with pytest.raises(TimeoutError):
+        LLMService()._llm_post("https://llm.example", headers={}, json_payload={},
+                               timeout=60, deadline=59)
+
+
+def test_p2_transport_rechecks_deadline_after_session_setup(monkeypatch):
+    clock = [0.0]
+    session = SimpleNamespace(close=lambda: None)
+
+    def forbidden_post(*args, **kwargs):
+        pytest.fail("transport setup exhausted the budget before sending")
+
+    session.post = forbidden_post
+    monkeypatch.setattr("app.services.llm.monotonic", lambda: clock[0])
+    monkeypatch.setattr("app.services.llm.requests.Session", lambda: session)
+    service = LLMService()
+
+    def slow_config():
+        clock[0] = 61
+        return ""
+
+    monkeypatch.setattr(service, "_llm_proxy_url", slow_config)
+    with pytest.raises(TimeoutError):
+        service._llm_post("https://llm.example", headers={}, json_payload={},
+                          timeout=60, deadline=60)
+
+
+def test_p2_litellm_uses_remaining_budget_without_sdk_retries(monkeypatch):
+    captured = {}
+
+    class FakeLiteLLM:
+        @staticmethod
+        def completion(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content="ok"))])
+
+    monkeypatch.setitem(sys.modules, "litellm", FakeLiteLLM)
+    monkeypatch.setattr("app.services.llm.monotonic", lambda: 43)
+    service = LLMService(provider="litellm")
+    assert service._call_litellm([], "m", 0.7, "", "", 60, deadline=60) == "ok"
+    assert captured["timeout"] == 17
+    assert captured["num_retries"] == 0

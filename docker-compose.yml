@@ -571,7 +571,45 @@ services:
     networks:
       - quantdinger-network
     healthcheck:
-      test: ["CMD", "python", "-m", "app.commands.worker_health", "celery"]
+      test: ["CMD", "python", "-m", "app.commands.worker_health", "celery", "--queues", "jobs,ai,maintenance"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
+  celery-mining-worker:
+    <<: *backend-runtime
+    build: *backend-build
+    image: ${BACKEND_LOCAL_IMAGE:-quantdinger-backend:local}
+    restart: unless-stopped
+    deploy:
+      replicas: ${CELERY_MINING_REPLICAS:-1}
+    mem_limit: ${CELERY_MINING_MEMORY_LIMIT:-2g}
+    cpus: ${CELERY_MINING_CPU_LIMIT:-1.0}
+    command: ["celery", "-A", "app.celery_app:celery_app", "worker", "--loglevel=INFO", "--hostname=celery@%h", "-Q", "mining", "--concurrency=${CELERY_MINING_CONCURRENCY:-1}", "--prefetch-multiplier=${CELERY_MINING_PREFETCH:-1}"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-jobs:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    volumes:
+      - backend_logs:/app/logs
+      - backend_data:/app/data
+      - ./.env:/app/.env
+    environment:
+      <<: *worker-environment
+      QD_PROCESS_ROLE: celery
+      DB_POOL_MIN: ${CELERY_MINING_DB_POOL_MIN:-1}
+      DB_POOL_MAX: ${CELERY_MINING_DB_POOL_MAX:-4}
+      DB_APPLICATION_NAME: quantdinger-celery-mining
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.commands.worker_health", "celery", "--queues", "mining"]
       interval: 15s
       timeout: 5s
       retries: 3

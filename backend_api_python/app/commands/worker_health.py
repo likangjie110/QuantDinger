@@ -4,9 +4,24 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
 import sys
 
 from app.utils.db import get_db_connection
+
+
+def _celery_queues_ready(expected_queues: set[str]) -> bool:
+    """Require the local Celery node to consume exactly its assigned queues."""
+    from app.celery_app import celery_app
+
+    node = f"celery@{socket.gethostname()}"
+    try:
+        inspector = celery_app.control.inspect(destination=[node], timeout=3.0)
+        replies = inspector.active_queues() or {}
+        queues = replies.get(node) or []
+        return bool(expected_queues) and {queue["name"] for queue in queues} == expected_queues
+    except Exception:
+        return False
 
 
 def main() -> None:
@@ -23,7 +38,16 @@ def main() -> None:
         ),
     )
     parser.add_argument("--max-age", type=int, default=45)
+    parser.add_argument("--queues", help="Expected local Celery queues, separated by commas")
     args = parser.parse_args()
+
+    if args.queues is not None:
+        if args.role != "celery":
+            parser.error("--queues is only supported for the celery role")
+        queues = {queue.strip() for queue in args.queues.split(",") if queue.strip()}
+        if not _celery_queues_ready(queues):
+            sys.exit(1)
+        return
 
     credential_key = str(os.getenv("CREDENTIAL_ENCRYPTION_KEY") or "").strip()
     session_key = str(os.getenv("SECRET_KEY") or "").strip()

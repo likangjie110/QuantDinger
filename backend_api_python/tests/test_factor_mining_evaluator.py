@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from app.services.factor_mining.evaluator import ExpressionEvaluator
 
@@ -100,3 +101,52 @@ def test_evaluator_cache_counts_distinct_subtrees_and_reuses():
     other = ExpressionEvaluator(fields)
     other.evaluate({"op": "add", "args": [{"op": "neg", "args": ["close"]}, spelled_out], "params": {}})
     assert other.cache_info() == info
+
+
+@pytest.mark.parametrize("operator, expected_columns", [
+    ("cs_rank", {"A": [0.5, 1 / 3, 0.5, 1 / 3], "B": [1, 2 / 3, 1, 2 / 3],
+                 "C": [np.nan, 1, np.nan, 1]}),
+    ("cs_zscore", {"A": [-1, -np.sqrt(1.5), -1, -np.sqrt(1.5)], "B": [1, 0, 1, 0],
+                   "C": [np.nan, np.sqrt(1.5), np.nan, np.sqrt(1.5)]}),
+    ("cs_demean", {"A": [-1, -2, -1, -2], "B": [1, 0, 1, 0],
+                   "C": [np.nan, 2, np.nan, 2]}),
+])
+def test_p1_cross_sections_ignore_nonmembers_before_ranking_and_scaling(operator, expected_columns):
+    dates = pd.date_range("2025-01-01", periods=4)
+    close = pd.DataFrame({"A": [1., 2., 3., 4.], "B": [3., 4., 5., 6.],
+                          "C": [1e12, 6., 1e12, 8.], "outsider": [-1e12] * 4}, index=dates)
+    membership = pd.DataFrame({"A": True, "B": True, "C": [False, True, False, True],
+                               "outsider": False}, index=dates)
+    original = close.copy(deep=True)
+    result = ExpressionEvaluator({"close": close}, membership=membership.iloc[::-1, ::-1]).evaluate(
+        {"op": operator, "args": ["close"]})
+
+    expected = pd.DataFrame({**expected_columns, "outsider": [np.nan] * 4}, index=dates, dtype=float)
+    pd.testing.assert_frame_equal(result, expected)
+    pd.testing.assert_frame_equal(close, original)
+
+
+def test_p1_time_series_uses_pre_membership_history_but_cross_sections_do_not():
+    dates = pd.date_range("2025-01-01", periods=5)
+    close = pd.DataFrame({"A": [1.] * 5, "B": [3.] * 5, "C": [3., 6., 9., 12., 15.]}, index=dates)
+    membership = pd.DataFrame({"A": True, "B": True, "C": [False, False, True, False, True]}, index=dates)
+    mean = {"op": "ts_mean", "args": ["close"], "params": {"n": 3}}
+    evaluator = ExpressionEvaluator({"close": close}, membership=membership)
+
+    values = evaluator.evaluate(mean)
+    np.testing.assert_allclose(values["C"], [np.nan, np.nan, 6., 9., 12.], equal_nan=True)
+    ranks = evaluator.evaluate({"op": "cs_rank", "args": [mean]})
+    assert ranks.loc[dates[2], "C"] == ranks.loc[dates[4], "C"] == 1.0
+    assert ranks.loc[dates[3], "A"] == 0.5
+    assert pd.isna(ranks.loc[dates[3], "C"])
+
+
+def test_p1_time_series_of_cross_sections_does_not_invent_pre_entry_ranks():
+    dates = pd.date_range("2025-01-01", periods=4)
+    close = pd.DataFrame({"A": 1., "B": 2., "C": 3.}, index=dates)
+    membership = pd.DataFrame({"A": True, "B": True, "C": [False, False, True, True]}, index=dates)
+    result = ExpressionEvaluator({"close": close}, membership=membership).evaluate(
+        {"op": "ts_mean", "args": [{"op": "cs_rank", "args": ["close"]}], "params": {"n": 2}})
+
+    assert pd.isna(result.loc[dates[2], "C"])
+    assert result.loc[dates[3], "C"] == 1.0

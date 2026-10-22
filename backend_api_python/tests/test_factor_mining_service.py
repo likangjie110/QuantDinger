@@ -90,7 +90,16 @@ class _Repository:
         # The job -> run lookup a replay and the proposals endpoint read, and the recorded
         # proposals a replay copies. Keyed the way the real repository answers them.
         self.runs_by_job = {}
+        self.recovery_runs_by_job = {}
         self.proposals = {}
+        self.experiments = []
+        self.cumulative_trials = 0
+        self.execution = None
+        self.cancelled = False
+
+    def for_execution(self, *, job_id, user_id, token):
+        self.execution = (job_id, user_id, token)
+        return self
 
     def persist_run(self, **kwargs):
         self.trace.append("persist_run")
@@ -107,13 +116,32 @@ class _Repository:
         self.candidates.append(list(candidates))
         return len(candidates)
 
+    def register_experiment_trials(self, run_id, *, user_id, context, trials_count):
+        self.trace.append("register_experiment_trials")
+        self.experiments.append({"run_id": run_id, "user_id": user_id, "context": context,
+                                 "trials_count": trials_count})
+        return {"experimentId": 11, "contextHash": "e" * 64, "runTrials": trials_count,
+                "cumulativeTrials": self.cumulative_trials + trials_count}
+
     def finish_run(self, run_id, *, user_id, status, result, error_message=""):
         self.trace.append("finish_run")
         self.finished.append({"run_id": run_id, "user_id": user_id, "status": status,
                               "result": result, "error_message": error_message})
 
+    def publish_run(self, run_id, *, user_id, result):
+        if self.cancelled:
+            raise mining_service.agent_jobs.JobCancelledError("JOB_CANCELLED")
+        self.trace.append("publish_run")
+        self.candidates.append(list(result["candidates"]))
+        self.finished.append({"run_id": run_id, "user_id": user_id, "status": "success",
+                              "result": result, "error_message": ""})
+
     def get_run_by_job_id(self, job_id, *, user_id):
         return self.runs_by_job.get(str(job_id))
+
+    def get_recovery_run(self, job_id, *, user_id):
+        run = self.recovery_runs_by_job.get(str(job_id), self.runs_by_job.get(str(job_id)))
+        return run if run and run.get("status") == "failed" and self.proposals.get(run["id"]) else None
 
     def list_proposals(self, run_id, *, user_id, limit=50, offset=0):
         rows = list(self.proposals.get(run_id, []))
@@ -165,6 +193,11 @@ class _Engine:
             raise self.review_error
         return self.reviewed
 
+    def freeze_evidence(self):
+        return {"freezeVersion": "v1", "freezeSnapshotId": "f" * 64,
+                "holdout": {"reserved": False, "evaluated": False,
+                            "startDate": None, "endDate": None}}
+
 
 def _factory(trace, engine):
     """An ``engine_factory`` that hands back ``engine`` and records how it was built."""
@@ -201,7 +234,8 @@ class _Jobs:
     def submit_job(self, *, job_id=None, request_payload=None, runner=None, **kwargs):
         self.jobs.append({
             "job_id": job_id, "kind": kwargs.get("kind"), "status": "queued",
-            "request": dict(request_payload or {}), "runner": runner, "result": None,
+            "request": {**dict(request_payload or {}), "__executionToken": "test-execution"},
+            "runner": runner, "result": None,
         })
         return {"job_id": job_id, "status": "queued"}
 
@@ -235,11 +269,14 @@ def _service(run_result=None):
 
 
 @pytest.fixture(autouse=True)
-def _restore_module_hooks():
+def _restore_module_hooks(monkeypatch):
     """Undo whatever ``_service`` patched, after every test in this module."""
     source = mining_service.get_script_source_service
     submit_job = mining_service.agent_jobs.submit_job
     count_active_jobs = mining_service.agent_jobs.count_active_jobs
+    from app.utils import factor_mining_jobs
+
+    monkeypatch.setattr(factor_mining_jobs, "recover_jobs", lambda **_: 0)
     yield
     mining_service.get_script_source_service = source
     mining_service.agent_jobs.submit_job = submit_job
@@ -438,21 +475,31 @@ def _list_one_running_job(monkeypatch, started_at, failed):
         lambda **_: [{"job_id": "job-1", "status": "running", "started_at": started_at}],
     )
     monkeypatch.setattr(mining_service.agent_jobs, "get_job",
-                        lambda job_id, *, user_id: _job_row(job_id=job_id, status="failed"))
+                        lambda job_id, *, user_id: _job_row(job_id=job_id, status="running"))
     monkeypatch.setattr(mining_service.agent_jobs, "_set_failure",
                         lambda job_id, message: failed.append((job_id, message)))
     return FactorMiningService().list_jobs(user_id=USER_ID)
 
 
-def test_list_jobs_retires_a_job_whose_worker_died(monkeypatch):
-    """An unswept ghost blocks every later submission: the concurrency gate counts active jobs."""
+def test_list_jobs_does_not_fail_long_running_job_from_started_at_alone(monkeypatch):
+    """Durable lease recovery, not elapsed time, decides whether an owner was lost."""
     failed = []
     stale = datetime.now(timezone.utc) - timedelta(seconds=10_000)
 
     jobs = _list_one_running_job(monkeypatch, stale, failed)
 
-    assert failed == [("job-1", "factorMining.workerInterrupted")]
-    assert jobs[0]["status"] == "failed"
+    assert failed == []
+    assert jobs[0]["status"] == "running"
+
+
+def test_list_jobs_recovers_only_the_callers_leases(monkeypatch):
+    from app.utils import factor_mining_jobs
+
+    scopes = []
+    monkeypatch.setattr(factor_mining_jobs, "recover_jobs", lambda **scope: scopes.append(scope))
+    monkeypatch.setattr(mining_service.agent_jobs, "list_jobs", lambda **_: [])
+    FactorMiningService().list_jobs(user_id=USER_ID)
+    assert scopes == [{"user_id": USER_ID}]
 
 
 def test_list_jobs_leaves_a_running_job_inside_its_time_limit_alone(monkeypatch):
@@ -888,8 +935,7 @@ def test_runner_ledgers_every_trial_and_writes_the_frozen_count_back(monkeypatch
     result = service._run_mining_job({"__userId": USER_ID, **_payload(budget=3)}, _PROGRESS)
 
     assert repository.trace == ["persist_run", "engine_factory", "engine.run", "save_trials",
-                                "upsert_candidates", "review_frozen", "upsert_candidates",
-                                "finish_run"]
+                                "register_experiment_trials", "review_frozen", "publish_run"]
     assert sources.calls == [(3, USER_ID)]
     assert isinstance(built["data_provider"], MiningDataProvider)
     assert built["on_progress"] is _PROGRESS
@@ -899,8 +945,7 @@ def test_runner_ledgers_every_trial_and_writes_the_frozen_count_back(monkeypatch
     assert repository.runs[0]["config"]["market"] == "USStock"
     assert repository.runs[0]["manifest"]["strategyType"] == "portfolio"
     assert repository.trials[0]["trials"] == trials
-    assert repository.candidates[0] == [survivor]
-    assert repository.candidates[1] == reviewed
+    assert repository.candidates == [reviewed]
     assert engine.survivors == [survivor]
     # One survivor, three trials: the denominator is the whole ledger, rejects included.
     assert engine.trials_counts == [len(trials)]
@@ -910,7 +955,9 @@ def test_runner_ledgers_every_trial_and_writes_the_frozen_count_back(monkeypatch
     # The service writes the review back and nothing else: every other field the engine handed it
     # is persisted unchanged, and only ``summary.frozen`` differs from the engine's placeholder.
     persisted = repository.finished[0]["result"]
-    assert persisted["summary"] == {**engine_summary, "frozen": 1}
+    assert persisted["summary"] == {**engine_summary, "frozen": 1, "research": {
+        "experimentId": 11, "contextHash": "e" * 64, "runTrials": 3,
+        "cumulativeTrials": 3, **engine.freeze_evidence()}}
     assert persisted["trials"] == trials
     assert persisted["split"] == run_result["split"]
     assert result["summary"]["frozen"] == 1
@@ -935,6 +982,21 @@ def test_search_mode_defaults_to_enumeration(monkeypatch):
 
     assert engine.configs[0].search_mode == "enumeration"
     assert engine.search_modes == ["enumeration", "enumeration"]
+
+
+def test_runner_uses_cumulative_trials_and_persists_research_evidence(monkeypatch):
+    repository = _Repository()
+    repository.cumulative_trials = 50
+    engine = _Engine(repository.trace, run_result=_run_result([_trial("a", "reject")], []))
+    build, _ = _factory(repository.trace, engine)
+    monkeypatch.setattr(mining_service, "get_script_source_service", lambda: _SourceService(_SOURCE))
+    result = FactorMiningService(engine_factory=build, repository=repository)._run_mining_job(
+        {"__userId": USER_ID, **_payload()}, _PROGRESS)
+    assert engine.trials_counts == [51]
+    assert result["summary"]["research"]["cumulativeTrials"] == 51
+    assert result["summary"]["research"]["freezeSnapshotId"] == "f" * 64
+    assert repository.experiments[0]["user_id"] == USER_ID
+    assert repository.experiments[0]["context"]["sourceId"] == 3
 
 
 def test_the_frozen_review_carries_the_modes_own_warmup_rule(monkeypatch):
@@ -1057,6 +1119,28 @@ def test_runner_marks_a_cancelled_run_as_cancelled(monkeypatch):
     assert repository.finished[0]["error_message"] == ""
 
 
+def test_cancellation_after_review_never_publishes_candidates(monkeypatch):
+    repository = _Repository()
+    survivor = {"expression": {"op": "close"}, "fingerprint": "a" * 64,
+                "status": "frozen", "metrics": {}, "outOfSample": {}}
+    engine = _Engine(repository.trace, run_result=_run_result([], [survivor]), reviewed=[survivor])
+    original_review = engine.review_frozen
+
+    def cancel_after_review(**kwargs):
+        result = original_review(**kwargs)
+        repository.cancelled = True
+        return result
+
+    engine.review_frozen = cancel_after_review
+    factory, _ = _factory(repository.trace, engine)
+    monkeypatch.setattr(mining_service, "get_script_source_service", lambda: _SourceService(_SOURCE))
+    service = FactorMiningService(repository=repository, engine_factory=factory)
+    with pytest.raises(mining_service.agent_jobs.JobCancelledError):
+        service._run_mining_job({"__userId": USER_ID, **_payload()}, _PROGRESS)
+    assert repository.candidates == []
+    assert repository.finished[-1]["status"] == "cancelled"
+
+
 # ─────────────────────────────── celery dispatch ───────────────────────────────
 
 def test_celery_dispatches_factor_mining_to_the_service_runner(monkeypatch):
@@ -1117,6 +1201,47 @@ def test_ai_run_passes_run_id_and_notes_to_the_engine():
     service.jobs[-1]["runner"](service.jobs[-1]["request"], None)
     assert service.engine_calls[-1]["ai"].run_id == RUN_ID
     assert service.engine_calls[-1]["ai"].research_notes == "note"
+    context = service.engine_calls[-1]["ai"].history_context
+    assert context["sourceId"] == 3 and context["holdingPeriod"] == 5
+    assert context["universe"]["kind"] == "static"
+
+
+def test_replay_preserves_reserved_holdout_configuration():
+    service = _service()
+    recorded = {**_original_config(), "holdout_ratio": .2}
+    service.repository.runs_by_job["orig"] = {"id": 9, "config": recorded, "status": "success"}
+    service.repository.proposals[9] = [{"expression": {"op": "close"}, "status": "evaluated"}]
+    receipt = service.submit(user_id=4, payload={"searchMode": "ai", "replayJobId": "orig"})
+    assert receipt["config"]["holdoutRatio"] == .2
+    assert service.jobs[-1]["request"]["holdoutRatio"] == .2
+
+
+def test_recovered_ai_attempt_reuses_recorded_proposals_without_fresh_model_work():
+    service = _service()
+    service.submit(user_id=USER_ID, payload=_payload(searchMode="ai"))
+    request = service.jobs[-1]["request"]
+    job_id = request["__jobId"]
+    proposals = [{"expression": {"op": "close"}, "round": 1, "ordinal": 1,
+                  "status": "evaluated", "hypothesis": "recorded", "dslVersion": DSL_VERSION}]
+    service.repository.runs_by_job[job_id] = {"id": 33, "status": "failed"}
+    service.repository.proposals[33] = proposals
+    service.jobs[-1]["runner"](request, None)
+    assert service.engine_calls[-1]["ai"].replay_proposals == tuple(proposals)
+    assert service.repository.execution == (job_id, USER_ID, "test-execution")
+
+
+def test_two_crashes_before_proposal_copy_still_recover_the_first_attempts_proposals():
+    service = _service()
+    service.submit(user_id=USER_ID, payload=_payload(searchMode="ai"))
+    request = service.jobs[-1]["request"]
+    job_id = request["__jobId"]
+    service.repository.runs_by_job[job_id] = {"id": 34, "status": "failed"}
+    service.repository.recovery_runs_by_job[job_id] = {"id": 33, "status": "failed"}
+    proposals = [{"expression": {"op": "neg", "args": ["close"]}, "round": 1, "ordinal": 1,
+                  "status": "proposed", "dslVersion": DSL_VERSION}]
+    service.repository.proposals[33] = proposals
+    service.jobs[-1]["runner"](request, None)
+    assert service.engine_calls[-1]["ai"].replay_proposals == tuple(proposals)
 
 
 def test_replay_uses_the_original_config_and_proposals():

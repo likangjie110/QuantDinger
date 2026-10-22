@@ -88,7 +88,7 @@ def submit_job(
     idempotency_key: Optional[str] = None,
     job_id: Optional[str] = None,
 ) -> dict:
-    """Persist a job row and dispatch its runner on the thread pool.
+    """Persist a job row and dispatch via Celery or the local thread pool.
 
     The runner may take either signature:
         ``runner(payload) -> result``                       (no streaming)
@@ -107,6 +107,9 @@ def submit_job(
     request_payload = dict(request_payload)
     with get_db_connection() as db:
         cur = db.cursor()
+        if kind == "factor_mining":
+            cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (f"factor-mining-submit:{int(user_id)}:{kind}",))
         if idempotency_key and agent_token_id:
             cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                         (f"agent-job:{user_id}:{agent_token_id}:{kind}:{idempotency_key}",))
@@ -122,6 +125,14 @@ def submit_job(
                 db.commit()
                 cur.close()
                 return _job_receipt(existing, duplicate=True)
+        if kind == "factor_mining":
+            cur.execute("""SELECT COUNT(*) > 0 AS active FROM qd_agent_jobs
+                WHERE user_id = %s AND kind = %s AND status IN ('queued', 'running')""",
+                (int(user_id), kind))
+            if (cur.fetchone() or {}).get("active") is True:
+                db.rollback()
+                cur.close()
+                raise ValueError("factorMining.concurrentLimit")
         if kind == "backtest":
             request_payload["__billing"] = get_billing_service().consume_in_transaction(
                 cur, int(user_id), "backtest", f"agent-backtest:{job_id}")
@@ -143,6 +154,11 @@ def submit_job(
     accepts_progress = _runner_accepts_progress(runner)
 
     def _run() -> None:
+        if kind == "factor_mining":
+            from app.utils.factor_mining_jobs import run_job
+
+            run_job(job_id, runner)
+            return
         if not _set_status(job_id, "running", started_at=datetime.utcnow()):
             return
         row = get_job_for_worker(job_id)
@@ -192,7 +208,10 @@ def submit_job(
             from app.tasks.agent_jobs import execute_agent_job, supports_kind
 
             if supports_kind(kind):
-                execute_agent_job.delay(job_id)
+                if kind == "factor_mining":
+                    execute_agent_job.apply_async(args=[job_id], queue="mining")
+                else:
+                    execute_agent_job.delay(job_id)
             else:
                 logger.warning("No Celery runner registered for agent job kind=%s; using local executor", kind)
                 _get_executor().submit(_run)
@@ -414,7 +433,9 @@ def _gc_job_state(job_id: str) -> None:
 def _set_status(job_id: str, status: str, *, started_at: Optional[datetime] = None) -> bool:
     with get_db_connection() as db:
         cur = db.cursor()
-        guard = " AND status = 'queued'" if status == "running" else ""
+        guard = " AND kind <> 'factor_mining'"
+        if status == "running":
+            guard += " AND status = 'queued'"
         if started_at is not None:
             cur.execute(
                 f"UPDATE qd_agent_jobs SET status = %s, started_at = %s WHERE job_id = %s{guard}",
@@ -444,12 +465,22 @@ def _finish_job(job_id: str, status: str, *, result: Any = None,
     """Commit the terminal state and any refund in one transaction."""
     with get_db_connection() as db:
         cur = db.cursor()
-        cur.execute("SELECT user_id, status, request FROM qd_agent_jobs WHERE job_id = %s FOR UPDATE", (job_id,))
+        cur.execute("SELECT user_id, kind, status, request FROM qd_agent_jobs WHERE job_id = %s FOR UPDATE", (job_id,))
         row = cur.fetchone()
         if not row or (user_id is not None and int(row["user_id"]) != int(user_id)) or row["status"] not in {"queued", "running"}:
             db.commit()
             cur.close()
             return False
+        if row.get("kind") == "factor_mining":
+            # Only cancellation and pre-claim dispatch failure may bypass an execution token.
+            if status != "cancelled" and (row["status"] == "running" or status == "succeeded"):
+                db.commit()
+                cur.close()
+                return False
+            from app.utils.factor_mining_jobs import close_running_runs
+
+            close_running_runs(cur, job_id=job_id, user_id=int(row["user_id"]),
+                               status=status, error=error or "")
         payload = _request_dict(row)
         charge = payload.get("__billing")
         if charge is not None:
@@ -457,9 +488,10 @@ def _finish_job(job_id: str, status: str, *, result: Any = None,
                 charge = get_billing_service().refund_in_transaction(cur, int(row["user_id"]), charge)
                 payload["__billing"] = charge
             result = {**(result if isinstance(result, dict) else {}), "billing": charge}
-        cur.execute("""UPDATE qd_agent_jobs SET status = %s, result = %s::jsonb,
+        lease_update = ", lease_expires_at = NULL" if row.get("kind") == "factor_mining" else ""
+        cur.execute(f"""UPDATE qd_agent_jobs SET status = %s, result = %s::jsonb,
             error = %s, request = %s::jsonb, progress = %s::jsonb,
-            finished_at = NOW() WHERE job_id = %s""",
+            finished_at = NOW(){lease_update} WHERE job_id = %s""",
             (status, json.dumps(result, default=str), error, json.dumps(payload, default=str),
              json.dumps({"phase": status}), job_id))
         db.commit()
@@ -520,7 +552,8 @@ def get_job_for_worker(job_id: str) -> Optional[dict]:
             cur.execute(
                 """
                 SELECT job_id, user_id, agent_token_id, kind, status, request,
-                       result, error, progress, created_at, started_at, finished_at
+                       result, error, progress, created_at, started_at, finished_at,
+                       execution_token, lease_expires_at, heartbeat_at, attempts
                 FROM qd_agent_jobs
                 WHERE job_id = %s
                 """,
