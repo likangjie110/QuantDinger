@@ -28,3 +28,6 @@ dist-ssr
 .env
 .env.local
 .env.*.local
+
+# Keep this application's npm dependency resolution reproducible.
+!package-lock.json

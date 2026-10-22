@@ -25,6 +25,7 @@ AI-agent access. This documentation describes the current v5 release.
 | Connect an AI agent | [MCP setup](agent/MCP_SETUP.md) | [Agent Gateway quickstart](agent/AGENT_QUICKSTART.md) |
 | Integrate over HTTP | [Human OpenAPI](api/README.md) | [API conventions](architecture/API_CONVENTIONS.md) |
 | Extend the backend | [Architecture overview](architecture/README.md) | [Extension guide](architecture/EXTENSION_GUIDE.md) |
+| Deliver product UI or a UI-consumed API | [Frontend module map](../doc/web_doc/00-index.md) | [User-flow delivery template](../doc/web_doc/07-feature-delivery-template.md) |
 
 ## Five-minute installation
 

@@ -1,5 +1,7 @@
 # QuantDinger 因子挖掘前端界面
 
+> 当前定位：这是保留兼容的独立 Vue 3 页面，不是 QuantDinger-Vue 主产品 SPA，也不在默认 Compose 前端镜像中。主产品新增 UI 应在 QuantDinger-Vue 实现。源码归属、替代条件与验收见 [前端模块地图](../doc/web_doc/00-index.md)；历史完成报告不代替本次构建、浏览器或部署证据。
+
 全自动量化因子挖掘功能的 Vue 3 前端实现。
 
 ## 功能特性

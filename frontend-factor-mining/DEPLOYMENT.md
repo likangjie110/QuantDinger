@@ -1,5 +1,7 @@
 # 因子挖掘功能完整部署指南
 
+> 范围：本指南仅描述独立兼容页面。默认 Compose 发布的是独立仓库 QuantDinger-Vue 的镜像，见 [当前交付归属](../doc/web_doc/00-index.md)。以下清单是既有实现说明；当前运行质量以 [前端验收](../doc/web_doc/05-acceptance-checklist.md) 和 fresh verification 为准。
+
 ## 一、架构概览
 
 ```

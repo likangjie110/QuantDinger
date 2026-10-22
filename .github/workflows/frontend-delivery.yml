@@ -1,0 +1,274 @@
+name: Frontend delivery governance
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      frontend_repository:
+        description: 'Explicit main frontend repository (owner/repository); private sources require FRONTEND_READ_TOKEN'
+        required: false
+        type: string
+      frontend_ref:
+        description: 'Explicit main frontend commit or ref; omitted sources remain unverified'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-delivery-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  governance:
+    name: Tools, docs and changed feature coverage (no main UI claim)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      standalone_changed: ${{ steps.scope.outputs.standalone_changed }}
+      browser_changed: ${{ steps.scope.outputs.browser_changed }}
+    steps:
+      - name: Checkout repository with comparison history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Delivery report behavior tests
+        run: python -m unittest discover -s scripts/tests -p test_frontend_delivery.py -v
+
+      - name: Documentation structure and local links
+        run: python scripts/check_docs.py
+
+      - name: Set up Node.js 22 for browser tooling boundary tests
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Browser verification boundary tests
+        run: npm --prefix tools/frontend-verification test
+
+      - name: Require a delivery scope record for changed UI consumers
+        id: scope
+        env:
+          COMPARISON_REF: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
+        shell: bash
+        run: |
+          if [[ "$COMPARISON_REF" =~ ^0+$ ]]; then
+            COMPARISON_REF="$(git rev-parse HEAD^)"
+          fi
+          python scripts/check_frontend_delivery.py --check-changes "$COMPARISON_REF" --report artifacts/frontend-change-coverage.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          report = json.loads(Path('artifacts/frontend-change-coverage.json').read_text())
+          changed = report.get('changedPaths', [])
+          value = 'true' if any(path.startswith('frontend-factor-mining/') for path in changed) else 'false'
+          browser = 'true' if value == 'true' or any(path.startswith('tools/frontend-verification/') for path in changed) else 'false'
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'standalone_changed={value}\n')
+              output.write(f'browser_changed={browser}\n')
+          PY
+
+      - name: Record the exact governance scope
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+              output.write('Main product UI: **unverified**. This public job checks tooling and scope records only.\n\n')
+              output.write('Browser: **unverified**; integration: **unverified**; deployment: **unverified**.\n\n')
+              path = Path('artifacts/frontend-change-coverage.json')
+              if path.exists():
+                  output.write('```json\n' + json.dumps(json.loads(path.read_text()), indent=2) + '\n```\n')
+          PY
+
+  standalone-static:
+    name: Changed standalone page static checks (browser not run)
+    needs: governance
+    if: needs.governance.outputs.standalone_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install the explicitly declared package manager and locked dependencies
+        working-directory: frontend-factor-mining
+        shell: bash
+        run: |
+          package_manager="$(node -p 'JSON.parse(require("fs").readFileSync("package.json", "utf8")).packageManager')"
+          if [[ ! "$package_manager" =~ ^npm@[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo '::error::Standalone packageManager must explicitly declare npm and a version'
+            exit 1
+          fi
+          npm install --global "$package_manager"
+          npm ci --ignore-scripts
+
+      - name: Run standalone lint, typecheck, unit and build without hiding failures
+        run: python scripts/check_frontend_delivery.py --target standalone --run --report artifacts/standalone-static.json
+
+      - name: Record standalone static scope
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+              output.write('Standalone static checks only. Main product UI, browser, integration and deployment remain **unverified**.\n\n')
+              path = Path('artifacts/standalone-static.json')
+              if path.exists():
+                  output.write('```json\n' + json.dumps(json.loads(path.read_text()), indent=2) + '\n```\n')
+          PY
+
+  standalone-mock:
+    name: Standalone application browser mock states (no real backend)
+    needs: governance
+    if: needs.governance.outputs.browser_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install locked application and browser tooling dependencies
+        run: |
+          npm --prefix frontend-factor-mining ci --ignore-scripts
+          npm --prefix tools/frontend-verification ci --ignore-scripts
+          npx --prefix tools/frontend-verification --no-install playwright install --with-deps chromium
+
+      - name: Verify the actual standalone application against isolated API mocks
+        run: node tools/frontend-verification/verify.mjs --target standalone --source frontend-factor-mining --source-revision "$GITHUB_SHA" --mode mock --output-dir artifacts/standalone-mock
+
+      - name: Validate browser evidence without promoting integration or deployment
+        if: always()
+        run: python scripts/check_frontend_delivery.py --target standalone --browser-report artifacts/standalone-mock/browser-report.json --report artifacts/standalone-mock-delivery.json
+
+      - name: Preserve mock evidence including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: standalone-browser-mock
+          path: |
+            artifacts/standalone-mock/
+            artifacts/standalone-mock-delivery.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  main-static:
+    name: Explicit external main source static and mock checks (no real backend)
+    if: github.event_name == 'workflow_dispatch' && inputs.frontend_repository != '' && inputs.frontend_ref != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout verification tools
+        uses: actions/checkout@v7
+
+      - name: Checkout explicitly selected main frontend
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.frontend_repository }}
+          ref: ${{ inputs.frontend_ref }}
+          path: external-main-frontend
+          token: ${{ secrets.FRONTEND_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install declared pnpm and frozen dependencies
+        id: install
+        working-directory: external-main-frontend
+        shell: bash
+        run: |
+          package_manager="$(node -p 'JSON.parse(require("fs").readFileSync("package.json", "utf8")).packageManager')"
+          if [[ ! "$package_manager" =~ ^pnpm@[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo '::error::Main packageManager must explicitly declare pnpm and a version'
+            exit 1
+          fi
+          git ls-files --error-unmatch pnpm-lock.yaml > /dev/null
+          npm install --global "$package_manager"
+          pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Run main static checks and report missing checks as blocked
+        run: python scripts/check_frontend_delivery.py --target main --source external-main-frontend --run --report artifacts/main-static.json
+
+      - name: Install isolated browser tooling
+        if: always() && steps.install.outcome == 'success'
+        run: |
+          npm --prefix tools/frontend-verification ci --ignore-scripts
+          npx --prefix tools/frontend-verification --no-install playwright install --with-deps chromium
+
+      - name: Verify explicitly selected main application against API mocks
+        if: always() && steps.install.outcome == 'success'
+        shell: bash
+        run: |
+          revision="$(git -C external-main-frontend rev-parse HEAD)"
+          node tools/frontend-verification/verify.mjs --target main --source external-main-frontend --source-revision "$revision" --mode mock --output-dir artifacts/main-mock
+
+      - name: Preserve external main verification evidence including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: explicitly-selected-main-verification
+          path: |
+            artifacts/main-static.json
+            artifacts/main-mock/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Record external source static scope
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+              output.write('Explicit main source static and API mock verification. Real integration and deployment remain **unverified**. See browser evidence for its observed result.\n\n')
+              path = Path('artifacts/main-static.json')
+              if path.exists():
+                  output.write('```json\n' + json.dumps(json.loads(path.read_text()), indent=2) + '\n```\n')
+          PY

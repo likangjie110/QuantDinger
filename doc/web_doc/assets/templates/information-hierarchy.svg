@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="560" viewBox="0 0 1040 560" role="img" aria-labelledby="title desc">
+  <title id="title">信息层级骨架，模板示意</title>
+  <desc id="desc">从用户任务出发划分主要信息、辅助信息和低频内容，再关联可观察结果及异常恢复。所有名称、位置与颜色均为模板示意，不代表项目事实。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#64748b"/></marker>
+  </defs>
+  <rect width="1040" height="560" fill="#f8fafc"/>
+  <g font-family="'Microsoft YaHei', 'Segoe UI', sans-serif" fill="#0f172a">
+    <text x="40" y="46" font-size="25" font-weight="700">信息层级与用户任务</text>
+    <rect x="806" y="23" width="194" height="34" rx="7" fill="#e2e8f0"/>
+    <text x="903" y="46" font-size="16" text-anchor="middle">模板示意 · 未配置</text>
+    <text x="40" y="80" font-size="16" fill="#475569">请用真实角色、任务、信息和动作替换；此图不是组件树或项目页面证据。</text>
+    <rect x="300" y="112" width="440" height="84" rx="10" fill="#fff" stroke="#475569" stroke-width="2"/>
+    <text x="520" y="146" text-anchor="middle" font-size="20" font-weight="700">用户角色 + 当前主任务</text>
+    <text x="520" y="176" text-anchor="middle" font-size="16" fill="#475569">成功结果 / 使用场景 / 真实入口：待核实</text>
+    <g fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)">
+      <path d="M520 196 V224 H196 V246"/>
+      <path d="M520 196 V246"/>
+      <path d="M520 196 V224 H844 V246"/>
+    </g>
+    <rect x="40" y="250" width="312" height="126" rx="10" fill="#fff" stroke="#334155" stroke-width="2"/>
+    <text x="62" y="286" font-size="20" font-weight="700">P0 主要信息与动作</text>
+    <text x="62" y="320" font-size="16">完成主任务必需的内容</text>
+    <text x="62" y="350" font-size="16" fill="#475569">可见性 / 操作条件 / 原因</text>
+    <rect x="364" y="250" width="312" height="126" rx="10" fill="#fff" stroke="#94a3b8"/>
+    <text x="386" y="286" font-size="20" font-weight="700">P1 辅助判断信息</text>
+    <text x="386" y="320" font-size="16">帮助理解与作出操作选择</text>
+    <text x="386" y="350" font-size="16" fill="#475569">与主内容的关联 / 进入方式</text>
+    <rect x="688" y="250" width="312" height="126" rx="10" fill="#fff" stroke="#94a3b8"/>
+    <text x="710" y="286" font-size="20" font-weight="700">P2 低频内容</text>
+    <text x="710" y="320" font-size="16">设置 / 历史 / 解释性内容</text>
+    <text x="710" y="350" font-size="16" fill="#475569">收起或导航依据：待核实</text>
+    <g fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)">
+      <path d="M196 376 V402 H520 V424"/>
+      <path d="M520 376 V424"/>
+      <path d="M844 376 V402 H520 V424"/>
+    </g>
+    <rect x="220" y="428" width="600" height="78" rx="10" fill="#e2e8f0" stroke="#64748b"/>
+    <text x="520" y="460" text-anchor="middle" font-size="20" font-weight="700">可观察结果 + 异常恢复出口</text>
+    <text x="520" y="488" text-anchor="middle" font-size="16">关联状态、API、刷新行为与实际验收证据</text>
+    <text x="40" y="540" font-size="15" fill="#475569">图源可编辑。项目采用时补充设计理由、节点来源及桌面/移动适用范围。</text>
+  </g>
+</svg>

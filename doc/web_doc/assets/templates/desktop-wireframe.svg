@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="740" viewBox="0 0 1120 740" role="img" aria-labelledby="title desc">
+  <title id="title">桌面布局骨架，模板示意</title>
+  <desc id="desc">示意顶部入口、可选侧栏、主要内容、辅助区域和底部反馈。要求项目填写区域几何、间距、滚动、层级和组件来源；图中比例不是项目尺寸。</desc>
+  <rect width="1120" height="740" fill="#f8fafc"/>
+  <g font-family="'Microsoft YaHei', 'Segoe UI', sans-serif" fill="#0f172a">
+    <text x="40" y="47" font-size="26" font-weight="700">桌面布局骨架</text>
+    <rect x="866" y="23" width="214" height="34" rx="7" fill="#e2e8f0"/>
+    <text x="973" y="46" font-size="16" text-anchor="middle">模板示意 · 非业务截图</text>
+    <text x="40" y="81" font-size="16" fill="#475569">区域、排列、比例与颜色均是示意。按实际页面绘制，并填写源码与设计依据。</text>
+    <rect x="48" y="120" width="1024" height="454" rx="10" fill="#fff" stroke="#64748b" stroke-width="2"/>
+    <path d="M48 178 H1072" stroke="#94a3b8"/>
+    <text x="68" y="155" font-size="18" font-weight="700">A 页面入口 / 标题 / 全局操作（按项目替换）</text>
+    <rect x="48" y="178" width="184" height="338" fill="#f1f5f9" stroke="#cbd5e1"/>
+    <text x="66" y="210" font-size="18" font-weight="700">B 导航或列表</text>
+    <text x="66" y="239" font-size="15" fill="#475569">是否存在：待核实</text>
+    <g stroke="#cbd5e1" stroke-width="10" stroke-linecap="round">
+      <path d="M72 278 H198"/><path d="M72 314 H174"/><path d="M72 350 H190"/>
+    </g>
+    <text x="66" y="460" font-size="15" fill="#475569">最小宽度 / 可折叠</text>
+    <text x="66" y="487" font-size="15" fill="#475569">来源：待核实</text>
+    <rect x="248" y="194" width="568" height="306" rx="6" fill="#fff" stroke="#334155" stroke-width="2"/>
+    <text x="270" y="227" font-size="20" font-weight="700">C 主要内容区域</text>
+    <text x="270" y="259" font-size="16" fill="#475569">内容形式、密度、宽高约束：待核实</text>
+    <rect x="270" y="283" width="524" height="126" rx="5" fill="#f1f5f9" stroke="#cbd5e1" stroke-dasharray="7 5"/>
+    <text x="532" y="339" text-anchor="middle" font-size="18">用真实内容结构与代表性数据替换</text>
+    <text x="532" y="371" text-anchor="middle" font-size="15" fill="#475569">长文案 / 数字 / 空值 / 列表密度</text>
+    <rect x="270" y="435" width="158" height="40" rx="6" fill="#334155"/>
+    <text x="349" y="461" text-anchor="middle" font-size="16" fill="#fff">主操作：待核实</text>
+    <text x="452" y="461" font-size="15" fill="#475569">条件与反馈：待核实</text>
+    <rect x="832" y="194" width="224" height="306" rx="6" fill="#f8fafc" stroke="#94a3b8"/>
+    <text x="850" y="227" font-size="18" font-weight="700">D 辅助信息</text>
+    <text x="850" y="259" font-size="15" fill="#475569">优先级与内容：待核实</text>
+    <text x="850" y="451" font-size="15" fill="#475569">独立滚动？</text>
+    <text x="850" y="478" font-size="15" fill="#475569">吸顶 / 浮层：待核实</text>
+    <rect x="48" y="516" width="1024" height="58" fill="#e2e8f0" stroke="#94a3b8"/>
+    <text x="68" y="552" font-size="17">E 反馈 / 次要操作（若存在）：与当前任务的关系、可见条件、恢复出口</text>
+    <text x="48" y="620" font-size="18" font-weight="700">项目图示需补充的标注</text>
+    <text x="48" y="652" font-size="16">① 区域尺寸与 token 来源　② 主/次滚动边界　③ 固定、吸顶与浮层层级</text>
+    <text x="48" y="682" font-size="16">④ 中间宽度与折叠顺序　⑤ 组件/路由映射　⑥ 当前实现与目标设计的差异</text>
+    <text x="48" y="717" font-size="15" fill="#475569">这张图不提供任何项目的已审阅布局。真实截图必须从实际应用采集。</text>
+  </g>
+</svg>

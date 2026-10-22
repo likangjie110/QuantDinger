@@ -16,6 +16,7 @@ IGNORED_DOCS_ROOT_FILES = {".DS_Store"}
 IGNORED_DIRECTORIES = {
     ".git",
     ".mypy_cache",
+    ".pnpm-store",
     ".pytest_cache",
     ".ruff_cache",
     ".test_deps",
@@ -32,6 +33,9 @@ IGNORED_DIRECTORIES = {
     ".agents",
     "frontend-extracted",
     "frontend-vue",
+    # ``graphify-out`` is the gitignored output of the local graphify knowledge-graph build:
+    # its GRAPH_REPORT.md and wiki articles link to generated anchors that are not repository paths.
+    "graphify-out",
 }
 
 MARKDOWN_LINK_RE = re.compile(r"(!?)\[[^\]]*\]\(([^)]+)\)")

@@ -143,7 +143,9 @@ python run.py
 
 ### Frontend
 
-The SPA lives in the private **QuantDinger-Vue** repo. Tagging a release there (`git tag vX.Y.Z && git push --tags`) triggers `.github/workflows/release-frontend.yml`, which builds a multi-arch image and pushes it to `ghcr.io/openbyteinc/quantdinger-frontend`. No frontend artefacts are committed here — pin the consumed tag via `IMAGE_TAG` (or `FRONTEND_TAG` for a per-side override) in a root-level `.env`.
+The main product SPA lives in the separate **QuantDinger-Vue** repo. Its release workflow builds the image consumed by Compose; pin the consumed tag via `IMAGE_TAG` (or `FRONTEND_TAG` for a per-side override). This repository also retains `frontend-factor-mining/`, a standalone compatibility UI which is not that product image.
+
+Start UI or UI-consumed API work with the [frontend module map](doc/web_doc/00-index.md) and [user-flow delivery template](doc/web_doc/07-feature-delivery-template.md). Update the affected module documentation, map API/UI/contract coverage, and report the actual target/revision, frontend checks, browser evidence, test-backend integration, and deployment separately. Backend tests alone do not establish UI completion.
 
 For local iteration without publishing, clone the Vue repo into `./QuantDinger-Vue/` (gitignored) and run `docker compose -f docker-compose.yml -f docker-compose.build.yml up --build` — see **DEVELOPMENT.md → Building frontend from local source**.
 
@@ -186,10 +188,11 @@ Keep PRs focused and reviewable.
 
 ## 🧪 Testing & Verification
 
-We do not enforce a single test command yet. Please at least:
+Choose the checks applicable to the affected module:
 
-- **Backend**: run the API locally and verify affected endpoints
-- **Frontend**: run the dev server and verify affected pages/components
+- **Backend**: run the focused pytest tests and verify the affected HTTP contract.
+- **Frontend**: follow the [test map](doc/web_doc/04-test-map.md): non-fixing lint, typecheck, unit tests, build, and actual browser checks of the user flow, result, and refresh behavior. Record desktop/mobile screenshots and console/network/accessibility findings.
+- Report backend, frontend, mock UI, test-backend integration, and deployment separately. Missing source, scripts, or test infrastructure remain blocked; backend tests do not establish UI completion.
 
 Bug fixes should include a minimal regression test when practical.
 

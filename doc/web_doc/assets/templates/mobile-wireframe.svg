@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="880" viewBox="0 0 840 880" role="img" aria-labelledby="title desc">
+  <title id="title">移动布局骨架，模板示意</title>
+  <desc id="desc">示意移动端的任务入口、主要信息、可折叠辅助信息、主操作与安全区域。右侧列出信息重排、滚动、焦点和断点等应核实的约束，不代表业务设计。</desc>
+  <rect width="840" height="880" fill="#f8fafc"/>
+  <g font-family="'Microsoft YaHei', 'Segoe UI', sans-serif" fill="#0f172a">
+    <text x="38" y="47" font-size="26" font-weight="700">移动布局骨架</text>
+    <rect x="588" y="23" width="214" height="34" rx="7" fill="#e2e8f0"/>
+    <text x="695" y="46" font-size="16" text-anchor="middle">模板示意 · 非业务截图</text>
+    <text x="38" y="81" font-size="16" fill="#475569">按真实任务重排内容；图中控件、尺寸与导航均待项目核实。</text>
+    <rect x="48" y="116" width="330" height="684" rx="22" fill="#fff" stroke="#64748b" stroke-width="2"/>
+    <path d="M48 154 H378" stroke="#cbd5e1" stroke-dasharray="5 5"/>
+    <text x="213" y="141" text-anchor="middle" font-size="14" fill="#475569">顶部安全区域（适用时）</text>
+    <text x="68" y="190" font-size="19" font-weight="700">A 任务入口 / 标题</text>
+    <path d="M48 212 H378" stroke="#cbd5e1"/>
+    <rect x="66" y="230" width="294" height="202" rx="8" fill="#f8fafc" stroke="#334155" stroke-width="2"/>
+    <text x="84" y="264" font-size="20" font-weight="700">B 主要信息</text>
+    <text x="84" y="295" font-size="16">优先级：待核实</text>
+    <g stroke="#cbd5e1" stroke-width="10" stroke-linecap="round">
+      <path d="M88 330 H330"/><path d="M88 362 H298"/><path d="M88 394 H318"/>
+    </g>
+    <rect x="66" y="452" width="294" height="118" rx="8" fill="#fff" stroke="#94a3b8"/>
+    <text x="84" y="485" font-size="19" font-weight="700">C 辅助信息 / 次要入口</text>
+    <text x="84" y="517" font-size="16" fill="#475569">折叠 / 换行 / 抽屉：待核实</text>
+    <text x="84" y="547" font-size="16" fill="#475569">可发现性与恢复：待核实</text>
+    <path d="M366 230 V674" stroke="#64748b" stroke-width="3" stroke-dasharray="6 5"/>
+    <text x="84" y="624" font-size="16" fill="#475569">滚动范围与内容溢出：待核实</text>
+    <path d="M48 690 H378" stroke="#94a3b8"/>
+    <rect x="66" y="708" width="294" height="46" rx="7" fill="#334155"/>
+    <text x="213" y="738" text-anchor="middle" font-size="18" fill="#fff">D 主操作（位置按项目替换）</text>
+    <text x="213" y="781" text-anchor="middle" font-size="14" fill="#475569">底部安全区域（适用时）</text>
+    <text x="420" y="156" font-size="21" font-weight="700">项目需要明确的变化规则</text>
+    <text x="420" y="200" font-size="17" font-weight="700">信息重排</text>
+    <text x="420" y="230" font-size="16">主信息保留哪些？辅助信息去哪里？</text>
+    <text x="420" y="284" font-size="17" font-weight="700">操作可达性</text>
+    <text x="420" y="314" font-size="16">主操作、返回、错误恢复的入口</text>
+    <text x="420" y="368" font-size="17" font-weight="700">滚动与遮挡</text>
+    <text x="420" y="398" font-size="16">页面/面板滚动、浮层和固定区域</text>
+    <text x="420" y="452" font-size="17" font-weight="700">输入与焦点</text>
+    <text x="420" y="482" font-size="16">软键盘、关闭、焦点返回与未保存</text>
+    <text x="420" y="536" font-size="17" font-weight="700">响应式切换</text>
+    <text x="420" y="566" font-size="16">真实断点及切换前后的截图</text>
+    <text x="420" y="620" font-size="17" font-weight="700">布局与源码关联</text>
+    <text x="420" y="650" font-size="16">区域 ID、组件、token 与验收用例</text>
+    <text x="420" y="726" font-size="16" fill="#475569">本图不是任何项目的默认移动布局。</text>
+    <text x="420" y="756" font-size="16" fill="#475569">采用时按真实页面重画并标记来源。</text>
+    <text x="38" y="846" font-size="15" fill="#475569">图源可编辑。实际外观、交互与业务结果分别提供运行证据。</text>
+  </g>
+</svg>
