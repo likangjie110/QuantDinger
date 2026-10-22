@@ -44,7 +44,25 @@ curl -X POST http://localhost:8888/api/agent/v1/strategies \
 
 回测异步执行。提交后轮询 `/jobs/{job_id}`，或订阅 `/jobs/{job_id}/stream`。取消任务使用 `POST /jobs/{job_id}/cancel`，需要 `B` Scope、新幂等键以及 MCP 层确认。
 
-## 4. 研究、指标与交易
+## 4. 因子挖掘
+
+因子挖掘把人工面 `/api/factor-mining` 的能力镜像到 `/api/agent/v1/factor-mining`，共 8 个路径、9 个操作：
+
+| 方法 | 路径 | Scope |
+| --- | --- | --- |
+| `GET` | `/factor-mining/catalog` | `R` |
+| `POST` | `/factor-mining/estimate` | `R` |
+| `POST` | `/factor-mining/jobs` | `B` |
+| `GET` | `/factor-mining/jobs` | `R` |
+| `GET` | `/factor-mining/jobs/{job_id}` | `R` |
+| `POST` | `/factor-mining/jobs/{job_id}/cancel` | `B` |
+| `GET` | `/factor-mining/jobs/{job_id}/proposals` | `R` |
+| `GET` | `/factor-mining/candidates` | `R` |
+| `GET` | `/factor-mining/candidates/{candidate_id}` | `R` |
+
+`catalog` 与 `estimate` 提供 DSL 词表并给一次运行估价，不读数据源、不开作业；`estimate` 是只读的 `POST`，只需要 `R`，不需要 `Idempotency-Key`。提交需要 `B` 和唯一幂等键，返回 HTTP 202 与作业回执。取消同样需要 `B` 和新幂等键；MCP 工具 `cancel_factor_mining_job` 还要求用户在明确同意后传 `confirm_cancel=true`。同一租户同时只能有一个活跃挖掘作业（否则返回 `400` `factorMining.concurrentLimit`），`budget` 的硬上限是 2000。
+
+## 5. 研究、指标与交易
 
 - `/research/*`：点时点股票池、因子元数据和租户自选列表。
 - `/indicators/*`：仅用于图表指标；指标代码不能直接提交到回测端点。
@@ -54,7 +72,7 @@ curl -X POST http://localhost:8888/api/agent/v1/strategies \
 
 实盘执行还要求服务端启用实盘、令牌允许实盘、提供凭据引用、客户端明确确认，并满足单笔和单日名义金额上限。
 
-## 5. 上线前检查
+## 6. 上线前检查
 
 - 先用模拟盘和最小 Scope 验证完整流程。
 - 不记录 Token、API Key、Secret 或 Passphrase；脱敏值不可尝试还原。

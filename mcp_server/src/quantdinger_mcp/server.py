@@ -88,6 +88,15 @@ MCP_TOOL_NAMES = (
     "set_signal_alert_status",
     "delete_signal_alert",
     "run_signal_alert",
+    "get_factor_mining_catalog",
+    "estimate_factor_mining",
+    "submit_factor_mining_run",
+    "list_factor_mining_jobs",
+    "get_factor_mining_job",
+    "list_factor_mining_proposals",
+    "cancel_factor_mining_job",
+    "list_factor_mining_candidates",
+    "get_factor_mining_candidate",
 )
 
 
@@ -1081,6 +1090,109 @@ def run_signal_alert(
         json={"confirm": True},
         headers=_idempotency_headers(idempotency_key),
     )
+
+
+# Factor mining
+
+
+@_tool
+def get_factor_mining_catalog(market: str = "") -> Any:
+    """List factor-mining fields, operators, and hypothesis templates."""
+    params = {"market": market} if market else {}
+    return _get("/api/agent/v1/factor-mining/catalog", params=params)
+
+
+@_tool
+def estimate_factor_mining(payload: dict) -> Any:
+    """Price a factor-mining run without reading data or opening a job."""
+    return _post(
+        "/api/agent/v1/factor-mining/estimate",
+        json=assert_json_dict("payload", payload),
+    )
+
+
+@_tool
+def submit_factor_mining_run(payload: dict, idempotency_key: str) -> Any:
+    """Queue a factor-mining run (scope B; one active run per tenant)."""
+    return _post(
+        "/api/agent/v1/factor-mining/jobs",
+        json=assert_json_dict("payload", payload),
+        headers=_idempotency_headers(idempotency_key),
+    )
+
+
+@_tool
+def list_factor_mining_jobs(limit: int = 20) -> Any:
+    """List the tenant's factor-mining jobs, newest first."""
+    return _get(
+        "/api/agent/v1/factor-mining/jobs",
+        params={"limit": max(1, min(50, int(limit)))},
+    )
+
+
+@_tool
+def get_factor_mining_job(job_id: str) -> Any:
+    """Fetch one factor-mining job, including its full result when finished."""
+    return _get(f"/api/agent/v1/factor-mining/jobs/{job_id}")
+
+
+@_tool
+def list_factor_mining_proposals(job_id: str, limit: int = 50, offset: int = 0) -> Any:
+    """List the AI proposals one factor-mining run recorded, in generation order."""
+    return _get(
+        f"/api/agent/v1/factor-mining/jobs/{job_id}/proposals",
+        params={
+            "limit": max(1, min(200, int(limit))),
+            "offset": max(0, int(offset)),
+        },
+    )
+
+
+@_tool
+def cancel_factor_mining_job(
+    job_id: str,
+    idempotency_key: str = "",
+    confirm_cancel: bool = False,
+) -> Any:
+    """Cancel one of the tenant's factor-mining jobs (requires confirmation)."""
+    if not confirm_cancel:
+        return {
+            "error": True,
+            "status": 400,
+            "body": {"message": "Re-call with confirm_cancel=true after explicit user approval."},
+        }
+    return _post(
+        f"/api/agent/v1/factor-mining/jobs/{job_id}/cancel",
+        headers=_idempotency_headers(idempotency_key),
+    )
+
+
+@_tool
+def list_factor_mining_candidates(
+    run_id: int | None = None,
+    status: str = "",
+    market: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> Any:
+    """List the tenant's mined factor candidates with filters and paging."""
+    params: dict[str, Any] = {
+        "limit": max(1, min(200, int(limit))),
+        "offset": max(0, int(offset)),
+    }
+    if run_id is not None:
+        params["runId"] = int(run_id)
+    if status:
+        params["status"] = status
+    if market:
+        params["market"] = market
+    return _get("/api/agent/v1/factor-mining/candidates", params=params)
+
+
+@_tool
+def get_factor_mining_candidate(candidate_id: int) -> Any:
+    """Fetch one mined candidate with metrics and out-of-sample review."""
+    return _get(f"/api/agent/v1/factor-mining/candidates/{int(candidate_id)}")
 
 
 _TRANSPORTS = {"stdio", "sse", "streamable-http"}

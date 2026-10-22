@@ -502,6 +502,20 @@ it is displayed under the factor name **`"expression"`** (the comparison factors
 correlations against the remaining names: built-ins, historical frozen pool members and earlier
 search survivors in this run.
 
+**Agent Gateway.** The same nine operations (eight paths) are mirrored under
+`/api/agent/v1/factor-mining/*` for Agent tokens: `catalog`, `estimate`, the job list and detail,
+`proposals`, and the candidate list and detail require `R`; job submission and cancellation
+require `B` (`estimate` is a read-only POST under `R`). Responses use the Agent envelope
+(`code` and `message`, with the payload in `data`; errors also carry `details` and
+`retriable`), and the job object has the same
+shape as the human surface's `_public_job`, so `config`, `progress`, `result` and `hasResult`
+mean the same thing on both. Submission requires `Idempotency-Key`; on the MCP surface,
+`cancel_factor_mining_job` additionally requires `confirm_cancel=true`. The generic
+`/api/agent/v1/jobs*` routes still read any job kind, but the dedicated factor-mining routes
+are the supported path: they enforce the `factor_mining` kind, return the public job shape, and
+`GET /jobs` also sweeps stale running jobs. After an AI run, read its recorded proposals with
+`GET /api/agent/v1/factor-mining/jobs/<job_id>/proposals`.
+
 ## 8. AI proposals and the failure-feedback loop
 
 `searchMode="ai"` replaces the template expansion with model proposals. The job asks the

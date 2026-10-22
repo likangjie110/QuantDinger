@@ -4,14 +4,13 @@ QuantDinger's MCP server wraps the Agent Gateway and keeps the REST API as the s
 
 ## Install
 
-The current PyPI package is `0.6.2` and exposes the complete 58-tool surface:
+PyPI release `0.6.2` exposes 58 tools:
 
 ```bash
 pip install "quantdinger-mcp==0.6.2"
 ```
 
-For package development from a repository checkout, use
-`pip install -e ./mcp_server` instead.
+The repository head adds nine factor-mining tools, for a 67-tool surface. Until the next package release, install it from a checkout with `pip install -e ./mcp_server`.
 
 Set these environment variables in the MCP client process:
 

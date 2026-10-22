@@ -13,6 +13,8 @@ quantdinger-mcp
 
 `pipx install quantdinger-mcp` and `uvx quantdinger-mcp` are also supported. Use `pip install -e ./mcp_server` only when developing from a repository checkout.
 
+PyPI `0.6.2` still exposes 58 tools. The repository head includes nine factor-mining tools (67 tools total); install with `pip install -e ./mcp_server` to use them before the next release.
+
 The default transport is `stdio`. Set `QUANTDINGER_MCP_TRANSPORT` to `sse` or `streamable-http` for a network transport. Optional limits include `QUANTDINGER_TIMEOUT_S`, `QUANTDINGER_MCP_JOB_STREAM_MAX_EVENTS`, `QUANTDINGER_MCP_JOB_STREAM_MAX_SECONDS`, and `QUANTDINGER_MCP_JOB_POLL_MAX_SECONDS`.
 
 Network transports bound to a non-loopback host require a separate inbound bearer token. This token authenticates MCP clients and must not be the Agent Gateway token:
@@ -34,11 +36,14 @@ Never place an agent token in prompts, logs, screenshots, source control, or MCP
 
 ## Tool surface
 
+The nine factor-mining tools are in the repository head (67 tools total); PyPI `0.6.2` still exposes 58.
+
 | Tool group | Scope | Purpose |
 |---|---:|---|
 | `whoami`, `check_health` | R/public | Identity, allowlists, and liveness |
 | `list_markets`, `search_symbols`, `get_klines`, `get_price` | R | Market discovery and data |
 | Universe and factor tools | R | Point-in-time research inputs |
+| Factor mining tools | R/B | Mining catalog, estimates, runs, and candidate library |
 | `list_watchlist`, `add_watchlist`, `remove_watchlist` | R/W | Watchlist workspace |
 | Indicator authoring, validation, save, link, and read tools | R/W | Chart-only indicators |
 | `list_strategy_templates`, `compile_strategy_code` | R | Strategy API V2 templates and manifest compilation |

@@ -13,7 +13,7 @@ curl -H "Authorization: Bearer $QUANTDINGER_AGENT_TOKEN" \
   http://localhost:8888/api/agent/v1/whoami
 ```
 
-Scopes are `R` for reads, `W` for saved artifacts and deployment configuration, `B` for backtests, `N` for notification side effects, and `T` for runtime or order mutations. `C` is admin-only. Token permissions never bypass server-side live-trading controls.
+Scopes are `R` for reads, `W` for saved artifacts and deployment configuration, `B` for backtests and simulation compute, `N` for notification side effects, and `T` for runtime or order mutations. `C` is admin-only. Token permissions never bypass server-side live-trading controls.
 
 Every mutating W/B/N/T request requires a unique `Idempotency-Key` header. Reuse the same key only when retrying the exact same method, route, query, and body. The gateway atomically reserves the key, returns a stored completed response on replay, and rejects concurrent or mismatched reuse.
 
@@ -80,6 +80,24 @@ instead of reporting a successful result without saved history. Jobs completed
 before this behavior was enabled are not automatically added to history.
 
 Cancel a queued or running job with `POST /jobs/{job_id}/cancel` using B scope, confirmation at the MCP layer, and a new idempotency key. A running worker may finish its local computation, but it cannot overwrite the durable cancelled state.
+
+## Factor mining
+
+Factor mining mirrors the human `/api/factor-mining` surface under `/api/agent/v1/factor-mining` as nine operations across eight paths:
+
+| Method | Path | Scope |
+|--------|------|-------|
+| `GET` | `/factor-mining/catalog` | `R` |
+| `POST` | `/factor-mining/estimate` | `R` |
+| `POST` | `/factor-mining/jobs` | `B` |
+| `GET` | `/factor-mining/jobs` | `R` |
+| `GET` | `/factor-mining/jobs/{job_id}` | `R` |
+| `POST` | `/factor-mining/jobs/{job_id}/cancel` | `B` |
+| `GET` | `/factor-mining/jobs/{job_id}/proposals` | `R` |
+| `GET` | `/factor-mining/candidates` | `R` |
+| `GET` | `/factor-mining/candidates/{candidate_id}` | `R` |
+
+`catalog` and `estimate` expose the DSL vocabulary and price a run without reading data or opening a job; `estimate` is a read-only `POST` that needs `R`, not an `Idempotency-Key`. Submission requires `B` and a unique `Idempotency-Key`, and returns HTTP 202 with the job receipt. Cancellation also requires `B` and a new idempotency key; the MCP tool `cancel_factor_mining_job` additionally requires `confirm_cancel=true` after explicit user approval. A tenant may have only one active factor-mining job at a time (otherwise `400` `factorMining.concurrentLimit`), and `budget` has a hard upper limit of 2000.
 
 ## Indicators
 

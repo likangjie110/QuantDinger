@@ -28,6 +28,8 @@ WRITE_TOOLS = {
     "set_signal_alert_status": True,
     "delete_signal_alert": True,
     "run_signal_alert": True,
+    "submit_factor_mining_run": False,
+    "cancel_factor_mining_job": True,
 }
 
 

@@ -255,6 +255,8 @@ L5 使用累计次数；旧 run 不重写。冻结版本表示分段定义和实
 
 **相关度研究里的标签。** 挖掘出来的候选进入 L4 的相关度研究时，显示的因子名是 **`"expression"`**（比较因子排在它后面）。所以 `metrics.factorCorrelation.factors[0]` 恒为 `"expression"`，`matrix[0][1:]` 对应其余名字的相关度，包括内置因子、历史冻结池成员及本 run 较早通过搜索门槛的候选。
 
+**Agent Gateway。** 同一套 9 个操作（8 个路径）以 `/api/agent/v1/factor-mining/*` 镜像给 Agent Token：`catalog`、`estimate`、作业列表与详情、提案、候选列表与详情需要 `R`；提交与取消需要 `B`（`estimate` 是 `R` 下的只读 POST）。响应使用 Agent 信封（`code` 与 `message`，载荷在 `data`；错误另带 `details` 与 `retriable`），作业对象与人工面的 `_public_job` 形状一致，`config`、`progress`、`result`、`hasResult` 在两侧含义相同。提交作业必须带 `Idempotency-Key`；在 MCP 上，`cancel_factor_mining_job` 还要求 `confirm_cancel=true`。通用 `/api/agent/v1/jobs*` 仍可读取任意 kind 的作业，但挖掘的推荐路径是专用接口：它们校验 `factor_mining` kind、返回公开作业形状，且 `GET /jobs` 还会清扫僵死的运行中作业。AI 运行结束后，用 `GET /api/agent/v1/factor-mining/jobs/<job_id>/proposals` 读取已记录的提案。
+
 ## 8. AI 提案与失败反馈循环
 
 `searchMode="ai"` 用模型提案替代模板展开：作业向服务端配置的 LLM 要假设与表达式，每条表达式都按与其它候选**同一套**字段/算子白名单校验，合法提案走**不变**的 L1–L6 阶梯。模板库仍会作为先验示例放进 prompt，但不进入候选流：AI 运行的候选一律 `origin = "ai"`、`templateId` 为空。试验台账、候选池、冻结段复核与池增量阶段与其它模式完全相同。
