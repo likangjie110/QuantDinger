@@ -26,7 +26,7 @@
         </el-form-item>
 
         <el-form-item :label="t('factorMining.candidates.runId')">
-          <el-input-number v-model="filters.runId" placeholder="运行 ID" clearable />
+          <el-input-number v-model="filters.runId" placeholder="运行 ID" />
         </el-form-item>
 
         <el-form-item>
@@ -198,7 +198,7 @@ const loadCandidates = async () => {
     const data = await factorMiningApi.getCandidates(params)
     candidates.value = data?.items || []
     // 注意：后端返回的是数组，没有 total，这里简化处理
-    total.value = data?.length || 0
+    total.value = data?.items?.length || 0
   } catch (error) {
     ElMessage.error(t(`factorMining.errors.${error.message}`) || error.message)
   } finally {

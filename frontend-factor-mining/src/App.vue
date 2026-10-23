@@ -33,6 +33,7 @@ import JobList from '@/components/JobList.vue'
 import CandidateList from '@/components/CandidateList.vue'
 
 const { t } = useI18n()
+/** @type {import('vue').Ref<string | number>} */
 const activeTab = ref('submit')
 </script>
 
